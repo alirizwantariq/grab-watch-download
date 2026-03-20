@@ -1,18 +1,16 @@
 // ─── State ────────────────────────────────────────────────────────────────────
 let currentVideoUrl = "";
 let currentVideoData = null;
-let currentDownloadId = null;
-let progressInterval = null;
-let isDownloading = false;
+
+// Multiple downloads tracking: Map<id, { interval, element }>
+const downloads = new Map();
 
 // ─── DOM Elements (with safe access) ─────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
-const app = $("app");
 const searchForm = $("searchForm");
 const videoUrlInput = $("videoUrl");
 const submitBtn = $("submitBtn");
 const loaderBar = $("loaderBar");
-const loaderText = $("loaderText");
 const errorMessage = $("errorMessage");
 const resultsSection = $("resultsSection");
 const thumbnail = $("thumbnail");
@@ -24,17 +22,12 @@ const extractor = $("extractor");
 const playerSection = $("playerSection");
 const videoPlayer = $("videoPlayer");
 const formatsBody = $("formatsBody");
-const progressSection = $("progressSection");
-const progressBar = $("progressBar");
-const progressPercent = $("progressPercent");
-const progressStatus = $("progressStatus");
-const saveBtn = $("saveBtn");
-const pauseBtn = $("pauseBtn");
-const resumeBtn = $("resumeBtn");
-const progressControls = $("progressControls");
+const downloadsSection = $("downloadsSection");
+const downloadsList = $("downloadsList");
 const refreshLinksBtn = $("refreshLinksBtn");
 const quickDownloads = document.querySelector(".quick-downloads");
 const noFormatsMsg = $("noFormatsMsg");
+const appEl = $("app");
 
 // ─── Form Submit ─────────────────────────────────────────────────────────────
 if (searchForm) {
@@ -56,15 +49,8 @@ if (searchForm) {
       });
 
       let data;
-      try {
-        data = await res.json();
-      } catch {
-        throw new Error("Invalid response from server");
-      }
-
-      if (!res.ok) {
-        throw new Error(data.error || "Failed to extract video info");
-      }
+      try { data = await res.json(); } catch { throw new Error("Invalid response from server"); }
+      if (!res.ok) throw new Error(data.error || "Failed to extract video info");
 
       currentVideoData = data;
       renderResults(data);
@@ -82,12 +68,10 @@ function renderResults(data) {
     thumbnail.src = data.thumbnail || "";
     thumbnail.alt = data.title || "No thumbnail";
   }
-
   if (durationBadge) {
     durationBadge.textContent = data.duration_string || "";
     durationBadge.style.display = data.duration_string ? "block" : "none";
   }
-
   if (videoTitle) videoTitle.textContent = data.title || "";
   if (uploader) uploader.textContent = data.uploader || "";
   if (viewCount) viewCount.textContent = data.view_count ? formatNumber(data.view_count) + " views" : "";
@@ -100,7 +84,7 @@ function renderResults(data) {
     resultsSection.style.display = "block";
     resultsSection.scrollIntoView({ behavior: "smooth", block: "start" });
   }
-  if (app) app.classList.add("has-results");
+  if (appEl) appEl.classList.add("has-results");
 }
 
 // ─── Player Setup ────────────────────────────────────────────────────────────
@@ -117,9 +101,7 @@ function setupPlayer(data) {
     playerSection.style.display = "block";
     videoPlayer.onerror = () => {
       videoPlayer.src = `/api/stream?url=${encodeURIComponent(currentVideoUrl)}`;
-      videoPlayer.onerror = () => {
-        playerSection.style.display = "none";
-      };
+      videoPlayer.onerror = () => { playerSection.style.display = "none"; };
     };
   } else if (data.best_video) {
     videoPlayer.src = data.best_video;
@@ -166,9 +148,8 @@ function renderFormatsTable(formats) {
 if (quickDownloads) {
   quickDownloads.addEventListener("click", (e) => {
     const btn = e.target.closest(".download-btn");
-    if (!btn || !currentVideoUrl || isDownloading) return;
+    if (!btn || !currentVideoUrl) return;
 
-    // For scraped sources, use the direct URL of the best format
     let directUrl = null;
     if (currentVideoData?.extractor === "browser-scrape" && currentVideoData.formats?.length > 0) {
       directUrl = currentVideoData.formats[0].url;
@@ -180,202 +161,263 @@ if (quickDownloads) {
 if (formatsBody) {
   formatsBody.addEventListener("click", (e) => {
     const btn = e.target.closest(".format-dl-btn");
-    if (!btn || !currentVideoUrl || isDownloading) return;
+    if (!btn || !currentVideoUrl) return;
     const directUrl = btn.dataset.directUrl || null;
     startDownload(currentVideoUrl, btn.dataset.formatId, null, directUrl);
   });
 }
 
-function setDownloadingState(active) {
-  isDownloading = active;
-  // Disable/enable all download buttons
-  document.querySelectorAll(".download-btn, .format-dl-btn").forEach((btn) => {
-    if (active) {
-      btn.classList.add("downloading");
-      btn.disabled = true;
-    } else {
-      btn.classList.remove("downloading");
-      btn.disabled = false;
-    }
+// ─── Create download item UI ─────────────────────────────────────────────────
+function createDownloadItem(id, title, quality) {
+  const item = document.createElement("div");
+  item.className = "download-item";
+  item.id = `dl-${id}`;
+  item.innerHTML = `
+    <div class="dl-item-header">
+      <span class="dl-item-title">${escapeHtml(title || "Video")}</span>
+      <span class="dl-item-quality">${escapeHtml(quality || "")}</span>
+    </div>
+    <div class="progress-bar-wrap">
+      <div class="progress-bar" id="bar-${id}" style="width:0%"></div>
+    </div>
+    <div class="dl-item-info">
+      <span class="dl-item-percent" id="pct-${id}">0%</span>
+      <span class="dl-item-speed" id="speed-${id}"></span>
+      <span class="dl-item-eta" id="eta-${id}"></span>
+      <span class="dl-item-status" id="status-${id}">Starting...</span>
+    </div>
+    <div class="dl-item-actions">
+      <button class="pause-btn" id="pause-${id}">
+        <svg class="dl-icon" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+        Pause
+      </button>
+      <button class="resume-btn" id="resume-${id}" style="display:none">
+        <svg class="dl-icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        Resume
+      </button>
+      <a class="save-btn" id="save-${id}" style="display:none" href="#" download>
+        <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 16l-5-5h3V4h4v7h3l-5 5zm-7 4h14v-2H5v2z"/></svg>
+        Save File
+      </a>
+      <button class="dismiss-btn" id="dismiss-${id}" style="display:none">
+        <svg class="dl-icon" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+      </button>
+    </div>
+  `;
+
+  // Bind pause
+  item.querySelector(`#pause-${id}`).addEventListener("click", () => pauseDownload(id));
+  // Bind resume
+  item.querySelector(`#resume-${id}`).addEventListener("click", () => resumeDownload(id));
+  // Bind save — after click, auto-delete from server
+  const saveLink = item.querySelector(`#save-${id}`);
+  saveLink.addEventListener("click", () => {
+    setTimeout(() => dismissDownload(id), 3000);
   });
+  // Bind dismiss
+  item.querySelector(`#dismiss-${id}`).addEventListener("click", () => dismissDownload(id));
+
+  return item;
 }
 
 async function startDownload(url, formatId, quality, directUrl) {
-  setDownloadingState(true);
-
-  if (progressSection) {
-    progressSection.style.display = "block";
-    progressSection.scrollIntoView({ behavior: "smooth", block: "center" });
-  }
-  if (progressBar) {
-    progressBar.style.width = "0%";
-    progressBar.classList.remove("paused");
-  }
-  if (progressPercent) progressPercent.textContent = "0%";
-  if (progressStatus) progressStatus.textContent = "Starting download...";
-  if (saveBtn) saveBtn.style.display = "none";
-  if (pauseBtn) pauseBtn.style.display = "inline-flex";
-  if (resumeBtn) resumeBtn.style.display = "none";
-  if (progressControls) progressControls.style.display = "flex";
-
-  stopPolling();
+  if (downloadsSection) downloadsSection.style.display = "block";
 
   try {
     const res = await fetch("/api/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, format_id: formatId, quality, title: currentVideoData?.title || null, direct_url: directUrl || undefined }),
+      body: JSON.stringify({
+        url,
+        format_id: formatId,
+        quality,
+        title: currentVideoData?.title || null,
+        direct_url: directUrl || undefined,
+      }),
     });
 
     let data;
-    try {
-      data = await res.json();
-    } catch {
-      throw new Error("Invalid response from server");
-    }
-
+    try { data = await res.json(); } catch { throw new Error("Invalid response from server"); }
     if (!res.ok) throw new Error(data.error || "Download failed");
 
-    currentDownloadId = data.id;
+    const qualityLabel = quality === "best" ? "Best Quality" : quality === "audio" ? "MP3" : quality ? `${quality}p` : formatId || "";
+    const item = createDownloadItem(data.id, currentVideoData?.title, qualityLabel);
+    if (downloadsList) downloadsList.prepend(item);
+
     pollProgress(data.id);
   } catch (err) {
-    if (progressStatus) progressStatus.textContent = `Error: ${err.message}`;
-    if (progressPercent) progressPercent.textContent = "Failed";
-    if (progressControls) progressControls.style.display = "none";
-    setDownloadingState(false);
+    showError(err.message);
   }
 }
 
-function stopPolling() {
-  if (progressInterval) {
-    clearInterval(progressInterval);
-    progressInterval = null;
-  }
-}
-
+// ─── Poll Progress ───────────────────────────────────────────────────────────
 function pollProgress(downloadId) {
-  stopPolling();
-
-  progressInterval = setInterval(async () => {
-    // Guard against stale polls from a previous download
-    if (downloadId !== currentDownloadId) {
-      stopPolling();
-      return;
-    }
-
+  const interval = setInterval(async () => {
     try {
       const res = await fetch(`/api/progress/${downloadId}`);
-
       let data;
-      try {
-        data = await res.json();
-      } catch {
-        // Non-JSON response — server may be down
-        stopPolling();
-        if (progressStatus) progressStatus.textContent = "Connection error — server may be restarting";
-        setDownloadingState(false);
+      try { data = await res.json(); } catch {
+        clearInterval(interval);
+        downloads.delete(downloadId);
         return;
       }
 
       if (!res.ok) {
-        stopPolling();
-        if (progressStatus) progressStatus.textContent = "Download not found";
-        if (progressControls) progressControls.style.display = "none";
-        setDownloadingState(false);
+        clearInterval(interval);
+        downloads.delete(downloadId);
+        updateItemStatus(downloadId, "error", "Download not found");
         return;
       }
 
-      if (progressBar) progressBar.style.width = `${data.progress}%`;
-      if (progressPercent) progressPercent.textContent = `${Math.round(data.progress)}%`;
+      const bar = $(`bar-${downloadId}`);
+      const pct = $(`pct-${downloadId}`);
+      const speed = $(`speed-${downloadId}`);
+      const eta = $(`eta-${downloadId}`);
+      const status = $(`status-${downloadId}`);
+
+      if (bar) bar.style.width = `${data.progress}%`;
+      if (pct) pct.textContent = `${Math.round(data.progress)}%`;
+      if (speed) speed.textContent = data.speed ? `${data.speed}` : "";
+      if (eta) eta.textContent = data.eta ? `ETA ${data.eta}` : "";
 
       if (data.status === "downloading") {
-        if (progressStatus) progressStatus.textContent = "Downloading...";
-        if (progressBar) progressBar.classList.remove("paused");
+        if (status) status.textContent = "Downloading...";
+        if (bar) bar.classList.remove("paused");
       } else if (data.status === "paused") {
-        stopPolling();
-        if (progressBar) progressBar.classList.add("paused");
-        if (progressStatus) progressStatus.textContent = "Paused";
-        if (pauseBtn) pauseBtn.style.display = "none";
-        if (resumeBtn) resumeBtn.style.display = "inline-flex";
+        clearInterval(interval);
+        downloads.delete(downloadId);
+        if (bar) bar.classList.add("paused");
+        if (status) status.textContent = "Paused";
+        if (speed) speed.textContent = "";
+        if (eta) eta.textContent = "";
+        const pauseEl = $(`pause-${downloadId}`);
+        const resumeEl = $(`resume-${downloadId}`);
+        if (pauseEl) pauseEl.style.display = "none";
+        if (resumeEl) resumeEl.style.display = "inline-flex";
       } else if (data.status === "complete") {
-        stopPolling();
-        if (progressBar) {
-          progressBar.style.width = "100%";
-          progressBar.classList.remove("paused");
+        clearInterval(interval);
+        downloads.delete(downloadId);
+        if (bar) { bar.style.width = "100%"; bar.classList.remove("paused"); }
+        if (pct) pct.textContent = "100%";
+        if (status) status.textContent = "Complete!";
+        if (speed) speed.textContent = "";
+        if (eta) eta.textContent = "";
+        const pauseEl = $(`pause-${downloadId}`);
+        const saveEl = $(`save-${downloadId}`);
+        const dismissEl = $(`dismiss-${downloadId}`);
+        if (pauseEl) pauseEl.style.display = "none";
+        if (saveEl) {
+          saveEl.href = `/api/file/${downloadId}`;
+          saveEl.style.display = "inline-flex";
         }
-        if (progressPercent) progressPercent.textContent = "100%";
-        if (progressStatus) progressStatus.textContent = "Complete!";
-        if (progressControls) progressControls.style.display = "none";
-        if (saveBtn) {
-          saveBtn.href = `/api/file/${downloadId}`;
-          saveBtn.style.display = "inline-flex";
-        }
-        setDownloadingState(false);
+        if (dismissEl) dismissEl.style.display = "inline-flex";
       } else if (data.status === "error") {
-        stopPolling();
-        if (progressStatus) progressStatus.textContent = `Error: ${data.error || "Download failed"}`;
-        if (progressPercent) progressPercent.textContent = "Failed";
-        if (progressControls) progressControls.style.display = "none";
-        setDownloadingState(false);
+        clearInterval(interval);
+        downloads.delete(downloadId);
+        if (status) status.textContent = `Error: ${data.error || "Download failed"}`;
+        if (pct) pct.textContent = "Failed";
+        if (speed) speed.textContent = "";
+        if (eta) eta.textContent = "";
+        const pauseEl = $(`pause-${downloadId}`);
+        const dismissEl = $(`dismiss-${downloadId}`);
+        if (pauseEl) pauseEl.style.display = "none";
+        if (dismissEl) dismissEl.style.display = "inline-flex";
       }
     } catch {
-      stopPolling();
-      if (progressStatus) progressStatus.textContent = "Connection lost — check if server is running";
-      if (progressControls) progressControls.style.display = "none";
-      setDownloadingState(false);
+      clearInterval(interval);
+      downloads.delete(downloadId);
     }
   }, 1000);
+
+  downloads.set(downloadId, { interval });
 }
 
-// ─── Pause Handler ───────────────────────────────────────────────────────────
-if (pauseBtn) {
-  pauseBtn.addEventListener("click", async () => {
-    if (!currentDownloadId) return;
-    pauseBtn.disabled = true;
+// ─── Pause / Resume / Dismiss ────────────────────────────────────────────────
+async function pauseDownload(id) {
+  const pauseEl = $(`pause-${id}`);
+  if (pauseEl) pauseEl.disabled = true;
 
-    try {
-      const res = await fetch(`/api/pause/${currentDownloadId}`, { method: "POST" });
-      let data;
-      try { data = await res.json(); } catch { throw new Error("Invalid response"); }
-      if (!res.ok) throw new Error(data.error || "Failed to pause");
+  try {
+    const res = await fetch(`/api/pause/${id}`, { method: "POST" });
+    let data;
+    try { data = await res.json(); } catch { throw new Error("Invalid response"); }
+    if (!res.ok) throw new Error(data.error || "Failed to pause");
 
-      stopPolling();
-      if (progressBar) progressBar.classList.add("paused");
-      if (progressStatus) progressStatus.textContent = "Paused";
-      pauseBtn.style.display = "none";
-      if (resumeBtn) resumeBtn.style.display = "inline-flex";
-    } catch (err) {
-      if (progressStatus) progressStatus.textContent = `Pause error: ${err.message}`;
-    } finally {
-      pauseBtn.disabled = false;
-    }
-  });
+    // Stop polling
+    const dl = downloads.get(id);
+    if (dl) { clearInterval(dl.interval); downloads.delete(id); }
+
+    const bar = $(`bar-${id}`);
+    const status = $(`status-${id}`);
+    const speed = $(`speed-${id}`);
+    const eta = $(`eta-${id}`);
+    const resumeEl = $(`resume-${id}`);
+    if (bar) bar.classList.add("paused");
+    if (status) status.textContent = "Paused";
+    if (speed) speed.textContent = "";
+    if (eta) eta.textContent = "";
+    if (pauseEl) pauseEl.style.display = "none";
+    if (resumeEl) resumeEl.style.display = "inline-flex";
+  } catch (err) {
+    const status = $(`status-${id}`);
+    if (status) status.textContent = `Pause error: ${err.message}`;
+  } finally {
+    if (pauseEl) pauseEl.disabled = false;
+  }
 }
 
-// ─── Resume Handler ──────────────────────────────────────────────────────────
-if (resumeBtn) {
-  resumeBtn.addEventListener("click", async () => {
-    if (!currentDownloadId) return;
-    resumeBtn.disabled = true;
+async function resumeDownload(id) {
+  const resumeEl = $(`resume-${id}`);
+  if (resumeEl) resumeEl.disabled = true;
 
-    try {
-      const res = await fetch(`/api/resume/${currentDownloadId}`, { method: "POST" });
-      let data;
-      try { data = await res.json(); } catch { throw new Error("Invalid response"); }
-      if (!res.ok) throw new Error(data.error || "Failed to resume");
+  try {
+    const res = await fetch(`/api/resume/${id}`, { method: "POST" });
+    let data;
+    try { data = await res.json(); } catch { throw new Error("Invalid response"); }
+    if (!res.ok) throw new Error(data.error || "Failed to resume");
 
-      if (progressBar) progressBar.classList.remove("paused");
-      if (progressStatus) progressStatus.textContent = data.warning || "Resuming...";
-      resumeBtn.style.display = "none";
-      if (pauseBtn) pauseBtn.style.display = "inline-flex";
+    const bar = $(`bar-${id}`);
+    const status = $(`status-${id}`);
+    const pauseEl = $(`pause-${id}`);
+    if (bar) bar.classList.remove("paused");
+    if (status) status.textContent = data.warning || "Resuming...";
+    if (resumeEl) resumeEl.style.display = "none";
+    if (pauseEl) pauseEl.style.display = "inline-flex";
 
-      pollProgress(currentDownloadId);
-    } catch (err) {
-      if (progressStatus) progressStatus.textContent = `Resume error: ${err.message}`;
-    } finally {
-      resumeBtn.disabled = false;
-    }
-  });
+    pollProgress(id);
+  } catch (err) {
+    const status = $(`status-${id}`);
+    if (status) status.textContent = `Resume error: ${err.message}`;
+  } finally {
+    if (resumeEl) resumeEl.disabled = false;
+  }
+}
+
+function dismissDownload(id) {
+  const dl = downloads.get(id);
+  if (dl) { clearInterval(dl.interval); downloads.delete(id); }
+  const item = $(`dl-${id}`);
+  if (item) {
+    item.style.animation = "fadeOut 0.3s ease";
+    setTimeout(() => item.remove(), 300);
+  }
+  // Hide section if no more downloads
+  if (downloadsList && downloadsList.children.length <= 1) {
+    setTimeout(() => {
+      if (downloadsList.children.length === 0 && downloadsSection) {
+        downloadsSection.style.display = "none";
+      }
+    }, 350);
+  }
+}
+
+function updateItemStatus(id, status, message) {
+  const statusEl = $(`status-${id}`);
+  const pauseEl = $(`pause-${id}`);
+  const dismissEl = $(`dismiss-${id}`);
+  if (statusEl) statusEl.textContent = message;
+  if (pauseEl) pauseEl.style.display = "none";
+  if (dismissEl) dismissEl.style.display = "inline-flex";
 }
 
 // ─── Refresh Links Handler ───────────────────────────────────────────────────
@@ -403,7 +445,7 @@ if (refreshLinksBtn) {
       const origHTML = refreshLinksBtn.innerHTML;
       refreshLinksBtn.textContent = "Links Refreshed!";
       setTimeout(() => { refreshLinksBtn.innerHTML = origHTML; }, 2000);
-    } catch (err) {
+    } catch {
       const origHTML = refreshLinksBtn.innerHTML;
       refreshLinksBtn.textContent = "Refresh failed";
       setTimeout(() => { refreshLinksBtn.innerHTML = origHTML; }, 2000);
@@ -440,8 +482,7 @@ function hideError() {
 function hideResults() {
   if (resultsSection) resultsSection.style.display = "none";
   if (playerSection) playerSection.style.display = "none";
-  if (progressSection) progressSection.style.display = "none";
-  if (app) app.classList.remove("has-results");
+  if (appEl) appEl.classList.remove("has-results");
 }
 
 function formatBytes(bytes) {
@@ -449,10 +490,7 @@ function formatBytes(bytes) {
   const units = ["B", "KB", "MB", "GB"];
   let i = 0;
   let size = bytes;
-  while (size >= 1024 && i < units.length - 1) {
-    size /= 1024;
-    i++;
-  }
+  while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
   return `${size.toFixed(1)} ${units[i]}`;
 }
 

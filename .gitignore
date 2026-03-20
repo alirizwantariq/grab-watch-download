@@ -3,3 +3,4 @@ downloads/
 cookies.txt
 .DS_Store
 *.log
+.claude/
