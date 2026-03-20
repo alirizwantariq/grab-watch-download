@@ -146,32 +146,10 @@
         </details>
       </div>
 
-      <!-- Download Progress -->
-      <div class="progress-section" id="progressSection" style="display:none">
-        <h3 class="section-title">Download Progress</h3>
-        <div class="progress-bar-wrap">
-          <div class="progress-bar" id="progressBar" style="width:0%"></div>
-        </div>
-        <div class="progress-info">
-          <span id="progressPercent">0%</span>
-          <span id="progressStatus">Preparing...</span>
-        </div>
-        <div class="progress-actions">
-          <div class="progress-controls" id="progressControls">
-            <button class="pause-btn" id="pauseBtn">
-              <svg class="dl-icon" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-              Pause
-            </button>
-            <button class="resume-btn" id="resumeBtn" style="display:none">
-              <svg class="dl-icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-              Resume
-            </button>
-          </div>
-          <a class="save-btn" id="saveBtn" style="display:none" href="#" download>
-            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 16l-5-5h3V4h4v7h3l-5 5zm-7 4h14v-2H5v2z"/></svg>
-            Save File
-          </a>
-        </div>
+      <!-- Downloads List -->
+      <div class="downloads-section" id="downloadsSection" style="display:none">
+        <h3 class="section-title">Downloads</h3>
+        <div class="downloads-list" id="downloadsList"></div>
       </div>
     </section>
 

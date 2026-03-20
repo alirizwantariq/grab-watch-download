@@ -294,6 +294,16 @@ function attachProcessHandlers(proc, downloadInfo) {
     if (match) {
       downloadInfo.progress = parseFloat(match[1]);
     }
+    // Parse speed: "at  5.23MiB/s" or "at ~  2.1MiB/s"
+    const speedMatch = text.match(/at\s+~?\s*([\d.]+\s*\w+\/s)/);
+    if (speedMatch) {
+      downloadInfo.speed = speedMatch[1].trim();
+    }
+    // Parse ETA: "ETA 00:10" or "ETA 01:23:45"
+    const etaMatch = text.match(/ETA\s+([\d:]+)/);
+    if (etaMatch) {
+      downloadInfo.eta = etaMatch[1];
+    }
     const destMatch = text.match(/\[(?:Merger|download)\].*?Destination:\s*(.+)/);
     if (destMatch) {
       downloadInfo.filename = safeBasename(destMatch[1].trim()) || downloadInfo.filename;
@@ -502,6 +512,8 @@ function startDirectDownload(id, directUrl, title, res) {
     status: "downloading",
     filename: null,
     error: null,
+    speed: null,
+    eta: null,
     url: directUrl,
     format_id: null,
     quality: null,
@@ -596,6 +608,8 @@ app.post("/api/download", (req, res) => {
     status: "downloading",
     filename: null,
     error: null,
+    speed: null,
+    eta: null,
     url: url.trim(),
     format_id: format_id || null,
     quality: quality || null,
@@ -672,6 +686,9 @@ app.get("/api/progress/:id", (req, res) => {
     status: info.status,
     filename: info.filename,
     error: info.error,
+    speed: info.speed || null,
+    eta: info.eta || null,
+    title: info.title || null,
   });
 });
 
@@ -705,7 +722,15 @@ app.get("/api/file/:id", (req, res) => {
 
   const ext = path.extname(safeName);
   const downloadName = `${info.title || "video"}${ext}`;
-  res.download(filePath, downloadName);
+  res.download(filePath, downloadName, (err) => {
+    if (!err) {
+      // Auto-delete after successful save
+      setTimeout(() => {
+        fs.unlink(filePath, () => {});
+        activeDownloads.delete(req.params.id);
+      }, 5000); // 5s delay to ensure browser finishes writing
+    }
+  });
 });
 
 // ─── API: Stream/proxy video for player ──────────────────────────────────────
