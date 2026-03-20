@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GrabNWatch - Online Video Downloader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <!-- Header -->
+    <header class="header">
+      <h1 class="title">Grab<span class="accent">N</span>Watch</h1>
+      <p class="subtitle">Online Video Downloader — Paste any video URL and download in any quality</p>
+    </header>
+
+    <!-- Search Section -->
+    <section class="search-section">
+      <form id="searchForm" class="search-form">
+        <div class="input-group">
+          <input
+            type="url"
+            id="videoUrl"
+            class="url-input"
+            placeholder="Paste video URL here... (YouTube, Vimeo, Twitter, TikTok, and 1000+ more)"
+            required
+            autocomplete="off"
+          >
+          <button type="submit" id="submitBtn" class="submit-btn">
+            <span class="btn-text">Grab</span>
+            <span class="btn-loader" style="display:none"></span>
+          </button>
+        </div>
+        <div class="supported-sites">
+          Supports: YouTube, Vimeo, Twitter/X, TikTok, Instagram, Facebook, Reddit, Dailymotion, Twitch, and 1000+ more
+        </div>
+      </form>
+
+      <!-- Loading Bar -->
+      <div class="loader-bar" id="loaderBar" style="display:none">
+        <div class="loader-track">
+          <div class="loader-fill"></div>
+        </div>
+        <p class="loader-text" id="loaderText">Extracting video information...</p>
+      </div>
+
+      <!-- Error Message -->
+      <div class="error-message" id="errorMessage" style="display:none"></div>
+    </section>
+
+    <!-- Results Section -->
+    <section class="results-section" id="resultsSection" style="display:none">
+      <!-- Video Info Card -->
+      <div class="video-card">
+        <div class="video-card-inner">
+          <div class="thumbnail-wrap">
+            <img id="thumbnail" class="thumbnail" src="" alt="Video thumbnail">
+            <span class="duration-badge" id="durationBadge"></span>
+          </div>
+          <div class="video-info">
+            <h2 class="video-title" id="videoTitle"></h2>
+            <div class="video-meta">
+              <span class="meta-item" id="uploader"></span>
+              <span class="meta-item" id="viewCount"></span>
+              <span class="meta-item" id="extractor"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Video Player -->
+      <div class="player-section" id="playerSection" style="display:none">
+        <h3 class="section-title">Preview</h3>
+        <div class="player-wrap">
+          <video id="videoPlayer" controls playsinline preload="metadata">
+            Your browser does not support the video tag.
+          </video>
+        </div>
+      </div>
+
+      <!-- Download Options -->
+      <div class="download-section">
+        <div class="section-header">
+          <h3 class="section-title">Download Options</h3>
+          <button class="refresh-links-btn" id="refreshLinksBtn">
+            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+            Refresh Links
+          </button>
+        </div>
+
+        <!-- Quick Download Buttons -->
+        <div class="quick-downloads">
+          <button class="download-btn primary" data-quality="best">
+            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 16l-5-5h3V4h4v7h3l-5 5zm-7 4h14v-2H5v2z"/></svg>
+            Best Quality (MP4)
+          </button>
+          <button class="download-btn" data-quality="1080">
+            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 16l-5-5h3V4h4v7h3l-5 5zm-7 4h14v-2H5v2z"/></svg>
+            1080p
+          </button>
+          <button class="download-btn" data-quality="720">
+            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 16l-5-5h3V4h4v7h3l-5 5zm-7 4h14v-2H5v2z"/></svg>
+            720p
+          </button>
+          <button class="download-btn" data-quality="480">
+            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 16l-5-5h3V4h4v7h3l-5 5zm-7 4h14v-2H5v2z"/></svg>
+            480p
+          </button>
+          <button class="download-btn" data-quality="360">
+            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 16l-5-5h3V4h4v7h3l-5 5zm-7 4h14v-2H5v2z"/></svg>
+            360p
+          </button>
+          <button class="download-btn audio" data-quality="audio">
+            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1014 17V7h4V3h-6z"/></svg>
+            MP3 Audio
+          </button>
+        </div>
+
+        <!-- No Formats Message -->
+        <div class="no-formats-msg" id="noFormatsMsg" style="display:none">
+          <p>No downloadable formats found. The video may be private, geo-restricted, or require authentication.</p>
+          <p class="hint">For Twitter/X and Instagram, export your browser cookies to <code>cookies.txt</code> in the project root.</p>
+        </div>
+
+        <!-- All Formats Table -->
+        <details class="formats-details">
+          <summary class="formats-toggle">Show all available formats</summary>
+          <div class="formats-table-wrap">
+            <table class="formats-table">
+              <thead>
+                <tr>
+                  <th>Format</th>
+                  <th>Resolution</th>
+                  <th>Ext</th>
+                  <th>Size</th>
+                  <th>Video</th>
+                  <th>Audio</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="formatsBody"></tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <!-- Download Progress -->
+      <div class="progress-section" id="progressSection" style="display:none">
+        <h3 class="section-title">Download Progress</h3>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="progressBar" style="width:0%"></div>
+        </div>
+        <div class="progress-info">
+          <span id="progressPercent">0%</span>
+          <span id="progressStatus">Preparing...</span>
+        </div>
+        <div class="progress-actions">
+          <div class="progress-controls" id="progressControls">
+            <button class="pause-btn" id="pauseBtn">
+              <svg class="dl-icon" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+              Pause
+            </button>
+            <button class="resume-btn" id="resumeBtn" style="display:none">
+              <svg class="dl-icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+              Resume
+            </button>
+          </div>
+          <a class="save-btn" id="saveBtn" style="display:none" href="#" download>
+            <svg class="dl-icon" viewBox="0 0 24 24"><path d="M12 16l-5-5h3V4h4v7h3l-5 5zm-7 4h14v-2H5v2z"/></svg>
+            Save File
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <p>GrabNWatch &mdash; Powered by yt-dlp. Supports 1000+ websites.</p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
