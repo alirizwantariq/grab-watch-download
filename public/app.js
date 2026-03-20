@@ -156,7 +156,7 @@ function renderFormatsTable(formats) {
       <td>${f.filesize ? formatBytes(f.filesize) : "\u2014"}</td>
       <td><span class="badge ${f.has_video ? "badge-yes" : "badge-no"}">${f.has_video ? "\u2713" : "\u2014"}</span></td>
       <td><span class="badge ${f.has_audio ? "badge-yes" : "badge-no"}">${f.has_audio ? "\u2713" : "\u2014"}</span></td>
-      <td><button class="format-dl-btn" data-format-id="${escapeHtml(f.format_id)}">Download</button></td>
+      <td><button class="format-dl-btn" data-format-id="${escapeHtml(f.format_id)}" data-direct-url="${f.format_id?.startsWith("scraped") ? escapeHtml(f.url) : ""}">Download</button></td>
     `;
     formatsBody.appendChild(tr);
   }
@@ -167,7 +167,13 @@ if (quickDownloads) {
   quickDownloads.addEventListener("click", (e) => {
     const btn = e.target.closest(".download-btn");
     if (!btn || !currentVideoUrl || isDownloading) return;
-    startDownload(currentVideoUrl, null, btn.dataset.quality);
+
+    // For scraped sources, use the direct URL of the best format
+    let directUrl = null;
+    if (currentVideoData?.extractor === "browser-scrape" && currentVideoData.formats?.length > 0) {
+      directUrl = currentVideoData.formats[0].url;
+    }
+    startDownload(currentVideoUrl, null, btn.dataset.quality, directUrl);
   });
 }
 
@@ -175,7 +181,8 @@ if (formatsBody) {
   formatsBody.addEventListener("click", (e) => {
     const btn = e.target.closest(".format-dl-btn");
     if (!btn || !currentVideoUrl || isDownloading) return;
-    startDownload(currentVideoUrl, btn.dataset.formatId, null);
+    const directUrl = btn.dataset.directUrl || null;
+    startDownload(currentVideoUrl, btn.dataset.formatId, null, directUrl);
   });
 }
 
@@ -193,7 +200,7 @@ function setDownloadingState(active) {
   });
 }
 
-async function startDownload(url, formatId, quality) {
+async function startDownload(url, formatId, quality, directUrl) {
   setDownloadingState(true);
 
   if (progressSection) {
@@ -217,7 +224,7 @@ async function startDownload(url, formatId, quality) {
     const res = await fetch("/api/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, format_id: formatId, quality, title: currentVideoData?.title || null }),
+      body: JSON.stringify({ url, format_id: formatId, quality, title: currentVideoData?.title || null, direct_url: directUrl || undefined }),
     });
 
     let data;
