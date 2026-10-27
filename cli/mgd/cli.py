@@ -196,13 +196,30 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
         ("chrome UA", _ytdlp_base_args() + [
             "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"]),
-        ("impersonate chrome", _ytdlp_base_args() + ["--impersonate", "chrome"]),
+        ("impersonate chrome", _ytdlp_base_args()
+            + ["--impersonate", "chrome",
+               "--extractor-args", "generic:impersonate"]),
     ]
     if explicit_cookies:
         strategies.insert(0, ("caller cookies", _ytdlp_base_args() + explicit_cookies))
     else:
+        preferred = (cfg.get("cookies_browser")
+                     or getattr(args, "default_browser", None))
         detected = _detect_cookie_browsers()
-        for browser in detected:
+        # unsupported pseudo-browsers (e.g. Arc: no yt-dlp cookie source);
+        # order: user preference, then detected Chromium/Firefox stores
+        SUPPORTED = {"chrome", "brave", "edge", "vivaldi", "firefox", "chromium",
+                     "opera", "whale", "safari"}
+        order_hint = []
+        if preferred in SUPPORTED:
+            order_hint.append(preferred)
+        for b in detected:
+            if b in SUPPORTED and b not in order_hint:
+                order_hint.append(b)
+        if "safari" in order_hint:  # needs Full Disk Access; last resort
+            order_hint.remove("safari")
+            order_hint.append("safari")
+        for browser in order_hint:
             strategies.append(
                 (f"cookies-from-{browser}",
                  _ytdlp_base_args() + ["--impersonate", "chrome",
