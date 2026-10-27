@@ -122,6 +122,39 @@ def _run_ytdlp_strategy(ytdlp: str, name: str, cmd: list[str]) -> int:
         return 130
 
 
+def _detect_cookie_browsers() -> list[str]:
+    """Browsers whose cookie stores look usable on this Mac; detected first."""
+    as_dir = pathlib.Path.home() / "Library" / "Application Support"
+    chromium = {
+        "arc": as_dir / "Arc",
+        "vivaldi": as_dir / "Vivaldi",
+        "chrome": as_dir / "Google" / "Chrome",
+        "brave": as_dir / "BraveSoftware" / "Brave-Browser",
+        "edge": as_dir / "Microsoft Edge",
+    }
+    found = []
+    for name, base in chromium.items():
+        try:
+            if not base.exists():
+                continue
+            if any(base.glob("*/Cookies")) or any(base.glob("Profile */Cookies")):
+                found.append(name)
+            else:
+                found.append(name)  # dir exists; a profile may need a launch
+        except OSError:
+            found.append(name)  # TCC-protected: likely real data, let yt-dlp try
+    try:
+        safari = pathlib.Path.home() / ("Library/Containers/com.apple.Safari/Data/"
+                                        "Library/Cookies/Cookies.binarycookies")
+        safari.resolve()  # raises EPERM when data exists but TCC blocks
+        if safari.exists():
+            found.append("safari")
+    except OSError:
+        found.append("safari")
+    order = {"safari": 99}
+    return sorted(set(found), key=lambda b: (order.get(b, 10), b))
+
+
 def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
     """YouTube-style URLs: delegate to yt-dlp's extractors, trying a chain:
     plain -> impersonate -> cookies from installed browsers (as in the
@@ -168,7 +201,8 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
     if explicit_cookies:
         strategies.insert(0, ("caller cookies", _ytdlp_base_args() + explicit_cookies))
     else:
-        for browser in ("chrome", "firefox", "safari", "brave", "edge"):
+        detected = _detect_cookie_browsers()
+        for browser in detected:
             strategies.append(
                 (f"cookies-from-{browser}",
                  _ytdlp_base_args() + ["--impersonate", "chrome",
@@ -180,9 +214,15 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
         if code == 0:
             return 0
         last_err = f"strategy {name} exited {code}"
+    hint = ""
+    if "safari" in last_err or getattr(args, "cookies_from_browser", None) is None:
+        hint = ("\nTip: for Safari cookies, grant your terminal app Full Disk Access "
+                "(System Settings > Privacy & Security), or export cookies to a file "
+                "with a browser extension and use --cookies cookies.txt.")
     print(f"error: all yt-dlp strategies failed ({last_err}). "
           "For bot-checked videos, pass cookies once: "
-          "mgd grab URL --cookies-from-browser chrome", file=sys.stderr)
+          f"mgd grab URL --cookies-from-browser <{', '.join(_detect_cookie_browsers()) or 'browser'}>.{hint}",
+          file=sys.stderr)
     return 1
 
 
