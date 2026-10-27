@@ -58,7 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--sha256", default=None, help="expected SHA-256 to verify")
     g.add_argument("--pick", type=int, default=None,
                    help="grab the Nth media link (1-based) instead of prompting")
-    g.add_argument("--all", action="store_true", help="download all found media links (cap 20)")
+    g.add_argument("--all", action="store_true",
+                   help="download all found media links on a page (cap: --limit, default 50); "
+                        "for YouTube it downloads the whole playlist")
+    g.add_argument("--limit", type=int, default=50, metavar="N",
+                   help="max items downloaded with --all (default 50)")
     g.add_argument("--user-agent", default=None)
     g.add_argument("--header", action="append", default=[], metavar="KEY:VALUE",
                    help="extra request header (repeatable)")
@@ -109,7 +113,7 @@ BOT_CHECK_MARKERS = ("sign in to confirm", "not a bot", "confirm you")
 
 
 def _ytdlp_base_args() -> list[str]:
-    return ["--no-playlist", "--no-warnings", "--extractor-retries", "5",
+    return ["--no-warnings", "--extractor-retries", "5",
             "--socket-timeout", "30", "--no-check-certificates"]
 
 
@@ -167,6 +171,8 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
               file=sys.stderr)
         return 1
     dest_args = []
+    if not args.all:
+        dest_args.append("--no-playlist")  # --all: let playlist URLs expand
     if args.out:
         o = args.out
         if pathlib.Path(o).suffix and "%(ext)s" not in o:
@@ -279,7 +285,7 @@ def cmd_grab(args) -> int:
                   "(use 'mgd grab-page' to inspect candidates)", file=sys.stderr)
             return 1
         if args.all:
-            links = links[:20]
+            links = links[:args.limit]
         elif args.pick:
             if not 1 <= args.pick <= len(links):
                 print(f"error: --pick {args.pick} out of range ({len(links)} found)",
