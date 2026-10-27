@@ -16,6 +16,9 @@ import argparse
 import json
 import os
 import pathlib
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -47,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=list(categorize.CATEGORIES), help="force category")
     g.add_argument("--proxy", default=None,
                    help="proxy URL: http://h:p, https://h:p or socks5://h:p")
+    g.add_argument("--cookies", default=None, help="Netscape cookie file for yt-dlp")
+    g.add_argument("--cookies-from-browser", default=None,
+                   help="browser to pull cookies from for yt-dlp: chrome, firefox, edge, safari, brave")
     g.add_argument("-c", "--conns", type=int, default=None)
     g.add_argument("-r", "--retries", type=int, default=None)
     g.add_argument("--sha256", default=None, help="expected SHA-256 to verify")
@@ -96,6 +102,90 @@ def proxy_of(args) -> str | None:
 
 
 # ── grab ─────────────────────────────────────────────────────────────────
+PLATFORM_RE = re.compile(
+    r"https?://(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\S*", re.I)
+
+BOT_CHECK_MARKERS = ("sign in to confirm", "not a bot", "confirm you")
+
+
+def _ytdlp_base_args() -> list[str]:
+    return ["--no-playlist", "--no-warnings", "--extractor-retries", "5",
+            "--socket-timeout", "30", "--no-check-certificates"]
+
+
+def _run_ytdlp_strategy(ytdlp: str, name: str, cmd: list[str]) -> int:
+    print(f"# yt-dlp strategy: {name}")
+    try:
+        return subprocess.run(cmd).returncode
+    except KeyboardInterrupt:
+        print("\nstopped (yt-dlp partials resume on rerun)", file=sys.stderr)
+        return 130
+
+
+def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
+    """YouTube-style URLs: delegate to yt-dlp's extractors, trying a chain:
+    plain -> impersonate -> cookies from installed browsers (as in the
+    GrabNWatch web app's proven strategy runner)."""
+    url = url or args.url
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp:
+        print("error: YouTube/platform URLs need yt-dlp "
+              "(install: brew install yt-dlp  or  pip install yt-dlp)",
+              file=sys.stderr)
+        return 1
+    dest_args = []
+    if args.out:
+        o = args.out
+        if pathlib.Path(o).suffix and "%(ext)s" not in o:
+            o += ".%(ext)s"
+        dest_args = ["-o", o]
+        pathlib.Path(os.path.expanduser(o)).parent.mkdir(parents=True, exist_ok=True)
+    elif args.dir:
+        dest_args = ["-P", os.path.expanduser(args.dir)]
+    else:
+        category = args.filetype or "video"
+        dest_args = ["-P", str(categorize.category_dir(cfg, category))]
+    proxy_args = []
+    if args.proxy:
+        proxy_args = ["--proxy", args.proxy]
+    else:
+        envp = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") \
+            or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+        if envp:
+            proxy_args = ["--proxy", envp]
+    explicit_cookies = []
+    if getattr(args, "cookies", None):
+        explicit_cookies = ["--cookies", args.cookies]
+    if getattr(args, "cookies_from_browser", None):
+        explicit_cookies = ["--cookies-from-browser", args.cookies_from_browser]
+
+    strategies = [
+        ("chrome UA", _ytdlp_base_args() + [
+            "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"]),
+        ("impersonate chrome", _ytdlp_base_args() + ["--impersonate", "chrome"]),
+    ]
+    if explicit_cookies:
+        strategies.insert(0, ("caller cookies", _ytdlp_base_args() + explicit_cookies))
+    else:
+        for browser in ("chrome", "firefox", "safari", "brave", "edge"):
+            strategies.append(
+                (f"cookies-from-{browser}",
+                 _ytdlp_base_args() + ["--impersonate", "chrome",
+                                       "--cookies-from-browser", browser]))
+    last_err = ""
+    for name, base in strategies:
+        cmd = [ytdlp, *base, *dest_args, *proxy_args, url]
+        code = _run_ytdlp_strategy(ytdlp, name, cmd)
+        if code == 0:
+            return 0
+        last_err = f"strategy {name} exited {code}"
+    print(f"error: all yt-dlp strategies failed ({last_err}). "
+          "For bot-checked videos, pass cookies once: "
+          "mgd grab URL --cookies-from-browser chrome", file=sys.stderr)
+    return 1
+
+
 def cmd_grab(args) -> int:
     cfg = _cfg()
     conns = args.conns if args.conns else cfg.get("conns", 6)
@@ -111,9 +201,15 @@ def cmd_grab(args) -> int:
         headers[k.strip()] = v.strip()
     stopper = Stopper()
 
+    if PLATFORM_RE.match(args.url):
+        return _grab_platform(args, cfg)
+
     try:
         page_links = _page_media(args.url, headers, args.proxy)
     except HttpError as err:
+        if err.status in (403, 429) and shutil.which("yt-dlp"):
+            print(f"# plain fetch blocked by {err.status} - delegating to yt-dlp")
+            return _grab_platform(args, cfg, args.url)
         print(f"error: {err} - this host may block automated clients "
               "(try --proxy or a different network)", file=sys.stderr)
         return 1
