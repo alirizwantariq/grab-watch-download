@@ -416,11 +416,16 @@ class Downloader:
                 self._backoff_sleep(attempt)
 
     def _stream(self, seg: Segment, resp, cap: int | None) -> None:
-        """cap: maximum bytes this response may contribute (span - pos at start)."""
+        """cap: maximum bytes this response may contribute (span - pos at start).
+        Uses read1 so slow/drip servers don't block past a chunk boundary -
+        keeps pause and periodic state saves responsive."""
         left = cap
         while True:
             self.stopper.check()
-            chunk = resp.read(CHUNK)
+            try:
+                chunk = resp.read1(CHUNK)  # type: ignore[attr-defined]
+            except AttributeError:
+                chunk = resp.read(CHUNK)
             if not chunk:
                 return
             if left is not None:
@@ -549,6 +554,8 @@ class Downloader:
                 "size": self._size, "etag": self._etag,
                 "last_modified": self._last_modified,
                 "accept_ranges": self._accept_ranges,
+                "pid": getattr(self, "pid", None),
+                "out_path": str(self.out_path),
                 "segments": [s.to_json() for s in self._segments],
             }), encoding="utf-8")
         except OSError:

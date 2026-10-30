@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import importlib
 import inspect
 import pathlib
 import sys
@@ -13,10 +14,8 @@ HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 
-import test_engine  # noqa: E402
-import test_mgd  # noqa: E402
-
-mods = [test_engine, test_mgd]
+mods = [importlib.import_module(p.stem)
+        for p in sorted(HERE.glob("test_*.py"))]
 passed, failed = 0, []
 for mod in mods:
     for name, fn in sorted(vars(mod).items()):
