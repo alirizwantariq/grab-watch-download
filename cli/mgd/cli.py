@@ -18,6 +18,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -26,7 +27,7 @@ import urllib.parse as u
 
 from . import categorize, grab, net
 from .engine import (Downloader, DownloadError, HttpError, Interrupted,
-                     Stopper, STATE_SUFFIX)
+                     Stopper, STATE_SUFFIX, PART_SUFFIX)
 
 BANNER = "mgd - media grab & download (stdlib-only segmented downloader)"
 DEFAULT_TIMEOUT = 30.0
@@ -40,7 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="retry attempts per range")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    g = sub.add_parser("grab", help="download a URL (page URLs get media extraction)")
+    g = sub.add_parser("grab", aliases=["get", "dl", "fetch"],
+                       help="download a URL (page URLs get media extraction; "
+                            "YouTube/X URLs get quality options)")
     g.add_argument("url")
     g.add_argument("-o", "--out", default=None,
                    help="exact destination file path (overrides category dirs)")
@@ -48,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="destination directory (skips category mapping)")
     g.add_argument("-t", "--type", default=None, dest="filetype",
                    choices=list(categorize.CATEGORIES), help="force category")
+    g.add_argument("--quality", "-Q", default=None,
+                   help="best|1080|720|480|360|audio (for YouTube/X; omit and "
+                        "mgd asks interactively when run in a terminal)")
     g.add_argument("--proxy", default=None,
                    help="proxy URL: http://h:p, https://h:p or socks5://h:p")
     g.add_argument("--cookies", default=None, help="Netscape cookie file for yt-dlp")
@@ -59,29 +65,42 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--pick", type=int, default=None,
                    help="grab the Nth media link (1-based) instead of prompting")
     g.add_argument("--all", action="store_true",
-                   help="download all found media links on a page (cap: --limit, default 50); "
-                        "for YouTube it downloads the whole playlist")
+                   help="download all found media links on a page (cap: --limit, "
+                        "default 50); for YouTube/X playlists it means the whole playlist")
     g.add_argument("--limit", type=int, default=50, metavar="N",
                    help="max items downloaded with --all (default 50)")
     g.add_argument("--user-agent", default=None)
     g.add_argument("--header", action="append", default=[], metavar="KEY:VALUE",
                    help="extra request header (repeatable)")
     g.add_argument("--quiet", "-q", action="store_true", help="no progress line")
+    g.add_argument("--json-progress", action="store_true", dest="json_progress",
+                   help="emit NDJSON progress events (for GUIs/scripts)")
 
-    gp = sub.add_parser("grab-page", help="list media links on an HTML page")
+    gp = sub.add_parser("grab-page", aliases=["links", "scan"],
+                        help="list media links on an HTML page")
     gp.add_argument("url")
     gp.add_argument("--proxy", default=None)
     gp.add_argument("--json", action="store_true", dest="as_json")
 
-    sp = sub.add_parser("set-default", help="set default dir for a category or root")
-    sp.add_argument("category", choices=["root", *categorize.CATEGORIES])
-    sp.add_argument("path")
+    sp = sub.add_parser("set-default",
+                        help="set default dir for a category/root, or preferred cookie browser")
+    sp.add_argument("category", choices=["root", "cookies-browser", *categorize.CATEGORIES])
+    sp.add_argument("value", help="path (or browser name for cookies-browser)")
 
-    sub.add_parser("defaults", help="show defaults")
+    sub.add_parser("defaults", aliases=["config"], help="show defaults + config")
 
-    sub.add_parser("list", help="list unfinished (resumable) downloads")
-    rs = sub.add_parser("resume", help="resume a saved download")
+    lj = sub.add_parser("list", aliases=["jobs", "ls"],
+                        help="list unfinished downloads with [running]/[paused] state")
+    lj.add_argument("--json", action="store_true", dest="as_json", help="machine-readable list")
+    rs = sub.add_parser("resume", aliases=["cont"],
+                        help="resume a saved download")
     rs.add_argument("target", help="id from 'mgd list' or 'all'")
+    ps = sub.add_parser("pause", help="pause a running download (by id from 'mgd list')")
+    ps.add_argument("target")
+    cx = sub.add_parser("cancel", aliases=["rm", "del"],
+                        help="cancel a download and delete its partial data")
+    cx.add_argument("target")
+    sub.add_parser("doctor", help="show engines, config and readiness")
     return ap
 
 
@@ -108,6 +127,13 @@ def proxy_of(args) -> str | None:
 # ── grab ─────────────────────────────────────────────────────────────────
 PLATFORM_RE = re.compile(
     r"https?://(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\S*", re.I)
+X_RE = re.compile(
+    r"https?://(www\.|mobile\.)?(x\.com|twitter\.com)\S*", re.I)
+QUALITY_PATTERNS = ["best", "audio"]
+
+
+def _is_platform(url: str) -> bool:
+    return bool(PLATFORM_RE.match(url) or X_RE.match(url))
 
 BOT_CHECK_MARKERS = ("sign in to confirm", "not a bot", "confirm you")
 
@@ -159,31 +185,161 @@ def _detect_cookie_browsers() -> list[str]:
     return sorted(set(found), key=lambda b: (order.get(b, 10), b))
 
 
+C_GREEN, C_RED, C_YELLOW, C_DIM, C_BOLD, C_END = (
+    "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[1m", "\033[0m")
+
+
+def _colors_enabled() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _ok(msg: str) -> str:
+    return f"{C_GREEN}✓{C_END} {msg}" if _colors_enabled() else msg
+
+
+def _fail(msg: str) -> str:
+    return f"{C_RED}✗{C_END} {msg}" if _colors_enabled() else msg
+
+
+def _arrow(msg: str) -> str:
+    return f"{C_BOLD}→{C_END} {msg}" if _colors_enabled() else f"> {msg}"
+
+
+def _map_quality(q: str | None) -> tuple[str | None, list[str]]:
+    """Friendly quality keyword -> (yt-dlp format selector, extra download args).
+    (None, []) means 'let yt-dlp pick the best'."""
+    if not q:
+        return None, []
+    q = q.strip().lower()
+    if q in ("best", "h", "high", "highest"):
+        return None, []
+    if q in ("audio", "audio-only", "mp3", "a"):
+        if shutil.which("ffmpeg"):
+            return "ba/bestaudio", ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+        print("(note: ffmpeg not found - saving best audio as m4a instead of mp3)",
+              file=sys.stderr)
+        return "ba[ext=m4a]/ba/bestaudio", []
+    if q.startswith("f"):  # explicit format id(s), e.g. f137 or f137+140
+        return q[1:], []
+    m = re.fullmatch(r"(\d{3,4})p?", q)
+    if m:  # height like 720 or 1080p
+        n = m.group(1)
+        return (f"bv*[height<={n}]+ba/b[height<={n}]"
+                f"/bv*[height<={n}]/b"), []
+    if re.fullmatch(r"[\d+]+", q):  # raw format ids e.g. 137+140
+        return q, []
+    print(f"(unknown quality '{q}' - using best)", file=sys.stderr)
+    return None, []
+
+
+def _fmt_int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _size_str_small(n) -> str:
+    v = float(n) if n else 0
+    for unit in ("B", "KB", "MB", "GB"):
+        if v < 1024 or unit == "GB":
+            return f"{v:.0f} {unit}" if v > 9 or unit in ("B", "KB") else f"{v:.1f} {unit}"
+        v /= 1024.0
+    return "?"
+
+
+def _quality_menu(info: dict) -> tuple[str | None, list[str]]:
+    """Interactive quality menu built from yt-dlp -J format data."""
+    fmts = info.get("formats") or []
+    has_ffmpeg = bool(shutil.which("ffmpeg"))
+    videos = [f for f in fmts if f.get("vcodec") not in (None, "none")
+              and f.get("height")]
+    best_h: dict[int, dict] = {}
+    for f in sorted(videos, key=lambda f: (-(f["height"]), -(f.get("tbr") or 0))):
+        best_h.setdefault(f["height"], f)
+    heights = sorted(best_h, reverse=True)[:6]
+    title = info.get("title") or "video"
+    duration = _fmt_int(info.get("duration"))
+
+    def opt_size(f):
+        n = f.get("filesize") or f.get("filesize_approx")
+        return f", ~{_size_str_small(n)}" if n else ""
+
+    options: list[tuple[str, str | None, list[str]]] = []
+    options.append(("Highest quality (best video + audio)", None, []))
+    for h in heights:
+        f = best_h[h]
+        sel = f"bv*[height<={h}]+ba/b[height<={h}]/bv*[height<={h}]/b"
+        options.append((f"{h}p ({f.get('ext', '?')}{opt_size(f)})", sel, []))
+    options.append((f"audio only ({'mp3' if has_ffmpeg else 'm4a'})",
+                    None, ["__AUDIO__"]))
+
+    extra_meta = f"  ({duration // 60}:{duration % 60:02d})" if duration else ""
+    print(f"\n{_colors_enabled() and C_BOLD or ''}{title}{_colors_enabled() and C_END or ''}{extra_meta}")
+    print("Choose a quality:")
+    for i, (label, _sel, _x) in enumerate(options, 1):
+        print(f"  {i}. {label}")
+    while True:
+        try:
+            answer = input(f"quality [1-{len(options)}] (Enter=1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None, []
+        if not answer:
+            return None, []
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            _label, sel, x = options[int(answer) - 1]
+            if x == ["__AUDIO__"]:
+                return _map_quality("audio")
+            return sel, []
+        print("  pick a number (1-{})".format(len(options)), file=sys.stderr)
+
+
+def _strip_impersonate(args_list: list[str]) -> list[str]:
+    """-J probing doesn't need --impersonate; drop flag and its value."""
+    out, skip = [], False
+    for a in args_list:
+        if skip:
+            skip = False
+            continue
+        if a == "--impersonate":
+            skip = True
+            continue
+        out.append(a)
+    return out
+
+
+def _probe_ytdlp_info(ytdlp: str, strategies: list[tuple[str, list[str]]],
+                      url: str, extra: list[str]) -> tuple[dict | None, str | None]:
+    """Run 'yt-dlp -J' through each strategy; return (info, strategy name)."""
+    for name, base in strategies:
+        base = _strip_impersonate(base)
+        cmd = [ytdlp, *base, "--no-playlist", "-J", *extra, url]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if proc.returncode != 0:
+            continue
+        try:
+            return json.loads(proc.stdout), name
+        except ValueError:
+            continue
+    return None, None
+
+
 def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
-    """YouTube-style URLs: delegate to yt-dlp's extractors, trying a chain:
-    plain -> impersonate -> cookies from installed browsers (as in the
-    GrabNWatch web app's proven strategy runner)."""
+    """YouTube/X/Twitter URLs: resolve via yt-dlp's upstream extractors with a
+    strategy chain (plain -> impersonate -> browser cookies), then download
+    with an interactive quality menu (or --quality)."""
     url = url or args.url
     ytdlp = shutil.which("yt-dlp")
     if not ytdlp:
-        print("error: YouTube/platform URLs need yt-dlp "
+        print("error: YouTube/X URLs need yt-dlp "
               "(install: brew install yt-dlp  or  pip install yt-dlp)",
               file=sys.stderr)
         return 1
-    dest_args = []
-    if not args.all:
-        dest_args.append("--no-playlist")  # --all: let playlist URLs expand
-    if args.out:
-        o = args.out
-        if pathlib.Path(o).suffix and "%(ext)s" not in o:
-            o += ".%(ext)s"
-        dest_args = ["-o", o]
-        pathlib.Path(os.path.expanduser(o)).parent.mkdir(parents=True, exist_ok=True)
-    elif args.dir:
-        dest_args = ["-P", os.path.expanduser(args.dir)]
-    else:
-        category = args.filetype or "video"
-        dest_args = ["-P", str(categorize.category_dir(cfg, category))]
+    base_flags = ["--no-playlist"] if not args.all else []  # --all: expand playlists
     proxy_args = []
     if args.proxy:
         proxy_args = ["--proxy", args.proxy]
@@ -209,11 +365,8 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
     if explicit_cookies:
         strategies.insert(0, ("caller cookies", _ytdlp_base_args() + explicit_cookies))
     else:
-        preferred = (cfg.get("cookies_browser")
-                     or getattr(args, "default_browser", None))
+        preferred = cfg.get("cookies_browser")
         detected = _detect_cookie_browsers()
-        # unsupported pseudo-browsers (e.g. Arc: no yt-dlp cookie source);
-        # order: user preference, then detected Chromium/Firefox stores
         SUPPORTED = {"chrome", "brave", "edge", "vivaldi", "firefox", "chromium",
                      "opera", "whale", "safari"}
         order_hint = []
@@ -230,21 +383,54 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
                 (f"cookies-from-{browser}",
                  _ytdlp_base_args() + ["--impersonate", "chrome",
                                        "--cookies-from-browser", browser]))
+
+    # ── quality selection ─────────────────────────────────────────────────
+    selector: str | None = None
+    quality_extra: list[str] = []
+    if args.quality is not None:
+        selector, quality_extra = _map_quality(args.quality)
+    elif not args.all and sys.stdin.isatty():
+        info, probe_strategy = _probe_ytdlp_info(
+            ytdlp, strategies, url, base_flags + proxy_args)
+        if info is not None:
+            print(_arrow(f"resolved via: {probe_strategy}"))
+            selector, quality_extra = _quality_menu(info)
+            strategies = [(strat_name, strat_args) for strat_name, strat_args in
+                          strategies if strat_name == probe_strategy] or strategies
+        # probe failed: keep full chain for the download (menu skipped)
+
+    # ── destination ───────────────────────────────────────────────────────
+    audio_only = bool(selector == "ba/bestaudio" or quality_extra)
+    dest_args = []
+    if args.out:
+        o = args.out
+        if pathlib.Path(o).suffix and "%(ext)s" not in o:
+            o += ".%(ext)s"
+        dest_args = ["-o", o]
+        pathlib.Path(os.path.expanduser(o)).parent.mkdir(parents=True, exist_ok=True)
+    elif args.dir:
+        dest_args = ["-P", os.path.expanduser(args.dir)]
+    else:
+        default_cat = "audio" if audio_only else (args.filetype or "video")
+        dest_args = ["-P", str(categorize.category_dir(cfg, default_cat))]
+
     last_err = ""
     for name, base in strategies:
-        cmd = [ytdlp, *base, *dest_args, *proxy_args, url]
+        cmd = [ytdlp, *base, *base_flags, *dest_args, *proxy_args]
+        if selector:
+            cmd += ["-f", selector]
+        cmd += [*quality_extra, url]
         code = _run_ytdlp_strategy(ytdlp, name, cmd)
         if code == 0:
             return 0
         last_err = f"strategy {name} exited {code}"
     hint = ""
-    if "safari" in last_err or getattr(args, "cookies_from_browser", None) is None:
-        hint = ("\nTip: for Safari cookies, grant your terminal app Full Disk Access "
-                "(System Settings > Privacy & Security), or export cookies to a file "
-                "with a browser extension and use --cookies cookies.txt.")
-    print(f"error: all yt-dlp strategies failed ({last_err}). "
-          "For bot-checked videos, pass cookies once: "
-          f"mgd grab URL --cookies-from-browser <{', '.join(_detect_cookie_browsers()) or 'browser'}>.{hint}",
+    if getattr(args, "cookies_from_browser", None) is None:
+        hint = ("\nTip: open this link once in your browser (solve any "
+                "challenge/login), then rerun - or export cookies and use "
+                "--cookies cookies.txt. Safari users: grant your terminal "
+                "Full Disk Access (System Settings > Privacy & Security).")
+    print(f"error: all yt-dlp strategies failed ({last_err}). {hint}",
           file=sys.stderr)
     return 1
 
@@ -264,7 +450,7 @@ def cmd_grab(args) -> int:
         headers[k.strip()] = v.strip()
     stopper = Stopper()
 
-    if PLATFORM_RE.match(args.url):
+    if _is_platform(args.url):
         return _grab_platform(args, cfg)
 
     try:
@@ -322,30 +508,49 @@ def cmd_grab(args) -> int:
     for t in targets:
         url_i = t["url"]
         title = f" ({t['title']})" if t.get("title") else ""
+        if getattr(args, "json_progress", False):
+            print(json.dumps({"type": "start", "url": url_i}), flush=True)
         try:
             out_path = _destination(args, cfg, url_i)
-            print(f"> {url_i}{title}")
-            print(f"+ {out_path}")
+            print(_arrow(f"{url_i}{title}"))
+            print(f"  saving to {out_path}")
         except (RuntimeError, OSError) as err:
             print(f"error: {err}", file=sys.stderr)
             return 2
+        _journal_record(out_path)
         dl = Downloader(url_i, out_path, proxy=args.proxy, conns=conns,
                         retries=retries, stopper=stopper,
                         timeout=DEFAULT_TIMEOUT,
                         expected_sha256=args.sha256 if t["kind"] == "direct" else None)
+        dl.pid = os.getpid()
         try:
-            result = dl.run(on_progress=None if args.quiet else _make_progress())
+            progress_cb = None
+            if args.json_progress:
+                def progress_cb(done, total):
+                    print(json.dumps({"type": "progress", "done": done,
+                                      "total": total}), flush=True)
+            elif not args.quiet:
+                progress_cb = _make_progress()
+            result = dl.run(on_progress=progress_cb)
             print()
-            print(f"DONE {result.path} {_size_str(result.size)}"
-                  + (" [resumed]" if result.resumed else ""))
+            if getattr(args, "json_progress", False):
+                print(json.dumps({"type": "done", "path": result.path,
+                                  "size": result.size}), flush=True)
+            else:
+                print(_ok(f"{result.path} {_size_str(result.size)}"
+                          + (" [resumed]" if result.resumed else "")))
             results.append(result)
         except KeyboardInterrupt:
             dl.abort()
-            print("\nstopped by user - state saved; resume with: mgd resume",
+            print(f"\npaused - state saved; continue with: {_arrow('mgd resume')}".strip(),
                   file=sys.stderr)
             return 130
         except (DownloadError, HttpError, OSError) as err:
-            print(f"FAIL {url_i}: {err}", file=sys.stderr)
+            if getattr(args, "json_progress", False):
+                print(json.dumps({"type": "error", "message": str(err)},
+                                 flush=True))
+            else:
+                print(_fail(f"{url_i}: {err}"), file=sys.stderr)
             failures += 1
     if results:
         print(f"{len(results)} downloaded, {failures} failed")
@@ -448,11 +653,17 @@ def cmd_grab_page(args) -> int:
 def cmd_set_default(args) -> int:
     cfg = _cfg()
     if args.category == "root":
-        cfg["root"] = args.path
+        cfg["root"] = args.value
+    elif args.category == "cookies-browser":
+        name = args.value.strip().lower()
+        cfg["cookies_browser"] = name
+        print(f"saved: preferred yt-dlp cookie browser -> {name} "
+              "(yt-dlp supports: brave, chrome, chromium, edge, firefox, opera, safari, vivaldi, whale)")
     else:
-        cfg.setdefault("defaults", {})[args.category] = args.path
+        cfg.setdefault("defaults", {})[args.category] = args.value
     categorize.save_config(cfg)
-    print(f"saved: {args.category} -> {args.path}")
+    if args.category != "cookies-browser":
+        print(f"saved: {args.category} -> {args.value}")
     return 0
 
 
@@ -467,6 +678,29 @@ def cmd_defaults(_args) -> int:
 
 
 # ── list / resume ────────────────────────────────────────────────────────
+def _journal_path() -> pathlib.Path:
+    return categorize.config_path().parent / "journal.json"
+
+
+def _journal_record(out_path: pathlib.Path) -> None:
+    """Remember where downloads live so list/pause/resume can find them."""
+    try:
+        jp = _journal_path()
+        jp.parent.mkdir(parents=True, exist_ok=True)
+        entries: list[str] = []
+        if jp.exists():
+            try:
+                entries = json.loads(jp.read_text(encoding="utf-8"))
+            except ValueError:
+                entries = []
+        sp = str(out_path.expanduser().parent / (out_path.name + STATE_SUFFIX))
+        if sp not in entries:
+            entries.append(sp)
+            jp.write_text(json.dumps(entries[-500:]), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _find_states() -> list[pathlib.Path]:
     cfg = _cfg()
     roots = {categorize.default_root(cfg)}
@@ -481,11 +715,45 @@ def _find_states() -> list[pathlib.Path]:
             if p not in seen:
                 seen.add(p)
                 out.append(p)
+    try:
+        entries = json.loads(_journal_path().read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        entries = []
+    for line in entries:
+        p = pathlib.Path(line)
+        if p.exists() and p not in seen:
+            seen.add(p)
+            out.append(p)
     return sorted(out)
 
 
-def cmd_list(_args) -> int:
+def _state_pid_alive(st: dict) -> bool:
+    pid = st.get("pid")
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, PermissionError, TypeError, ValueError):
+        return False
+
+
+def cmd_list(args) -> int:
     states = _find_states()
+    if getattr(args, "as_json", False):
+        items = []
+        for p in states:
+            try:
+                st = json.loads(p.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            done = sum(s.get("pos", 0) for s in st.get("segments", [])
+                       if s.get("pos", 0) != -2)
+            items.append({"url": st.get("url"), "filename": st.get("filename"),
+                          "out_path": st.get("out_path"), "size": st.get("size"),
+                          "done": done, "state": "running" if _state_pid_alive(st) else "paused"})
+        print(json.dumps({"items": items}))
+        return 0
     if not states:
         print("no unfinished downloads")
         return 0
@@ -498,9 +766,111 @@ def cmd_list(_args) -> int:
         total = st.get("size")
         done = sum(s.get("pos", 0) for s in segs if s.get("pos", 0) != -2)
         pct = f"{done * 100 // total}%" if total else "?"
-        print(f"  {i}. {p.name[:-len(STATE_SUFFIX)]}")
+        status = "running" if _state_pid_alive(st) else "paused"
+        print(f"  {i}. [{status}] {p.name[:-len(STATE_SUFFIX)]}")
         print(f"     {st.get('url')}")
-        print(f"     {pct} done ({done}/{total} bytes) - resume with: mgd resume {i}")
+        print(f"     {pct} ({done}/{total} bytes)"
+              + (f" - pause ok: mgd pause {i} | resume: mgd resume {i} | cancel: mgd cancel {i}"
+                 if status == "running" else
+                 f" - resume: mgd resume {i} | delete: mgd cancel {i}"))
+    return 0
+
+
+def _kill_pid_of(st_path: pathlib.Path, st: dict) -> bool:
+    """Return True if a running download process was signalled."""
+    if not _state_pid_alive(st):
+        return False
+    try:
+        os.kill(int(st["pid"]), signal.SIGTERM)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def cmd_pause(args) -> int:
+    states = _find_states()
+    try:
+        idx = int(args.target)
+    except ValueError:
+        print("error: pause target must be an id from 'mgd list'", file=sys.stderr)
+        return 2
+    if not 1 <= idx <= len(states):
+        print(f"error: id {idx} out of range (1..{len(states)})", file=sys.stderr)
+        return 2
+    st_path = states[idx - 1]
+    try:
+        st = json.loads(st_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return 2
+    if _kill_pid_of(st_path, st):
+        print(f"pause signal sent to download {idx} - state saved, resume with: mgd resume {idx}")
+        # give the process a moment to flush its state
+        for _ in range(20):
+            time.sleep(0.1)
+            if not _state_pid_alive(st):
+                break
+        return 0
+    print(f"download {idx} is not running (already paused) - resume with: mgd resume {idx}")
+    return 0
+
+
+def cmd_cancel(args) -> int:
+    states = _find_states()
+    try:
+        idx = int(args.target)
+    except ValueError:
+        print("error: cancel target must be an id from 'mgd list'", file=sys.stderr)
+        return 2
+    if not 1 <= idx <= len(states):
+        print(f"error: id {idx} out of range (1..{len(states)})", file=sys.stderr)
+        return 2
+    st_path = states[idx - 1]
+    try:
+        st = json.loads(st_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return 2
+    _kill_pid_of(st_path, st)
+    time.sleep(0.4)
+    removed = []
+    for suffix in (STATE_SUFFIX, PART_SUFFIX):
+        part = st_path.with_name(st_path.name.replace(STATE_SUFFIX, suffix))
+        if part.exists():
+            try:
+                part.unlink()
+                removed.append(part.name)
+            except OSError as err:
+                print(f"error: cannot remove {part}: {err}", file=sys.stderr)
+                return 1
+    print(f"cancelled download {idx}"
+          + (f" (removed {', '.join(removed)})" if removed else ""))
+    return 0
+
+
+def cmd_doctor(_args) -> int:
+    """Show what engines and setup mgd can use right now."""
+    cfg = _cfg()
+    ok, warn = "OK", "--"
+    print("mgd doctor")
+    print(f"  engine        {ok}  python {sys.version.split()[0]}, "
+          f"config: {categorize.config_path()}")
+    root = categorize.default_root(cfg)
+    print(f"  download root {ok}  {root}")
+    dl = shutil.which("yt-dlp")
+    print(f"  yt-dlp        {ok if dl else warn}  {dl or 'install: brew install yt-dlp'}")
+    if dl:
+        imp = subprocess.run(["yt-dlp", "--list-impersonate-targets"],
+                             capture_output=True, text=True, timeout=30)
+        targets = len((imp.stdout or "").strip().splitlines()) - 3
+        print(f"  impersonation {ok if targets > 0 else warn}  "
+              f"{max(0, targets)} browser targets (Cloudflare-protected sites)")
+    ff = shutil.which("ffmpeg")
+    print(f"  ffmpeg        {ok if ff else warn}  {ff or 'needed for MP3 conversion (' if True else ''}"
+          + ("" if ff else "brew install ffmpeg)"))
+    print(f"  cookie source {ok if cfg.get('cookies_browser') else warn}  "
+          + (f"preferred: {cfg['cookies_browser']} (set with: mgd set-default cookies-browser chrome)"
+             if cfg.get("cookies_browser") else "none chosen; auto-detect on first platform download"))
+    paused = len(_find_states())
+    print(f"  paused items  {paused}")
     return 0
 
 
@@ -535,11 +905,13 @@ def cmd_resume(args) -> int:
         dl = Downloader(st.get("url", ""), out_path,
                         proxy=_cfg().get("proxy") or os.environ.get("HTTPS_PROXY"),
                         resume_state=st_path.read_bytes())
-        print(f"resuming {out_path.name} ...")
+        dl.pid = os.getpid()
+        print(_arrow(f"resuming {out_path.name} ({st.get('size', '?')} bytes total)"))
         try:
             result = dl.run(on_progress=_make_progress())
             print()
-            print(f"DONE {result.path}")
+            print(_ok(f"{result.path} {_size_str(result.size)}"
+                      + (" [was resumed]" if result.resumed else "")))
         except KeyboardInterrupt:
             dl.abort()
             print("\npaused again (state saved)")
@@ -551,15 +923,26 @@ def cmd_resume(args) -> int:
 
 
 # ── main ─────────────────────────────────────────────────────────────────
+def _sigterm_to_interrupt(signum, frame):
+    raise KeyboardInterrupt()
+
+
 def main(argv=None) -> int:
+    try:
+        signal.signal(signal.SIGTERM, _sigterm_to_interrupt)
+    except (ValueError, OSError):
+        pass
     args = build_parser().parse_args(argv)
     handlers = {
-        "grab": cmd_grab,
-        "grab-page": cmd_grab_page,
+        "grab": cmd_grab, "get": cmd_grab, "dl": cmd_grab, "fetch": cmd_grab,
+        "grab-page": cmd_grab_page, "links": cmd_grab_page, "scan": cmd_grab_page,
         "set-default": cmd_set_default,
-        "defaults": cmd_defaults,
-        "list": cmd_list,
-        "resume": cmd_resume,
+        "defaults": cmd_defaults, "config": cmd_defaults,
+        "list": cmd_list, "jobs": cmd_list, "ls": cmd_list,
+        "resume": cmd_resume, "cont": cmd_resume,
+        "pause": cmd_pause,
+        "cancel": cmd_cancel, "rm": cmd_cancel, "del": cmd_cancel,
+        "doctor": cmd_doctor,
     }
     try:
         return handlers[args.cmd](args)

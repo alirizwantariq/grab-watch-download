@@ -257,3 +257,57 @@ class Socks5ProxyServer:
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+class DripOrigin:
+    """Range-capable origin that trickles data (for pause/kill tests)."""
+
+    def __init__(self, content: bytes, chunk: int = 16 * 1024, delay: float = 0.05):
+        self.content = content
+        self.chunk = chunk
+        self.delay = delay
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                rng = self.headers.get("Range", "")
+                total = handler_content.len
+                if rng.startswith("bytes="):
+                    spec = rng[6:].split(",", 1)[0]
+                    first, _, last = spec.partition("-")
+                    first = int(first)
+                    last = int(last) if last else total - 1
+                    body = content[first:last + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {first}-{last}/{total}")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                else:
+                    body = content
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(total))
+                    self.end_headers()
+                for i in range(0, len(body), handler_content.chunk):
+                    self.wfile.write(body[i:i + handler_content.chunk])
+                    self.wfile.flush()
+                    import time as _t
+                    _t.sleep(handler_content.delay)
+
+        handler_content = type("H", (), {"len": len(content), "chunk": chunk,
+                                         "delay": delay})
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_address[1]
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.port}/drip.bin"
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
