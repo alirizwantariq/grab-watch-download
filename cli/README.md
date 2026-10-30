@@ -40,6 +40,7 @@ mgd grab "x.com/.." -Q audio       # same bridge converts to mp3
 mgd grab "x.com/.." --resolver ytdlp|x  # force a resolver (default auto)
 mgd jobs                           # [running]/[paused] + per-item actions
 mgd pause 1 / mgd resume 1 / mgd cancel 1
+mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)
 mgd doctor                         # engines + config readiness
 mgd grab-page <url> [--json]       # just list media links found on a page
 mgd set-default video ~/Movies     # per-category default directory
@@ -106,8 +107,9 @@ page URLs are scanned for `<video>`, `<audio>`, `<source>`, `og:video`,
 ## GUI (macOS app)
 
 `gui/` contains a native SwiftUI app (MediaGrab) that drives this engine:
-paste-link window, quality picker, live progress/speed, pause/resume/cancel
-and a diagnostics pane. Build with `gui/script/build_app.sh`; make a
+paste-link window, automatic quality chooser (YouTube/X resolution menus),
+download list with per-row pause/resume, file icons that reveal in Finder,
+paused-download pickup (even from other terminals) and a diagnostics pane. Build with `gui/script/build_app.sh`; make a
 drag-to-Applications DMG with `gui/script/create_dmg.sh`. See
 `gui/README.md`.
 

@@ -97,12 +97,21 @@ def build_parser() -> argparse.ArgumentParser:
     rs = sub.add_parser("resume", aliases=["cont"],
                         help="resume a saved download")
     rs.add_argument("target", help="id from 'mgd list' or 'all'")
+    rs.add_argument("--json-progress", action="store_true", dest="json_progress",
+                    help="emit NDJSON progress events (for GUIs/scripts)")
     ps = sub.add_parser("pause", help="pause a running download (by id from 'mgd list')")
     ps.add_argument("target")
     cx = sub.add_parser("cancel", aliases=["rm", "del"],
                         help="cancel a download and delete its partial data")
     cx.add_argument("target")
     sub.add_parser("doctor", help="show engines, config and readiness")
+    ql = sub.add_parser("qualities", aliases=["formats"],
+                        help="list downloadable qualities/resolutions for a "
+                             "URL (JSON; used by the GUI and scripts)")
+    ql.add_argument("url")
+    ql.add_argument("--proxy", default=None)
+    ql.add_argument("--cookies", default=None)
+    ql.add_argument("--cookies-from-browser", default=None)
     return ap
 
 
@@ -432,6 +441,53 @@ def _quality_menu(info: dict) -> tuple[str | None, list[str]]:
         print("  pick a number (1-{})".format(len(options)), file=sys.stderr)
 
 
+def _curate_qualities(info: dict) -> list[dict]:
+    """yt-dlp -J info -> [{label, quality}] passable to --quality."""
+    fmts = info.get("formats") or []
+    has_ffmpeg = bool(shutil.which("ffmpeg"))
+    videos = [f for f in fmts if f.get("vcodec") not in (None, "none")
+              and f.get("height")]
+    best_h: dict[int, dict] = {}
+    for f in sorted(videos, key=lambda f: (-(f["height"]), -(f.get("tbr") or 0))):
+        best_h.setdefault(f["height"], f)
+    out: list[dict] = [{"label": "Highest quality (best video + audio)",
+                        "quality": "best"}]
+    for h in sorted(best_h, reverse=True)[:6]:
+        f = best_h[h]
+        n = f.get("filesize") or f.get("filesize_approx")
+        size = f", ~{_size_str_small(n)}" if n else ""
+        out.append({"label": f"{h}p ({f.get('ext', '?')}{size})",
+                    "quality": str(h)})
+    out.append({"label": f"audio only ({'mp3' if has_ffmpeg else 'm4a'})",
+                "quality": "audio"})
+    return out
+
+
+def _xd_quality_entries(st: dict) -> list[dict]:
+    """x-downloader bridge response -> [{label, quality}] passable to --quality.
+
+    The bridge reports widths like '854x480'; --quality takes the height cap
+    number, which _xd_pick_format maps back to the best matching entry."""
+    def height_of(label: str) -> int:
+        m = re.search(r"x(\d{3,4})", label or "")
+        return int(m.group(1)) if m else 0
+
+    entries = [st.get("filename") and
+               {"label": st.get("resolution") or "Highest", "quality": "best"}]
+    seen_filenames = {st.get("filename")}
+    for f in st.get("formats") or []:
+        fn = f.get("filename")
+        if not fn or fn in seen_filenames:
+            continue
+        seen_filenames.add(fn)
+        h = height_of(f.get("label", ""))
+        entries.append({"label": f.get("label", ""),
+                        "quality": str(h) if h else "best"})
+    entries = [e for e in entries if e]
+    entries.append({"label": "audio only (mp3)", "quality": "audio"})
+    return entries
+
+
 def _strip_impersonate(args_list: list[str]) -> list[str]:
     """-J probing doesn't need --impersonate; drop flag and its value."""
     out, skip = [], False
@@ -689,7 +745,7 @@ def cmd_grab(args) -> int:
             result = dl.run(on_progress=progress_cb)
             print()
             if getattr(args, "json_progress", False):
-                print(json.dumps({"type": "done", "path": result.path,
+                print(json.dumps({"type": "done", "path": str(result.path),
                                   "size": result.size}), flush=True)
             else:
                 print(_ok(f"{result.path} {_size_str(result.size)}"
@@ -1029,6 +1085,81 @@ def cmd_doctor(_args) -> int:
     return 0
 
 
+def cmd_qualities(args) -> int:
+    """Machine-readable quality menu for a URL (NDJSON-ish single JSON line).
+
+    Source: 'xd' for X/Twitter posts (bridge resolution ladder), 'ytdlp' for
+    platforms (yt-dlp -J), 'direct' when there is nothing to choose.
+    Responds {"source":..., "title":..., "items":[{label, quality}], "error":?}"""
+    url = args.url
+    out = {"source": None, "title": None, "items": [], "error": None}
+    cfg = _cfg()
+    if X_RE.match(url):
+        out["source"] = "xd"
+        try:
+            st = _xd_resolve(url, ".mp4")
+        except (RuntimeError, OSError) as err:
+            out["error"] = str(err)
+            print(json.dumps(out))
+            return 1
+        out["title"] = st.get("title")
+        out["items"] = _xd_quality_entries(st)
+        print(json.dumps(out))
+        return 0
+
+    # Quality probing only makes sense for platform pages; probing a direct
+    # file with yt-dlp -J can download the whole file during extraction.
+    if not PLATFORM_RE.match(url):
+        out["source"] = "direct"
+        print(json.dumps(out))
+        return 0
+
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp:
+        out["error"] = "yt-dlp not installed (brew install yt-dlp)"
+        print(json.dumps(out))
+        return 1
+    proxy_args = []
+    envp = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") \
+        or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+    if args.proxy:
+        proxy_args = ["--proxy", args.proxy]
+    elif envp:
+        proxy_args = ["--proxy", envp]
+    cookies = []
+    if getattr(args, "cookies", None):
+        cookies = ["--cookies", args.cookies]
+    elif getattr(args, "cookies_from_browser", None):
+        cookies = ["--cookies-from-browser", args.cookies_from_browser]
+    else:
+        preferred = cfg.get("cookies_browser")
+        for b in [preferred, "chrome", "edge", "brave", "firefox", "safari"]:
+            if b:
+                cookies = ["--impersonate", "chrome",
+                           "--cookies-from-browser", b]
+                break
+    strategies = [
+        ("chrome UA", _ytdlp_base_args() + [
+            "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"]),
+        ("impersonate chrome", _ytdlp_base_args() + ["--impersonate", "chrome"]),
+        ("cookies", _ytdlp_base_args() + cookies) if cookies else None,
+    ]
+    strategies = [s for s in strategies if s]
+    info, probe_strategy = _probe_ytdlp_info(ytdlp, strategies, url,
+                                             ["--no-playlist", *proxy_args])
+    if info is None:
+        out["error"] = ("yt-dlp could not read formats for this link "
+                        "(bot check? open/update your preferred browser once, or pass --cookies)")
+        print(json.dumps(out))
+        return 1
+    out["source"] = "ytdlp"
+    out["title"] = info.get("title")
+    out["items"] = _curate_qualities(info)
+    print(json.dumps(out))
+    return 0
+
+
 def cmd_resume(args) -> int:
     states = _find_states()
     if not states:
@@ -1046,6 +1177,7 @@ def cmd_resume(args) -> int:
             print(f"error: id {idx} out of range (1..{len(states)})", file=sys.stderr)
             return 2
         chosen = [states[idx - 1]]
+    as_json = getattr(args, "json_progress", False)
     failures = 0
     for st_path in chosen:
         try:
@@ -1061,18 +1193,41 @@ def cmd_resume(args) -> int:
                         proxy=_cfg().get("proxy") or os.environ.get("HTTPS_PROXY"),
                         resume_state=st_path.read_bytes())
         dl.pid = os.getpid()
-        print(_arrow(f"resuming {out_path.name} ({st.get('size', '?')} bytes total)"))
+        if as_json:
+            print(json.dumps({"type": "start", "url": st.get("url", "")}), flush=True)
+        else:
+            print(_arrow(f"resuming {out_path.name} ({st.get('size', '?')} bytes total)"))
+
+        plain_progress = None if as_json else _make_progress()
+
+        def _cb(done, total, _json=as_json, _plain=plain_progress):
+            if _json:
+                print(json.dumps({"type": "progress", "done": done,
+                                  "total": total}), flush=True)
+            else:
+                _plain(done, total)
+
         try:
-            result = dl.run(on_progress=_make_progress())
-            print()
-            print(_ok(f"{result.path} {_size_str(result.size)}"
-                      + (" [was resumed]" if result.resumed else "")))
+            result = dl.run(on_progress=_cb)
+            if as_json:
+                print(json.dumps({"type": "done", "path": str(result.path),
+                                  "size": result.size}), flush=True)
+            else:
+                print()
+                print(_ok(f"{result.path} {_size_str(result.size)}"
+                          + (" [was resumed]" if result.resumed else "")))
         except KeyboardInterrupt:
             dl.abort()
-            print("\npaused again (state saved)")
+            if as_json:
+                print(json.dumps({"type": "paused"}), flush=True)
+            else:
+                print("\npaused again (state saved)")
             return 130
         except (DownloadError, HttpError, OSError) as err:
-            print(f"FAIL {st_path}: {err}", file=sys.stderr)
+            if as_json:
+                print(json.dumps({"type": "error", "message": str(err)}), flush=True)
+            else:
+                print(f"FAIL {st_path}: {err}", file=sys.stderr)
             failures += 1
     return 0 if not failures else 1
 
@@ -1098,6 +1253,7 @@ def main(argv=None) -> int:
         "pause": cmd_pause,
         "cancel": cmd_cancel, "rm": cmd_cancel, "del": cmd_cancel,
         "doctor": cmd_doctor,
+        "qualities": cmd_qualities, "formats": cmd_qualities,
     }
     try:
         return handlers[args.cmd](args)

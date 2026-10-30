@@ -35,6 +35,36 @@ def test_map_quality():
     assert mgd_cli._map_quality("137+140")[0] == "137+140"
 
 
+def test_curate_qualities():
+    info = {"title": "t", "formats": [
+        {"vcodec": "avc1", "height": 1080, "ext": "mp4", "tbr": 5000},
+        {"vcodec": "avc1", "height": 720, "ext": "mp4", "tbr": 2500},
+        {"vcodec": "avc1", "height": 720, "ext": "webm", "tbr": 1000},
+        {"vcodec": "none", "acodec": "mp4a", "ext": "m4a"},
+        {"vcodec": "vp9", "height": None, "ext": "webm"},
+    ]}
+    items = mgd_cli._curate_qualities(info)
+    labels = [i["label"] for i in items]
+    assert labels[0].startswith("Highest")
+    assert "1080p" in labels[1] and "720p" in labels[2]
+    assert any(i["quality"] == "audio" for i in items)
+    assert [i["quality"] for i in items] == ["best", "1080", "720", "audio"]
+    # no video formats -> just best + audio
+    bare = mgd_cli._curate_qualities({"formats": [
+        {"vcodec": "none", "acodec": "mp4a", "ext": "m4a"}]})
+    assert [i["quality"] for i in bare] == ["best", "audio"]
+
+
+def test_xd_quality_entries():
+    st = {"filename": "a.mp4", "resolution": "854x480",
+          "formats": [{"label": "854x480", "filename": "a.mp4"},  # dup of top
+                      {"label": "640x360", "filename": "b.mp4"},
+                      {"label": "480x270", "filename": "c.mp4"}]}
+    items = mgd_cli._xd_quality_entries(st)
+    assert items[0] == {"label": "854x480", "quality": "best"}
+    assert [i["quality"] for i in items[1:]] == ["360", "270", "audio"]
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")
@@ -80,12 +110,18 @@ def test_pause_then_resume(tmp_path):
         item = json.loads(listed2.stdout)["items"][0]
         assert item["state"] == "paused"
         assert item["done"] > 0
-        # resume completes file byte-perfect
+        # resume completes file byte-perfect; --json-progress must emit
+        # start/progress/done NDJSON (the GUI consumes exactly this)
         content = origin.content
-        res = _mgd(["resume", "1"], timeout=120)
+        res = _mgd(["resume", "1", "--json-progress"], timeout=120)
         final = root / "drip.bin"
         assert final.read_bytes() == content, proc.stdout
-        assert ("✓" in res.stdout) or res.returncode == 0
+        kinds = [json.loads(l)["type"] for l in res.stdout.splitlines()
+                 if l.startswith('{"type"')]
+        assert "start" in kinds and "progress" in kinds and "done" in kinds
+        done_line = [l for l in res.stdout.splitlines() if '"done"' in l][-1]
+        assert json.loads(done_line)["path"] == str(final)
+        assert (res.returncode == 0)
         # list now empty (state cleared)
         listed3 = _mgd(["list", "--json"])
         assert not json.loads(listed3.stdout)["items"]

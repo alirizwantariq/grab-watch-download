@@ -33,13 +33,20 @@ open dist/MediaGrab.app
 ## How it works
 
 - The GUI does not re-implement downloading; it drives the mgd CLI
-  (`mgd grab --json-progress`, `mgd list --json`, `mgd resume`, `mgd pause`,
-  `mgd cancel`, `mgd doctor`), restoring `/opt/homebrew/bin` on `PATH` since
-  GUI apps don't inherit your shell's PATH.
-- Quality choices (`--quality`), category choice (`-t`) map 1:1 to CLI flags.
-- Pause sends SIGTERM to the running `mgd` process; the engine saves exact
-  byte positions and the paused job appears in the list; Resume runs
-  `mgd resume <id>`.
+  (`mgd grab --json-progress`, `mgd qualities`, `mgd list --json`,
+  `mgd resume`, `mgd pause`, `mgd cancel`, `mgd doctor`), restoring
+  `/opt/homebrew/bin` on `PATH` since GUI apps don't inherit your shell's PATH.
+- **Quality chooser:** pressing Grab first asks mgd what the link offers
+  (`mgd qualities`). YouTube links show the yt-dlp resolution ladder, X/Twitter
+  links show the resolver bridge ladder (e.g. 270p/360p/480p), both plus
+  "audio only"; single-file links skip straight to downloading.
+- **Pause/Resume:** each active row has a Pause button (SIGTERM → mgd saves
+  exact byte positions); a paused row shows Resume, which runs `mgd resume <id>`
+  with NDJSON progress. Downloads paused in another terminal (or before the app
+  launched) show up in the "Paused" section with Resume/Cancel buttons — the
+  list refreshes every few seconds.
+- **Completed rows** show a file-type icon (film/music/photo/…) — click it (or
+  "Show") to open the folder containing the file, selected in Finder.
 
 Note: building under Command Line Tools only (no full Xcode), SwiftUI's
 newer `@State` macros are avoided in favor of classic wrappers so `swift
