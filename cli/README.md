@@ -27,9 +27,15 @@ Windows: works the same with `py -m mgd`; config lives under `%APPDATA%\mgd`.
 ## Commands
 
 ```sh
-mgd grab <url>                     # download; HTML pages get media extraction
+mgd grab <url>                     # direct files, pages, YouTube, X/Twitter
 mgd grab <page-url> --pick 2       # grab the 2nd media link found on a page
-mgd grab <page-url> --all          # grab up to 20 found media links
+mgd grab <page-url> --all          # all links (cap --limit, default 50)
+mgd grab "playlist-url" --all      # whole YouTube playlist
+mgd grab "youtu.be/.."             # quality menu (interactive) or --quality 720p|audio
+mgd grab "x.com/user/status/.."    # X/Twitter media via yt-dlp + cookies
+mgd jobs                           # [running]/[paused] + per-item actions
+mgd pause 1 / mgd resume 1 / mgd cancel 1
+mgd doctor                         # engines + config readiness
 mgd grab-page <url> [--json]       # just list media links found on a page
 mgd set-default video ~/Movies     # per-category default directory
 mgd set-default root ~/Downloads   # default root (categories become subdirs)
@@ -91,6 +97,14 @@ page URLs are scanned for `<video>`, `<audio>`, `<source>`, `og:video`,
   cannot defeat interactive bot challenges (Cloudflare Turnstile, etc.) — for
   those, grab the direct media URL from a real browser (or a tool like
   yt-dlp, which this repo's web app already uses) and hand it to `mgd grab`.
+
+## GUI (macOS app)
+
+`gui/` contains a native SwiftUI app (MediaGrab) that drives this engine:
+paste-link window, quality picker, live progress/speed, pause/resume/cancel
+and a diagnostics pane. Build with `gui/script/build_app.sh`; make a
+drag-to-Applications DMG with `gui/script/create_dmg.sh`. See
+`gui/README.md`.
 
 ## Tests
 
