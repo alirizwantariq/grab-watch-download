@@ -267,18 +267,41 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
                     conns=args.conns if args.conns else cfg.get("conns", 6),
                     stopper=Stopper())
     dl.pid = os.getpid()
+    as_json = getattr(args, "json_progress", False)
+    if as_json:
+        print(json.dumps({"type": "start", "url": url}), flush=True)
+
+    def _cb(done: int, total: int | None, _json: bool = as_json) -> None:
+        if _json:
+            print(json.dumps({"type": "progress", "done": done,
+                              "total": total or 0}), flush=True)
+        else:
+            plain(done, total)
+
+    plain = None if (as_json or getattr(args, "quiet", False)) else _make_progress()
     try:
         _journal_record(out_path)
-        result = dl.run(on_progress=None if getattr(args, "quiet", False) else _make_progress())
-        print()
-        print(_ok(f"{result.path} {_size_str(result.size)}"))
+        on_progress = _cb if (as_json or plain is not None) else None
+        result = dl.run(on_progress=on_progress)
+        if as_json:
+            print(json.dumps({"type": "done", "path": str(result.path),
+                              "size": result.size}), flush=True)
+        else:
+            print()
+            print(_ok(f"{result.path} {_size_str(result.size)}"))
         return 0
     except KeyboardInterrupt:
         dl.abort()
-        print("\npaused - resume with: mgd resume", file=sys.stderr)
+        if as_json:
+            print(json.dumps({"type": "paused"}), flush=True)
+        else:
+            print("\npaused - resume with: mgd resume", file=sys.stderr)
         return 130
     except (DownloadError, HttpError, OSError) as err:
-        print(_fail(str(err)), file=sys.stderr)
+        if as_json:
+            print(json.dumps({"type": "error", "message": str(err)}), flush=True)
+        else:
+            print(_fail(str(err)), file=sys.stderr)
         return 1
 
 BOT_CHECK_MARKERS = ("sign in to confirm", "not a bot", "confirm you")
@@ -289,10 +312,53 @@ def _ytdlp_base_args() -> list[str]:
             "--socket-timeout", "30", "--no-check-certificates"]
 
 
-def _run_ytdlp_strategy(ytdlp: str, name: str, cmd: list[str]) -> int:
+def _ytdlp_progress_event(line: str) -> dict | None:
+    """'MGDPROG <done> <total> <estimate>' -> NDJSON progress event.
+
+    yt-dlp prints 'NA' for unknown values; total falls back to the estimate."""
+    parts = line.split()
+    if len(parts) != 4:
+        return None
+
+    def _num(s: str) -> int | None:
+        return int(s) if s.isdigit() else None
+
+    done = _num(parts[1])
+    total = _num(parts[2])
+    est = _num(parts[3])
+    if done is None:
+        return None
+    if total is None or total <= 0:
+        total = est or 0
+    return {"type": "progress", "done": done, "total": total}
+
+
+def _run_ytdlp_strategy(ytdlp: str, name: str, cmd: list[str],
+                        json_progress: bool = False) -> int:
     print(f"# yt-dlp strategy: {name}")
     try:
-        return subprocess.run(cmd).returncode
+        if not json_progress:
+            return subprocess.run(cmd).returncode
+        # GUI mode: stream yt-dlp output, translating the MGD progress
+        # template into NDJSON events and capturing the final file path.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True,
+                                bufsize=1)
+        final_path: str | None = None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if line.startswith("MGDPROG "):
+                ev = _ytdlp_progress_event(line)
+                if ev:
+                    print(json.dumps(ev), flush=True)
+                continue
+            if line.startswith("MGDFINAL "):
+                final_path = line[len("MGDFINAL "):]
+                continue
+            print(line, flush=True)
+        code = proc.wait()
+        if code == 0 and final_path:
+            print(json.dumps({"type": "done", "path": final_path}), flush=True)
+        return code
     except KeyboardInterrupt:
         print("\nstopped (yt-dlp partials resume on rerun)", file=sys.stderr)
         return 130
@@ -608,6 +674,15 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
         dest_args = ["-P", str(categorize.category_dir(cfg, default_cat))]
 
     last_err = ""
+    # GUI/NDJSON mode: make yt-dlp stream progress + final path in a format
+    # _run_ytdlp_strategy translates into the same events mgd emits.
+    dl_flags: list[str] = []
+    if getattr(args, "json_progress", False):
+        dl_flags = ["--newline", "--progress",
+                    "--progress-template",
+                    "download:MGDPROG %(progress.downloaded_bytes)s "
+                    "%(progress.total_bytes)s %(progress.total_bytes_estimate)s",
+                    "--print", "after_move:MGDFINAL %(filepath)s"]
     # For X posts without caller-supplied cookies, guest extraction never
     # succeeds for gated media - limit the chain to the two UA/impersonate
     # strategies and hand off to the bridge quickly.
@@ -616,11 +691,12 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
                        "https://www.twitter.com")) and not explicit_cookies:
         max_strategies = 2
     for name, base in strategies[:max_strategies]:
-        cmd = [ytdlp, *base, *base_flags, *dest_args, *proxy_args]
+        cmd = [ytdlp, *base, *base_flags, *dl_flags, *dest_args, *proxy_args]
         if selector:
             cmd += ["-f", selector]
         cmd += [*quality_extra, url]
-        code = _run_ytdlp_strategy(ytdlp, name, cmd)
+        code = _run_ytdlp_strategy(ytdlp, name, cmd,
+                                   json_progress=getattr(args, "json_progress", False))
         if code == 0:
             return 0
         last_err = f"strategy {name} exited {code}"

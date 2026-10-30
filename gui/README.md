@@ -47,6 +47,13 @@ open dist/MediaGrab.app
   list refreshes every few seconds.
 - **Completed rows** show a file-type icon (film/music/photo/…) — click it (or
   "Show") to open the folder containing the file, selected in Finder.
+- **Delete options:** every completed row has a trash menu with
+  *Remove from list* (keep the file) and *Delete file* (moves it to the Trash);
+  paused rows can be fully deleted (partial data removed). The toolbar has
+  *Clear completed*.
+- All three download paths (direct files, the X/Twitter bridge, yt-dlp) speak
+  the same NDJSON protocol, so progress and the finished file's path always
+  reach the UI (yt-dlp output is translated via `--progress-template`).
 
 Note: building under Command Line Tools only (no full Xcode), SwiftUI's
 newer `@State` macros are avoided in favor of classic wrappers so `swift

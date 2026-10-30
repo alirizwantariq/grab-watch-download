@@ -65,6 +65,19 @@ def test_xd_quality_entries():
     assert [i["quality"] for i in items[1:]] == ["360", "270", "audio"]
 
 
+def test_ytdlp_progress_event():
+    f = mgd_cli._ytdlp_progress_event
+    assert f("MGDPROG 1024 768000 NA") == {"type": "progress", "done": 1024,
+                                           "total": 768000}
+    # unknown total -> fall back to the estimate
+    assert f("MGDPROG 1024 NA 512000") == {"type": "progress", "done": 1024,
+                                           "total": 512000}
+    assert f("MGDPROG 512 768000 768000")["total"] == 768000
+    assert f("MGDPROG x y z") is None
+    assert f("MGDPROG 100") is None
+    assert f("some random output") is None
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")

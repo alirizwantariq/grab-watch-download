@@ -17,29 +17,7 @@ struct MGDPaths {
         return env
     }
 
-    static func run(_ args: [String]) async -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = [mgd] + args
-        p.environment = environment()
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        do {
-            try p.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8) ?? ""
-        } catch {
-            return "error: \(error.localizedDescription)"
-        }
-    }
-
-    /// Long-running one-shot calls (e.g. `mgd qualities`) must not block the
-    /// cooperative pool the rest of the UI uses.
-    static func runDetached(_ args: [String]) async -> String {
-        await Task.detached { MGDPaths.runBlocking(args) }.value
-    }
-
+    /// Blocking one-shot call meant for detached execution.
     static func runBlocking(_ args: [String]) -> String {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -55,6 +33,10 @@ struct MGDPaths {
         } catch {
             return "error: \(error.localizedDescription)"
         }
+    }
+
+    static func run(_ args: [String]) async -> String {
+        await Task.detached { MGDPaths.runBlocking(args) }.value
     }
 
     static func spawn(_ args: [String],
@@ -174,8 +156,11 @@ final class DownloadJob: ObservableObject, Identifiable {
     @Published var bytesPerSecond: Double = 0
     @Published var log: String = ""
     @Published var finishedPath: String?
+    @Published var finishedSize: Int64 = 0
     @Published var showLog = false
     var process: Process?
+    /// fallback path parsed from yt-dlp's "[download] Destination: …" output
+    var candidatePath: String?
     private var lastTick = Date()
     private var lastBytes: Int64 = 0
 
@@ -198,7 +183,8 @@ final class DownloadJob: ObservableObject, Identifiable {
                     phase = .running
                 case "done":
                     finishedPath = obj["path"] as? String
-                    total = (obj["size"] as? NSNumber)?.int64Value ?? total
+                    finishedSize = (obj["size"] as? NSNumber)?.int64Value ?? total
+                    total = finishedSize
                     done = total
                     phase = .done
                 case "error":
@@ -212,7 +198,25 @@ final class DownloadJob: ObservableObject, Identifiable {
                 return
             }
         }
+        // yt-dlp passthrough: keep a candidate path for the finished file in
+        // case the after_move event never fires (file already existed etc.)
+        if let r = line.range(of: "[download] Destination: ") {
+            candidatePath = String(line[r.upperBound...]).trimmingCharacters(
+                in: CharacterSet.whitespaces)
+        } else if line.contains("has already been downloaded") {
+            let inner = line.replacingOccurrences(of: "[download] ", with: "")
+            if let r = inner.range(of: " has already been downloaded") {
+                candidatePath = String(inner[inner.startIndex..<r.lowerBound])
+            }
+        }
         appendLog(line)
+    }
+
+    func finalizeAfterExit(code: Int32) {
+        if finishedPath == nil, let p = candidatePath, !p.isEmpty, code == 0 {
+            finishedPath = p
+            phase = .done
+        }
     }
 
     private func now() {
@@ -255,29 +259,42 @@ final class DownloadJob: ObservableObject, Identifiable {
     }
 }
 
-// MARK: - file icon per extension
+// MARK: - helpers
 
-func fileIcon(forPath path: String, size: CGFloat = 26) -> some View {
+func fmtBytes(_ n: Int64) -> String {
+    let v = Double(n)
+    let units: [(String, Double)] = [("GB", 1_073_741_824.0), ("MB", 1_048_576.0), ("KB", 1024.0)]
+    for (name, div) in units where v >= div {
+        return String(format: "%.1f %@", v / div, name)
+    }
+    return "\(n) B"
+}
+
+func fileSymbol(forPath path: String) -> String {
     let ext = (path as NSString).pathExtension.lowercased()
-    let symbol: String
     switch ext {
     case "mp4", "mov", "mkv", "webm", "avi", "m4v":
-        symbol = "film.fill"
+        return "film.fill"
     case "mp3", "m4a", "wav", "flac", "aac":
-        symbol = "music.note"
+        return "music.note"
     case "jpg", "jpeg", "png", "gif", "webp", "heic":
-        symbol = "photo.fill"
+        return "photo.fill"
     case "zip", "tar", "gz", "7z", "rar", "dmg":
-        symbol = "archivebox"
+        return "archivebox"
     case "pdf", "doc", "docx", "txt", "md":
-        symbol = "doc.text.fill"
+        return "doc.text.fill"
     default:
-        symbol = "arrow.down.doc.fill"
+        return "arrow.down.doc.fill"
     }
-    return Image(systemName: symbol)
-        .font(.system(size: size))
-        .foregroundColor(.accentColor)
-        .help("Show in Finder")
+}
+
+func revealInFinder(_ path: String) {
+    let url = URL(fileURLWithPath: path)
+    if FileManager.default.fileExists(atPath: path) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    } else if let dir = url.deletingLastPathComponent() as URL? {
+        NSWorkspace.shared.open(dir)
+    }
 }
 
 // MARK: - store
@@ -286,6 +303,8 @@ final class JobStore: ObservableObject {
     @Published var jobs: [DownloadJob] = []
     @Published var pausedList: [ListEntry] = []   // paused elsewhere / before launch
     @Published var statusFooter = ""
+
+    // actions: start / pause / resume
 
     func start(_ job: DownloadJob, quality: String, category: String) {
         var args = ["grab", job.url, "--json-progress", "--retries", "8"]
@@ -315,6 +334,7 @@ final class JobStore: ObservableObject {
                     job.phase = .failed
                 }
             }
+            job.finalizeAfterExit(code: code)
             self.refreshPaused()
             self.statusFooter = "\(job.title): \(job.phase.rawValue)"
         })
@@ -327,7 +347,7 @@ final class JobStore: ObservableObject {
             let entries = ListEntry.parse(out)
             guard let entry = entries.first(where: { $0.url == job.url }) else {
                 await MainActor.run {
-                    job.appendLog("could not find that download in `mgd jobs` — try the Paused list")
+                    job.appendLog("could not find that download in `mgd jobs`")
                     self.statusFooter = "resume failed: not found in mgd jobs"
                 }
                 return
@@ -345,6 +365,7 @@ final class JobStore: ObservableObject {
                     case 130: job.phase = .paused
                     default: job.phase = .failed
                     }
+                    job.finalizeAfterExit(code: code)
                     self.refreshPaused()
                 })
                 self.refreshPaused()
@@ -354,7 +375,8 @@ final class JobStore: ObservableObject {
 
     /// Resume one of the externally paused downloads (id known from list).
     func resumeExternal(entry: ListEntry) {
-        let job = DownloadJob(url: entry.url, title: entry.filename.isEmpty ? entry.url : entry.filename)
+        let job = DownloadJob(url: entry.url,
+                              title: entry.filename.isEmpty ? entry.url : entry.filename)
         job.done = entry.done
         job.total = entry.size
         job.phase = .running
@@ -369,9 +391,26 @@ final class JobStore: ObservableObject {
             case 130: job.phase = .paused
             default: job.phase = .failed
             }
+            job.finalizeAfterExit(code: code)
             self.refreshPaused()
         })
         refreshPaused()
+    }
+
+    /// Stop an in-app paused job and delete its partial data.
+    func cancel(job: DownloadJob) {
+        job.pause()   // stop the process if somehow still running
+        Task {
+            let out = await MGDPaths.run(["list", "--json"])
+            if let entry = ListEntry.parse(out).first(where: { $0.url == job.url }) {
+                _ = await MGDPaths.run(["cancel", "\(entry.index)"])
+            }
+            await MainActor.run {
+                self.remove(job)
+                self.statusFooter = "cancelled — partial data deleted"
+                self.refreshPaused()
+            }
+        }
     }
 
     func cancel(entry: ListEntry) {
@@ -379,6 +418,32 @@ final class JobStore: ObservableObject {
             _ = await MGDPaths.run(["cancel", "\(entry.index)"])
             await MainActor.run { self.refreshPaused() }
         }
+    }
+
+    // actions: delete
+
+    func remove(_ job: DownloadJob) {
+        jobs.removeAll { $0.id == job.id }
+    }
+
+    /// Move the finished file to Trash, then drop the row.
+    func trashFile(of job: DownloadJob) {
+        let path = job.finishedPath
+        remove(job)
+        statusFooter = "removed from list: \(job.title)"
+        guard let path, FileManager.default.fileExists(atPath: path) else { return }
+        NSWorkspace.shared.recycle([URL(fileURLWithPath: path)]) { _, err in
+            DispatchQueue.main.async {
+                self.statusFooter = err == nil
+                    ? "moved to Trash: \((path as NSString).lastPathComponent)"
+                    : "could not delete file: \(err!.localizedDescription)"
+            }
+        }
+    }
+
+    func clearFinished() {
+        jobs.removeAll { $0.phase == .done || $0.phase == .failed || $0.phase == .cancelled }
+        statusFooter = "cleared completed downloads"
     }
 
     func refreshPaused() {
@@ -398,7 +463,7 @@ struct MediaGrabApp: App {
     var body: some Scene {
         WindowGroup("MediaGrab") {
             ContentView()
-                .frame(minWidth: 720, minHeight: 560)
+                .frame(minWidth: 740, minHeight: 580)
         }
         .windowStyle(.automatic)
     }
@@ -410,157 +475,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - rows
+// MARK: - UI pieces
+
+func card<Content: View>(_ content: Content) -> some View {
+    content
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(NSColor.controlBackgroundColor))
+                .shadow(color: Color.black.opacity(0.06), radius: 2, y: 1)
+        )
+}
+
+struct SectionHeader: View {
+    let title: String
+    let count: Int
+    let systemImage: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+                .foregroundColor(color)
+            Text(title.uppercased())
+                .font(.caption.weight(.semibold))
+                .foregroundColor(.secondary)
+            Text("\(count)")
+                .font(.caption2.weight(.bold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 5).padding(.vertical, 1)
+                .background(Capsule().fill(color.opacity(0.8)))
+            Spacer()
+        }
+        .padding(.top, 6)
+    }
+}
+
+struct ProgressBar: View {
+    let fraction: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.18))
+                Capsule()
+                    .fill(color)
+                    .frame(width: max(4, geo.size.width * min(1, max(0, fraction))))
+                    .opacity(fraction < 0 ? 0 : 1)
+            }
+        }
+        .frame(height: 6)
+    }
+}
 
 struct ActiveJobRow: View {
     @ObservedObject var job: DownloadJob
     var onResume: () -> Void
+    var onCancel: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            // leading status icon
-            ZStack {
-                switch job.phase {
-                case .running:
-                    ProgressView().controlSize(.regular)
-                case .paused:
-                    Image(systemName: "pause.circle.fill")
-                        .font(.system(size: 22)).foregroundColor(.orange)
-                case .queued:
-                    Image(systemName: "clock.fill")
-                        .font(.system(size: 18)).foregroundColor(.secondary)
-                default:
-                    Image(systemName: "circle.dashed")
-                        .font(.system(size: 18)).foregroundColor(.secondary)
-                }
-            }
-            .frame(width: 30)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(job.title).lineLimit(1).font(.body.weight(.medium))
-                HStack(spacing: 8) {
-                    if job.phase == .running && !job.speedText.isEmpty {
-                        Text(job.speedText).foregroundColor(.secondary)
-                    }
-                    if job.total > 0 {
-                        Text("\(fmtBytes(job.done)) / \(fmtBytes(job.total)) — \(Int(max(0, job.percent)))%")
-                            .foregroundColor(.secondary)
-                    } else if job.phase == .paused {
-                        Text("paused — click ▶ to resume").foregroundColor(.secondary)
-                    }
-                }
-                .font(.caption)
-                if job.total > 0 {
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(Color.secondary.opacity(0.18))
-                            Capsule()
-                                .fill(job.phase == .paused ? Color.orange : Color.accentColor)
-                                .frame(width: max(4, geo.size.width * job.percent / 100))
+        card(
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .center, spacing: 12) {
+                    ZStack {
+                        switch job.phase {
+                        case .running:
+                            ProgressView().controlSize(.regular)
+                        case .paused:
+                            Image(systemName: "pause.circle.fill")
+                                .font(.system(size: 22)).foregroundColor(.orange)
+                        case .queued:
+                            Image(systemName: "clock.fill")
+                                .font(.system(size: 18)).foregroundColor(.secondary)
+                        default:
+                            Image(systemName: "circle.dashed")
+                                .font(.system(size: 18)).foregroundColor(.secondary)
                         }
                     }
-                    .frame(height: 6)
+                    .frame(width: 30)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(job.title).lineLimit(1).font(.body.weight(.medium))
+                        HStack(spacing: 10) {
+                            if job.total > 0 {
+                                Text("\(fmtBytes(job.done)) / \(fmtBytes(job.total)) — \(Int(max(0, job.percent)))%")
+                            }
+                            if job.phase == .running, !job.speedText.isEmpty {
+                                Text("· \(job.speedText)")
+                            }
+                            if job.phase == .paused {
+                                Text("· paused — resume any time")
+                            }
+                        }
+                        .font(.caption).foregroundColor(.secondary)
+                        if job.total > 0 {
+                            ProgressBar(fraction: job.percent / 100,
+                                        color: job.phase == .paused ? .orange : .accentColor)
+                        }
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 6) {
+                        if job.phase == .running || job.phase == .queued {
+                            Button {
+                                job.pause()
+                            } label: {
+                                Label("Pause", systemImage: "pause.fill")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Pause and save progress (you can also pause from any terminal: mgd pause)")
+                        } else if job.phase == .paused {
+                            Button {
+                                onResume()
+                            } label: {
+                                Label("Resume", systemImage: "play.fill")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .help("Continue from saved progress")
+                            Button {
+                                onCancel()
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Stop and delete the partial data")
+                        }
+                        Button {
+                            job.showLog.toggle()
+                        } label: {
+                            Image(systemName: job.showLog ? "chevron.up" : "chevron.down")
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                        .help("Details")
+                    }
+                }
+                if job.showLog {
+                    Text(job.log.suffix(700))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(7)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-
-            Spacer()
-
-            // per-row controls: pause while running, play when paused
-            HStack(spacing: 6) {
-                if job.phase == .running || job.phase == .queued {
-                    Button {
-                        job.pause()
-                    } label: {
-                        Label("Pause", systemImage: "pause")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Pause and save progress (also pauses from any terminal: mgd pause)")
-                } else if job.phase == .paused {
-                    Button {
-                        onResume()
-                    } label: {
-                        Label("Resume", systemImage: "play")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .help("Resume from saved progress")
-                }
-                if !job.log.isEmpty {
-                    Button {
-                        job.showLog.toggle()
-                    } label: {
-                        Image(systemName: "square.and.pencil")
-                    }
-                    .buttonStyle(.borderless)
-                    .controlSize(.small)
-                    .help("Toggle details")
-                }
-            }
-        }
-        .padding(.vertical, 3)
-        if job.showLog {
-            Text(job.log.suffix(600))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(.secondary)
-                .lineLimit(6)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-}
-
-struct FinishedJobRow: View {
-    @ObservedObject var job: DownloadJob
-    var onResume: (() -> Void)? = nil
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            if job.phase == .done {
-                // file icon: click opens the folder holding the file
-                Button {
-                    if let path = job.finishedPath {
-                        NSWorkspace.shared.activateFileViewerSelecting(
-                            [URL(fileURLWithPath: path)])
-                    }
-                } label: {
-                    fileIcon(forPath: job.finishedPath ?? job.title)
-                }
-                .buttonStyle(.borderless)
-            } else {
-                Image(systemName: job.phase == .failed ? "exclamationmark.triangle.fill" : "xmark.circle.fill")
-                    .font(.system(size: 22))
-                    .foregroundColor(.red)
-            }
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(job.title).lineLimit(1).font(.body.weight(.medium))
-                if job.phase == .done, let path = job.finishedPath {
-                    Text((path as NSString).abbreviatingWithTildeInPath)
-                        .font(.caption).foregroundColor(.secondary).lineLimit(1)
-                    Text("Click the file icon to open its folder")
-                        .font(.caption2).foregroundColor(.secondary.opacity(0.7))
-                } else if job.phase == .failed {
-                    Text(job.log.suffix(300).replacingOccurrences(of: "\n", with: " → "))
-                        .font(.caption).foregroundColor(.secondary).lineLimit(1)
-                }
-            }
-
-            Spacer()
-
-            if job.phase == .done, let path = job.finishedPath {
-                HStack(spacing: 10) {
-                    Button {
-                        NSWorkspace.shared.activateFileViewerSelecting(
-                            [URL(fileURLWithPath: path)])
-                    } label: {
-                        Label("Show", systemImage: "folder")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            }
-        }
-        .padding(.vertical, 3)
+        )
     }
 }
 
@@ -570,36 +635,108 @@ struct ExternalPausedRow: View {
     var onCancel: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Image(systemName: "pause.circle.fill")
-                .font(.system(size: 22)).foregroundColor(.orange)
-                .padding(.leading, 30)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(entry.filename.isEmpty ? entry.url : entry.filename)
-                    .lineLimit(1).font(.body.weight(.medium))
-                Text(entry.filename.isEmpty
-                     ? "\(fmtBytes(entry.done)) of \(fmtBytes(entry.size))"
-                     : "\(fmtBytes(entry.done)) / \(fmtBytes(entry.size)) — \(entry.url)")
-                    .font(.caption).foregroundColor(.secondary).lineLimit(1)
+        card(
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: "pause.circle.fill")
+                    .font(.system(size: 22)).foregroundColor(.orange)
+                    .padding(.leading, 8)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(entry.filename.isEmpty ? entry.url : entry.filename)
+                        .lineLimit(1).font(.body.weight(.medium))
+                    Text("\(fmtBytes(entry.done)) / \(fmtBytes(entry.size)) — \(entry.url)")
+                        .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                }
+                Spacer()
+                Button {
+                    onResume()
+                } label: {
+                    Label("Resume", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Button {
+                    onCancel()
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Stop and delete the partial data")
             }
-            Spacer()
-            Button {
-                onResume()
-            } label: {
-                Label("Resume", systemImage: "play")
+        )
+    }
+}
+
+struct FinishedJobRow: View {
+    @ObservedObject var job: DownloadJob
+    var onRemove: () -> Void
+    var onTrashFile: () -> Void
+
+    var body: some View {
+        card(
+            HStack(alignment: .center, spacing: 12) {
+                if job.phase == .done, let path = job.finishedPath {
+                    Button {
+                        revealInFinder(path)
+                    } label: {
+                        Image(systemName: fileSymbol(forPath: path))
+                            .font(.system(size: 26))
+                            .foregroundColor(.accentColor)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Open the folder containing this file")
+                } else {
+                    Image(systemName: job.phase == .failed
+                          ? "exclamationmark.triangle.fill" : "xmark.circle.fill")
+                        .font(.system(size: 24)).foregroundColor(.red)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        if job.phase == .done {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption).foregroundColor(.green)
+                        }
+                        Text(job.title).lineLimit(1).font(.body.weight(.medium))
+                    }
+                    if job.phase == .done, let path = job.finishedPath {
+                        Text("\(path) · \(fmtBytes(job.finishedSize > 0 ? job.finishedSize : job.total))")
+                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    } else if job.phase == .failed || job.phase == .cancelled {
+                        Text(job.log.suffix(220).replacingOccurrences(of: "\n", with: " → "))
+                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    }
+                }
+
+                Spacer()
+
+                if job.phase == .done, let path = job.finishedPath {
+                    Button {
+                        revealInFinder(path)
+                    } label: {
+                        Label("Show", systemImage: "folder")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Open the folder containing this file")
+                }
+                Menu {
+                    Button("Remove from list", action: onRemove)
+                        .help("Keep the file, forget this row")
+                    if job.finishedPath != nil {
+                        Divider()
+                        Button("Delete file (moves to Trash)", action: onTrashFile)
+                            .help("Move the downloaded file to the Trash")
+                    }
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .menuStyle(.borderlessButton)
+                .frame(width: 30)
+                .fixedSize()
+                .help("Delete options")
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            Button {
-                onCancel()
-            } label: {
-                Label("Cancel", systemImage: "trash")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Stop and delete the partial file")
-        }
-        .padding(.vertical, 3)
+        )
     }
 }
 
@@ -672,7 +809,7 @@ struct QualitySheet: View {
             }
         }
         .padding(20)
-        .frame(width: 420)
+        .frame(width: 430)
     }
 }
 
@@ -691,17 +828,16 @@ struct ContentView: View {
     private let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             header
             Divider()
-            jobsList
+            jobsArea
             Divider()
             footer
         }
         .padding(.vertical, 10)
         .onAppear { store.refreshPaused() }
         .onReceive(timer) { _ in store.refreshPaused() }
-        .onReceive(store.$jobs) { _ in }   // keeps published changes flowing
         .sheet(item: $session.qualitySheet) { probe in
             QualitySheet(probe: probe, onStart: { quality in
                 begin(url: probe.url, quality: quality)
@@ -726,12 +862,22 @@ struct ContentView: View {
                 .disabled(!store.jobs.contains { $0.phase == .running })
             }
             ToolbarItem {
+                Button {
+                    store.clearFinished()
+                } label: {
+                    Label("Clear completed", systemImage: "trash.slash")
+                }
+                .disabled(!store.jobs.contains {
+                    $0.phase == .done || $0.phase == .failed || $0.phase == .cancelled
+                })
+            }
+            ToolbarItem {
                 Menu {
                     Button("mgd doctor") {
-                        Task { store.statusFooter = await MGDPaths.runDetached(["doctor"]) }
+                        Task { store.statusFooter = await MGDPaths.run(["doctor"]) }
                     }
                     Button("mgd defaults") {
-                        Task { store.statusFooter = await MGDPaths.runDetached(["defaults"]) }
+                        Task { store.statusFooter = await MGDPaths.run(["defaults"]) }
                     }
                     Button("Open download root") {
                         NSWorkspace.shared.open(URL(fileURLWithPath:
@@ -745,9 +891,20 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 30))
+                    .foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("MediaGrab").font(.title3.bold())
+                    Text("Segmented, resumable downloads — any file, page, YouTube or X/Twitter")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+            }
             HStack(spacing: 8) {
-                TextField("Paste any file, page, YouTube or X link…",
+                TextField("Paste a link: file, page, youtube.com, x.com …",
                           text: $session.urlString)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(grab)
@@ -758,59 +915,72 @@ struct ContentView: View {
                     grab()
                 } label: {
                     Label("Grab", systemImage: "arrow.down.circle.fill")
-                        .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
                 .disabled(session.urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                           || session.probing)
             }
-            Text("Multiple qualities are offered automatically when the link has several resolutions (YouTube, X/Twitter, and direct pages).")
+            Text("If the link has several resolutions, MediaGrab asks which one you want. " +
+                 "Downloads can be paused and resumed at any time — even from another terminal.")
                 .font(.caption).foregroundColor(.secondary)
         }
         .padding(.horizontal)
     }
 
-    private var jobsList: some View {
-        let active = store.jobs.filter { $0.phase == .queued || $0.phase == .running || $0.phase == .paused }
-        let finished = store.jobs.filter { $0.phase == .done || $0.phase == .failed || $0.phase == .cancelled }
+    private var jobsArea: some View {
+        let active = store.jobs.filter {
+            $0.phase == .queued || $0.phase == .running || $0.phase == .paused
+        }
+        let finished = store.jobs.filter {
+            $0.phase == .done || $0.phase == .failed || $0.phase == .cancelled
+        }
         return Group {
             if active.isEmpty && finished.isEmpty && store.pausedList.isEmpty {
-                VStack(spacing: 6) {
+                VStack(spacing: 8) {
                     Image(systemName: "tray")
-                        .font(.system(size: 30)).foregroundColor(.secondary.opacity(0.5))
-                    Text("No downloads yet")
-                        .foregroundColor(.secondary)
-                    Text("Paste a link above; downloads pause/resume losslessly.")
+                        .font(.system(size: 34)).foregroundColor(.secondary.opacity(0.5))
+                    Text("No downloads yet").foregroundColor(.secondary)
+                    Text("Paste a link above to start. " +
+                         "Finished files show a file icon — click it to open its folder.")
                         .font(.caption).foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List {
-                    if !active.isEmpty {
-                        Section("Downloading") {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        if !active.isEmpty {
+                            SectionHeader(title: "Downloading", count: active.count,
+                                          systemImage: "arrow.down.circle", color: .accentColor)
                             ForEach(active) { job in
                                 ActiveJobRow(job: job,
-                                             onResume: { store.resume(job: job) })
+                                             onResume: { store.resume(job: job) },
+                                             onCancel: { store.cancel(job: job) })
                             }
                         }
-                    }
-                    if !store.pausedList.isEmpty {
-                        Section("Paused (saved from earlier or another terminal)") {
+                        if !store.pausedList.isEmpty {
+                            SectionHeader(title: "Paused elsewhere",
+                                          count: store.pausedList.count,
+                                          systemImage: "pause.circle", color: .orange)
                             ForEach(store.pausedList) { entry in
                                 ExternalPausedRow(entry: entry,
                                                   onResume: { store.resumeExternal(entry: entry) },
                                                   onCancel: { store.cancel(entry: entry) })
                             }
                         }
-                    }
-                    if !finished.isEmpty {
-                        Section("Completed") {
+                        if !finished.isEmpty {
+                            SectionHeader(title: "Completed", count: finished.count,
+                                          systemImage: "checkmark.circle", color: .green)
                             ForEach(finished) { job in
-                                FinishedJobRow(job: job)
+                                FinishedJobRow(job: job,
+                                               onRemove: { store.remove(job) },
+                                               onTrashFile: { store.trashFile(of: job) })
                             }
                         }
                     }
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
                 }
             }
         }
@@ -850,8 +1020,10 @@ struct ContentView: View {
     }
 
     var latestLog: String {
-        store.jobs.first?.log.isEmpty == false
-            ? store.jobs.first!.log : "no engine output yet"
+        if let first = store.jobs.first, !first.log.isEmpty {
+            return first.log
+        }
+        return "no engine output yet"
     }
 
     // MARK: grab flow
@@ -861,7 +1033,7 @@ struct ContentView: View {
         guard !url.isEmpty, !session.probing else { return }
         session.probing = true
         Task {
-            let out = await MGDPaths.runDetached(["qualities", url])
+            let out = await MGDPaths.run(["qualities", url])
             await MainActor.run {
                 session.probing = false
                 session.urlString = ""
@@ -869,7 +1041,6 @@ struct ContentView: View {
                 if probe.options.count > 1 {
                     session.qualitySheet = probe
                 } else if let err = probe.error, probe.options.isEmpty {
-                    // couldn't inspect: still offer a plain automatic grab
                     store.statusFooter = "quality check failed — \(err)"
                     session.qualitySheet = probe
                 } else {
@@ -883,13 +1054,4 @@ struct ContentView: View {
         session.qualitySheet = nil
         store.start(DownloadJob(url: url), quality: quality, category: "auto")
     }
-}
-
-func fmtBytes(_ n: Int64) -> String {
-    let v = Double(n)
-    let units: [(String, Double)] = [("GB", 1_073_741_824.0), ("MB", 1_048_576.0), ("KB", 1024.0)]
-    for (name, div) in units where v >= div {
-        return String(format: "%.1f %@", v / div, name)
-    }
-    return "\(n) B"
 }
