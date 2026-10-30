@@ -32,7 +32,12 @@ mgd grab <page-url> --pick 2       # grab the 2nd media link found on a page
 mgd grab <page-url> --all          # all links (cap --limit, default 50)
 mgd grab "playlist-url" --all      # whole YouTube playlist
 mgd grab "youtu.be/.."             # quality menu (interactive) or --quality 720p|audio
-mgd grab "x.com/user/status/.."    # X/Twitter media via yt-dlp + cookies
+mgd grab "x.com/user/status/.."    # X/Twitter media: yt-dlp guest flow first,
+                                   # then the x-downloader.com bridge for
+                                   # login-gated posts (auto fallback)
+mgd grab "x.com/.." -Q 480         # bridge returns a resolution ladder (2xx/4xx)
+mgd grab "x.com/.." -Q audio       # same bridge converts to mp3
+mgd grab "x.com/.." --resolver ytdlp|x  # force a resolver (default auto)
 mgd jobs                           # [running]/[paused] + per-item actions
 mgd pause 1 / mgd resume 1 / mgd cancel 1
 mgd doctor                         # engines + config readiness

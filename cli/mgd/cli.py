@@ -59,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--cookies", default=None, help="Netscape cookie file for yt-dlp")
     g.add_argument("--cookies-from-browser", default=None,
                    help="browser to pull cookies from for yt-dlp: chrome, firefox, edge, safari, brave")
+    g.add_argument("--resolver", default=None, choices=["auto", "ytdlp", "xd"],
+                   help="X/Twitter resolver: auto (yt-dlp then bridge), ytdlp, xd")
     g.add_argument("-c", "--conns", type=int, default=None)
     g.add_argument("-r", "--retries", type=int, default=None)
     g.add_argument("--sha256", default=None, help="expected SHA-256 to verify")
@@ -134,6 +136,141 @@ QUALITY_PATTERNS = ["best", "audio"]
 
 def _is_platform(url: str) -> bool:
     return bool(PLATFORM_RE.match(url) or X_RE.match(url))
+
+
+# ── X/Twitter third-party resolver bridge (x-downloader.com public API) ────
+XD_API = "https://api.x-downloader.com"
+XD_UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+         "Origin": "https://x-downloader.com", "Referer": "https://x-downloader.com/"}
+
+
+def _xd_post(path: str, payload: dict, timeout: float = 30.0) -> dict:
+    import urllib.request
+    req = urllib.request.Request(f"{XD_API}{path}", data=json.dumps(payload).encode(),
+                                 headers={**XD_UA, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _xd_get_state(req_id: str, timeout: float = 30.0) -> dict:
+    import urllib.request
+    req = urllib.request.Request(f"{XD_API}/download/{req_id}", headers=XD_UA)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _xd_resolve(tweet_url: str, type_ext: str = ".mp4", deadline: float = 75.0) -> dict:
+    """validate -> request -> poll /download/<id> until finished|error.
+    Raises RuntimeError with the service's own explanation on error."""
+    _xd_post("/validate", {"url": tweet_url})
+    resp = _xd_post("/request", {"url": tweet_url, "type": type_ext})
+    req_id = resp.get("_id")
+    if not req_id:
+        raise RuntimeError("resolver did not accept the link")
+    start = time.monotonic()
+    while True:
+        time.sleep(2.0)
+        st = _xd_get_state(req_id)
+        if st.get("status") in ("finished", "error"):
+            if st.get("status") == "error":
+                msg = (st.get("error") or "the tweet could not be resolved").lower()
+                if "account owner" in msg or "author limit" in msg:
+                    raise RuntimeError(
+                        "X is gating this tweet (author limits who can view it) - "
+                        "a signed-in cookie session is required for it")
+                if "no video" in msg:
+                    raise RuntimeError("no downloadable video in this tweet")
+                if "withheld" in msg or "moderator" in msg:
+                    raise RuntimeError("this tweet is withheld/removed from X")
+                raise RuntimeError(f"resolver error: {msg}")
+            return st
+        if time.monotonic() - start > deadline:
+            raise RuntimeError("resolver timed out preparing the download")
+
+
+def _xd_pick_format(st: dict, quality: str | None, interactive: bool) -> dict:
+    """Choose (host, filename) from the finished response's quality ladder."""
+    formats = st.get("formats") or []
+    top = {"host": st.get("host"), "filename": st.get("filename"),
+           "label": st.get("resolution") or "Highest"}
+
+    def height_of(label: str) -> int:
+        import re as _re
+        m = _re.search(r"x(\d{3,4})", label or "")
+        return int(m.group(1)) if m else 0
+
+    # dedupe: top-level entry equals the highest variant usually
+    entries = [top]
+    for f in formats:
+        if f.get("filename") and f["filename"] != top.get("filename"):
+            entries.append({"host": f.get("host"), "filename": f["filename"],
+                            "label": f.get("label", "")})
+    entries.sort(key=lambda e: -height_of(e.get("label", "")))
+    if quality and re.fullmatch(r"\d{3,4}p?", quality.strip().lower()):
+        n = int(re.sub(r"p", "", quality.strip().lower()))
+        fits = [e for e in entries if height_of(e["label"]) and height_of(e["label"]) <= n]
+        return fits[0] if fits else entries[0]
+    if quality == "best":
+        return entries[0]
+    if interactive and len(entries) > 1:
+        print(f"\n{st.get('title') or 'X video'} — choose quality:")
+        for i, e in enumerate(entries, 1):
+            print(f"  {i}. {e.get('label') or 'best'}")
+        try:
+            ans = input(f"quality [1-{len(entries)}] (Enter=1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return entries[0]
+        if ans.isdigit() and 1 <= int(ans) <= len(entries):
+            return entries[int(ans) - 1]
+    return entries[0]
+
+
+def _grab_via_xd(args, cfg: dict, url: str) -> int:
+    """Resolve an X/Twitter URL through the public x-downloader.com bridge,
+    then download with mgd's segmented engine (parallel + resumable)."""
+    try:
+        type_ext = ".mp3" if (args.quality or "").lower() in ("audio", "mp3") else ".mp4"
+        st = _xd_resolve(url, type_ext)
+        chosen = _xd_pick_format(st, args.quality if type_ext == ".mp4" else "best",
+                                 sys.stdin.isatty())
+        if not chosen.get("host") or not chosen.get("filename"):
+            raise RuntimeError("resolver returned no media")
+        dl_url = f"https://{chosen['host']}/{chosen['filename']}"
+        print(_arrow(f"{st.get('title') or url} [{chosen.get('label', 'best')}]"))
+    except RuntimeError as err:
+        print(f"error: {err}", file=sys.stderr)
+        print("To download gated posts yourself, export cookies with a browser "
+              "extension and run: mgd grab URL --cookies cookies.txt", file=sys.stderr)
+        return 1
+    category = "audio" if type_ext == ".mp3" else (args.filetype or "video")
+    if args.out:
+        out_path = pathlib.Path(os.path.expanduser(args.out))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = pathlib.Path(os.path.expanduser(args.dir)) if args.dir \
+            else categorize.category_dir(cfg, category)
+        from .engine import _url_filename
+        out_path = categorize.unique_path(out_dir, _url_filename(dl_url))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    dl = Downloader(dl_url, out_path, proxy=args.proxy,
+                    conns=args.conns if args.conns else cfg.get("conns", 6),
+                    stopper=Stopper())
+    dl.pid = os.getpid()
+    try:
+        _journal_record(out_path)
+        result = dl.run(on_progress=None if getattr(args, "quiet", False) else _make_progress())
+        print()
+        print(_ok(f"{result.path} {_size_str(result.size)}"))
+        return 0
+    except KeyboardInterrupt:
+        dl.abort()
+        print("\npaused - resume with: mgd resume", file=sys.stderr)
+        return 130
+    except (DownloadError, HttpError, OSError) as err:
+        print(_fail(str(err)), file=sys.stderr)
+        return 1
 
 BOT_CHECK_MARKERS = ("sign in to confirm", "not a bot", "confirm you")
 
@@ -415,7 +552,14 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
         dest_args = ["-P", str(categorize.category_dir(cfg, default_cat))]
 
     last_err = ""
-    for name, base in strategies:
+    # For X posts without caller-supplied cookies, guest extraction never
+    # succeeds for gated media - limit the chain to the two UA/impersonate
+    # strategies and hand off to the bridge quickly.
+    max_strategies = len(strategies)
+    if url.startswith(("https://x.com", "https://twitter.com", "https://www.x.com",
+                       "https://www.twitter.com")) and not explicit_cookies:
+        max_strategies = 2
+    for name, base in strategies[:max_strategies]:
         cmd = [ytdlp, *base, *base_flags, *dest_args, *proxy_args]
         if selector:
             cmd += ["-f", selector]
@@ -424,6 +568,17 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
         if code == 0:
             return 0
         last_err = f"strategy {name} exited {code}"
+
+    # ── third-party resolver bridge for gated X posts ────────────────────
+    resolver = getattr(args, "resolver", None) or cfg.get("resolver", "auto")
+    if X_RE.match(url) and resolver in ("auto", "xd"):
+        print("# yt-dlp could not resolve this X post - trying the "
+              "x-downloader.com bridge")
+        if resolver == "auto" and explicit_cookies:
+            # caller supplied cookies: one more targeted yt-dlp retry is pointless, bridge anyway
+            pass
+        return _grab_via_xd(args, cfg, url)
+
     hint = ""
     if getattr(args, "cookies_from_browser", None) is None:
         hint = ("\nTip: open this link once in your browser (solve any "
