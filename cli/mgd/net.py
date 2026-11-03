@@ -262,6 +262,10 @@ def _open_request_once(url: str, proxy: str | None, method: str = "GET",
         path += "?" + p.query
     if via_forward_proxy:
         path = f"{p.scheme}://{p.netloc}{path}"
+    if not path.isascii():
+        # emoji/international URLs: http.client request lines are ASCII-only;
+        # percent-encode raw bytes (existing %XX sequences stay intact)
+        path = u.quote(path, safe="/%:@=&?~#+$,;!*'()[]")
     h = {
         "User-Agent": DEFAULT_UA,
         "Accept-Encoding": "identity",

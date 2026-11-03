@@ -78,6 +78,46 @@ def test_ytdlp_progress_event():
     assert f("some random output") is None
 
 
+def test_unicode_url_downloads(tmp_path):
+    """URLs with emoji/international characters must be percent-encoded on the
+    wire (http.client request lines are ASCII-only) and still download."""
+    import http.server
+    import threading
+    import urllib.parse
+    from mgd import engine
+
+    content = bytes(range(64)) * 40
+    seen = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen["path"] = self.path
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/dir/chili🌶️_file.bin"
+        out = tmp_path / "out.bin"
+        dl = engine.Downloader(url, out, conns=1)
+        dl.run()
+        assert out.read_bytes() == content
+        assert "%" in seen["path"] and seen["path"].isascii(), \
+            f"server saw non-encoded path: {seen['path']!r}"
+        assert "chili" in urllib.parse.unquote(seen["path"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")
