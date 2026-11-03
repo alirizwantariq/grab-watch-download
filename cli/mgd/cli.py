@@ -246,7 +246,10 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
                                  sys.stdin.isatty())
         if not chosen.get("host") or not chosen.get("filename"):
             raise RuntimeError("resolver returned no media")
-        dl_url = f"https://{chosen['host']}/{chosen['filename']}"
+        raw_name = chosen["filename"]          # e.g. v/AbCdEf/Title_🌶️_xY.mp4
+        dl_url = f"https://{chosen['host']}/" \
+                 f"{u.quote(raw_name, safe='/')}"
+        local_name = pathlib.PurePosixPath(raw_name).name  # keep emoji etc.
         print(_arrow(f"{st.get('title') or url} [{chosen.get('label', 'best')}]"))
     except RuntimeError as err:
         print(f"error: {err}", file=sys.stderr)
@@ -261,7 +264,8 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
         out_dir = pathlib.Path(os.path.expanduser(args.dir)) if args.dir \
             else categorize.category_dir(cfg, category)
         from .engine import _url_filename
-        out_path = categorize.unique_path(out_dir, _url_filename(dl_url))
+        out_path = categorize.unique_path(
+            out_dir, local_name or _url_filename(dl_url))
         out_path.parent.mkdir(parents=True, exist_ok=True)
     dl = Downloader(dl_url, out_path, proxy=args.proxy,
                     conns=args.conns if args.conns else cfg.get("conns", 6),
