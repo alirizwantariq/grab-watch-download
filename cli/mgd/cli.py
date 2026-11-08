@@ -753,6 +753,11 @@ def cmd_grab(args) -> int:
         print(f"error: {err} - this host may block automated clients "
               "(try --proxy or a different network)", file=sys.stderr)
         return 1
+    except OSError as err:
+        print(f"error: could not reach the host after retries: "
+              f"{type(err).__name__}: {err}\n(try again, or use --proxy / a "
+              "different network)", file=sys.stderr)
+        return 1
     if page_links is None:
         targets = [{"url": args.url, "kind": "direct", "title": ""}]
     else:
@@ -848,26 +853,39 @@ def cmd_grab(args) -> int:
     return 1 if failures and not results else 0
 
 
-def _page_media(url: str, headers: dict, proxy: str | None):
-    """None if url is a plain file; [{kind,url,title}] if it is an HTML page."""
-    conn, resp = net.open_request(url, proxy, "GET",
-                                  headers=headers or None, timeout=DEFAULT_TIMEOUT)
-    close = getattr(conn, "close", None)
-    try:
-        status = resp.status
-        if status >= 400:
-            raise HttpError(status)
-        body_head = resp.read(4096)
-        if not grab.is_html(resp.getheader("Content-Type"), body_head):
-            return None
-        html = (body_head + resp.read()).decode("utf-8", "replace")
-        return grab.extract_links(html, url)
-    finally:
-        if callable(close):
+def _page_media(url: str, headers: dict, proxy: str | None,
+                attempts: int = 3):
+    """None if url is a plain file; [{kind,url,title}] if it is an HTML page.
+    Retries transient connection failures (TLS hiccups, resets)."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        conn = None
+        try:
+            conn, resp = net.open_request(url, proxy, "GET",
+                                           headers=headers or None,
+                                           timeout=DEFAULT_TIMEOUT)
+            close = getattr(conn, "close", None)
             try:
-                close()
-            except OSError:
-                pass
+                status = resp.status
+                if status >= 400:
+                    raise HttpError(status)
+                body_head = resp.read(4096)
+                if not grab.is_html(resp.getheader("Content-Type"), body_head):
+                    return None
+                html = (body_head + resp.read()).decode("utf-8", "replace")
+                return grab.extract_links(html, url)
+            finally:
+                if callable(close):
+                    try:
+                        close()
+                    except OSError:
+                        pass
+        except OSError as exc:
+            # ssl.SSLError (e.g. BAD_SIGNATURE), resets, timeouts: transient
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(min(2.0, 0.5 * (2 ** (attempt - 1))))
+    raise last_exc if last_exc else HttpError(500, "page fetch failed")
 
 
 def _destination(args, cfg: dict, url: str) -> pathlib.Path:

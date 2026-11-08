@@ -1,16 +1,26 @@
 """Segmented, resumable download engine.
 
-Design notes are drawn from the behavior documented on IDM's own site
-(internetdownloadmanager.com/support/segmentation.html):
-  - dynamic segmentation: large unclaimed ranges are split in half when a new
-    connection claims work, instead of splitting the whole file up front
-  - finished connections are reused for the next range without reconnect and
-    login stages (one keep-alive connection per worker; we reconnect per range,
-    since proxies make long-lived sockets less reliable - see README)
-  - file positions are saved repeatedly during download so an interrupted or
-    power-lost download can resume and assemble correctly
+Strategy notes, drawn from the two reference implementations of "optimal"
+downloading (researched Nov 2026):
+
+aria2 1.37.0 (shipped binary analyzed via REA, arm64 Mach-O
+sha256 503c7b58b64e76af21ac9f0f96cca8749617c25f997739b8346cdf7c47fd99e3):
+  - "--min-split-size=SIZE: aria2 does not split less than 2*SIZE byte
+    range" (default 20M) - parallel connections only pay off for big files;
+    we use the same rule with MIN_BYTES_PER_CONN (one conn per ~8 MiB)
+  - --max-connection-per-server is capped at 16 (our MAX_CONNS)
+  - per-download retry budget with retry-wait backoff (our retries + backoff)
+
+IDM (internetdownloadmanager.com, "Dynamic segmentation"):
+  - "segments downloaded files dynamically during download process and
+    reuses available connections" - unclaimed ranges are split in half when
+    a new connection claims work (our _claim), and idle workers steal the
+    tail half of the largest in-flight range (our tail-stealing), which is
+    what keeps one slow connection from stalling the last 1% of a file
+  - file positions are saved repeatedly so interruptions resume exactly
 
 On top of that: per-range retry with exponential backoff and jitter,
+probe retry for transient TLS/connection failures (BAD_SIGNATURE etc.),
 ETag/If-Range staleness validation, size verification, optional SHA-256
 verification, and proxy support (HTTP CONNECT, TLS-wrapped proxy, SOCKS5).
 """
@@ -31,6 +41,9 @@ CHUNK = 256 * 1024
 STATE_SUFFIX = ".mgdstate"
 PART_SUFFIX = ".mgdpart"
 SPLIT_THRESHOLD = 4 * 1024 * 1024  # ranges bigger than this get split when claimed again
+STEAL_THRESHOLD = 4 * 1024 * 1024  # in-flight tails bigger than 2x this get stolen
+MIN_BYTES_PER_CONN = 8 * 1024 * 1024  # aria2's "2 * min-split-size" rule per connection
+MAX_CONNS = 16                       # aria2's --max-connection-per-server cap
 STATE_SAVE_INTERVAL = 0.5
 RETRY_BACKOFF_BASE = 0.5
 RETRY_BACKOFF_CAP = 30.0
@@ -172,7 +185,7 @@ class Downloader:
         self.url = url
         self.out_path = pathlib.Path(out_path).expanduser()
         self.proxy = proxy
-        self.conns = max(1, int(conns))
+        self.conns = max(1, min(MAX_CONNS, int(conns)))
         self.retries = max(1, int(retries))
         self.stopper = stopper or Stopper()
         self.expected_sha256 = expected_sha256
@@ -202,7 +215,7 @@ class Downloader:
         self._on_progress = on_progress
         self._last_notify = 0.0
         while True:
-            pr = probe(self.url, self.proxy, self.timeout)
+            pr = self._probe_with_retries()
             if getattr(pr, "final_url", None) and pr.final_url != pr.url:
                 self.url = pr.final_url
                 pr.url = pr.final_url
@@ -225,6 +238,32 @@ class Downloader:
                 self._close_part()
                 raise
         return self._finalize()
+
+    def _probe_with_retries(self) -> ProbeResult:
+        """Probe with bounded retries and backoff: TLS handshake hiccups
+        (BAD_SIGNATURE), connection resets and timeouts are transient and
+        must not kill the download. 4xx answers are real and fail fast."""
+        attempt = 0
+        while True:
+            attempt += 1
+            self.stopper.check()
+            try:
+                return probe(self.url, self.proxy, self.timeout)
+            except Interrupted:
+                raise
+            except HttpError as exc:
+                if 400 <= exc.status < 500 and exc.status not in RETRYABLE_STATUS:
+                    raise
+                if attempt >= self.retries:
+                    raise DownloadError(
+                        f"server unreachable after {attempt} probes: {exc}") from exc
+                self._backoff_sleep(attempt)
+            except (TimeoutError, OSError) as exc:
+                if attempt >= self.retries:
+                    raise DownloadError(
+                        f"could not reach the server after {attempt} probes: "
+                        f"{type(exc).__name__}: {exc}") from exc
+                self._backoff_sleep(attempt)
 
     # ── init / resume ─────────────────────────────────────────────────────
     def _init_for(self, pr: ProbeResult) -> None:
@@ -293,7 +332,7 @@ class Downloader:
             self.resumed = False
             self._start_fresh(self._current_probe())
         streaming = self._streaming_mode()
-        pool = 1 if streaming else self.conns
+        pool = 1 if streaming else self.effective_conns(self._size, self.conns)
         workers = [threading.Thread(target=self._worker, daemon=True)
                    for _ in range(pool)]
         for w in workers:
@@ -305,6 +344,15 @@ class Downloader:
             err = self._error
             self._error = None
             raise err
+
+    @staticmethod
+    def effective_conns(size: int | None, conns: int) -> int:
+        """aria2's '2 * min-split-size' rule: only pay for parallel
+        connections when the file is big enough for each connection to
+        matter. One connection per MIN_BYTES_PER_CONN of file."""
+        if not size:
+            return conns
+        return max(1, min(conns, size // MIN_BYTES_PER_CONN))
 
     def _streaming_mode(self) -> bool:
         return not self._accept_ranges
@@ -345,20 +393,38 @@ class Downloader:
     def _claim(self, wid: str) -> Segment | None:
         with self._seg_lock:
             unclaimed = [s for s in self._segments if s.owner is None and not s.done()]
-            if not unclaimed:
+            if unclaimed:
+                largest = max(unclaimed, key=lambda s: s.span() if s.end >= 0 else 1)
+                # IDM-style dynamic segmentation: a fresh claimer splits a
+                # large unclaimed range in half and takes the second half.
+                if largest.end >= 0 and largest.span() > SPLIT_THRESHOLD:
+                    mid = largest.start + (largest.span() // 2) - 1
+                    right = Segment(mid + 1, largest.end)
+                    largest.end = mid
+                    largest.owner = None
+                    right.owner = wid
+                    self._segments.append(right)  # track for state/resume
+                    return right
+                largest.owner = wid
+                return largest
+            # everything is claimed: IDM-style work stealing. Take the tail
+            # half of the largest in-flight range so a straggler connection
+            # cannot leave the download stuck at 99%. _stream's per-chunk
+            # boundary re-check keeps the original owner inside its range.
+            inflight = [s for s in self._segments
+                        if s.owner is not None and not s.done() and s.end >= 0]
+            if not inflight:
                 return None
-            largest = max(unclaimed, key=lambda s: s.span() if s.end >= 0 else 1)
-            # IDM-style dynamic segmentation: a fresh claimer splits a large
-            # unclaimed range in half and takes the second half.
-            if largest.end >= 0 and largest.span() > SPLIT_THRESHOLD:
-                mid = largest.start + (largest.span() // 2) - 1
-                right = Segment(mid + 1, largest.end)
-                largest.end = mid
-                largest.owner = None
-                right.owner = wid
-                return right
-            largest.owner = wid
-            return largest
+            victim = max(inflight, key=lambda s: s.span() - s.pos)
+            remaining = victim.span() - victim.pos
+            if remaining < 2 * STEAL_THRESHOLD:
+                return None  # too small to be worth stealing; let it finish
+            new_end = victim.start + victim.pos + remaining // 2 - 1
+            right = Segment(new_end + 1, victim.end)
+            victim.end = new_end
+            right.owner = wid
+            self._segments.append(right)
+            return right
 
     def _download_segment(self, seg: Segment) -> None:
         """Stream the claimed range to completion with bounded retries."""
@@ -418,7 +484,10 @@ class Downloader:
     def _stream(self, seg: Segment, resp, cap: int | None) -> None:
         """cap: maximum bytes this response may contribute (span - pos at start).
         Uses read1 so slow/drip servers don't block past a chunk boundary -
-        keeps pause and periodic state saves responsive."""
+        keeps pause and periodic state saves responsive. Re-checks seg.end
+        every chunk: a tail-stealing worker may shrink this segment's range
+        mid-response (IDM-style), and this owner must stop at the new edge
+        without overwriting the stolen bytes."""
         left = cap
         while True:
             self.stopper.check()
@@ -434,7 +503,16 @@ class Downloader:
                 if len(chunk) > left:
                     chunk = chunk[:left]
                 left -= len(chunk)
+            if seg.end >= 0:
+                # boundary may have shrunk (tail stolen) while streaming
+                room = seg.span() - seg.pos
+                if room <= 0:
+                    return
+                if len(chunk) > room:
+                    chunk = chunk[:room]  # rest of this response belongs to the stealer
             self._write(seg, chunk)
+            if seg.end >= 0 and seg.pos >= seg.span():
+                return
             if self._save_due():
                 self.flush()
                 self.save_state()
