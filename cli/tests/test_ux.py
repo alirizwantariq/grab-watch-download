@@ -118,6 +118,177 @@ def test_unicode_url_downloads(tmp_path):
         srv.server_close()
 
 
+def test_effective_conns():
+    """aria2's 2*min-split-size rule: parallel conns only for big files."""
+    from mgd import engine
+    f = engine.Downloader.effective_conns
+    assert f(None, 6) == 6          # unknown size: honor the request
+    assert f(0, 6) == 6
+    assert f(5 * 1024 * 1024, 8) == 1     # 5 MB: one connection
+    assert f(16 * 1024 * 1024, 8) == 2
+    assert f(100 * 1024 * 1024, 8) == 8
+    assert f(100 * 1024 * 1024, 6) == 6   # capped by caller's conns
+
+
+def test_probe_retries_transient_failures(tmp_path):
+    """A server that kills the first two connections (TLS hiccups, resets)
+    must not kill the download - the engine retries the probe."""
+    import http.server
+    import threading
+    from mgd import engine
+
+    content = bytes(range(64)) * 64
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        failures = [2]
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if H.failures[0] > 0:
+                H.failures[0] -= 1
+                try:
+                    self.connection.close()  # abrupt TCP close, no response
+                except OSError:
+                    pass
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/flaky.bin"
+        out = tmp_path / "flaky.bin"
+        dl = engine.Downloader(url, out, conns=1, retries=3)
+        result = dl.run()
+        assert result.path.read_bytes() == content
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_tail_steal_correctness(tmp_path):
+    """A slow leading region must not stall the download: idle workers steal
+    the tail of the largest in-flight range (IDM-style). The final file must
+    be byte-perfect - this validates the shrink/truncate math under real
+    stealing."""
+    import http.server
+    import threading
+    from mgd import engine
+
+    size = 24 * 1024 * 1024
+    content = (bytes(range(256)) * (size // 256))
+    SLOW_FROM = 12 * 1024 * 1024   # the trailing half trickles: w1 claims it
+    requests: list[tuple[int, int, float]] = []
+    req_lock = threading.Lock()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            start = 0
+            rng = self.headers.get("Range", "")
+            if rng.startswith("bytes="):
+                spec = rng[6:].split(",", 1)[0]
+                first, _, last = spec.partition("-")
+                start = int(first)
+                end = int(last) if last else size - 1
+                with req_lock:
+                    requests.append((start, end, time.time()))
+                body = content[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range",
+                                 f"bytes {start}-{end}/{size}")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+            else:
+                with req_lock:
+                    requests.append((0, size - 1, time.time()))
+                body = content
+                self.send_response(200)
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+            for i in range(0, len(body), 256 * 1024):
+                if start + i >= SLOW_FROM:
+                    time.sleep(0.004)  # slow region
+                self.wfile.write(body[i:i + 256 * 1024])
+            try:
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionError):
+                pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/big.bin"
+        out = tmp_path / "big.bin"
+        dl = engine.Downloader(url, out, conns=3, retries=5)
+        dl.run()
+        data = out.read_bytes()
+        assert data == content, "tail stealing corrupted the file"
+        # evidence a steal happened: a later request for a tail sub-range of
+        # a range another connection was still downloading
+        stole = False
+        for (s1, e1, t1) in requests:
+            for (s2, e2, t2) in requests:
+                if t2 > t1 and s1 < s2 and e2 <= e1 \
+                        and (e2 - s2) < (e1 - s1):
+                    stole = True
+                    break
+            if stole:
+                break
+        assert stole, f"no tail steal observed; requests={requests[:12]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_state_tiles_whole_file_on_pause(tmp_path):
+    """Regression: split-off ranges must be tracked in the state file.
+    Pausing a multi-connection download mid-flight used to save state that
+    missed every dynamically split range -> resume filled those bytes with
+    zeros and the size check still passed (silent corruption)."""
+    import conftest
+    import threading
+    from mgd import engine
+
+    size = 32 * 1024 * 1024
+    origin = conftest.DripOrigin((bytes(range(256)) * (size // 256)),
+                                 chunk=64 * 1024, delay=0.004)
+    out = tmp_path / "drip.bin"   # state file is named after the URL filename
+    stopper = engine.Stopper()
+    dl = engine.Downloader(origin.url, out, conns=2, stopper=stopper)
+    worker = threading.Thread(target=dl.run, daemon=True)
+    try:
+        worker.start()
+        time.sleep(0.4)
+        stopper.stop()
+        worker.join(timeout=20)
+        state_path = out.parent / "drip.bin.mgdstate"
+        assert state_path.exists(), "no state saved after pause"
+        state = json.loads(state_path.read_text())
+        segs = sorted((s for s in state["segments"] if s["pos"] != -2),
+                      key=lambda s: s["start"])
+        assert segs, "state has no segments"
+        assert segs[0]["start"] == 0, f"gap at file start: {segs[0]}"
+        for a, b in zip(segs, segs[1:]):
+            assert a["end"] + 1 == b["start"], \
+                f"state gap/overlap at {a['end'] + 1}: {segs}"
+        assert segs[-1]["end"] == size - 1, f"state ends at {segs[-1]}"
+        assert not out.exists(), "download finished before the pause"
+    finally:
+        origin.stop()
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")

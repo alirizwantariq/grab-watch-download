@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import UniformTypeIdentifiers
 
 // MARK: - mgd process plumbing
 
@@ -270,6 +271,15 @@ func fmtBytes(_ n: Int64) -> String {
     return "\(n) B"
 }
 
+/// aggregate speed across all running jobs, for the footer indicator
+func fmtSpeed(_ v: Double) -> String {
+    let units: [(String, Double)] = [("GB/s", 1_073_741_824.0), ("MB/s", 1_048_576.0), ("KB/s", 1024.0)]
+    for (name, div) in units where v >= div {
+        return String(format: "%.1f %@", v / div, name)
+    }
+    return String(format: "%.0f B/s", v)
+}
+
 func fileSymbol(forPath path: String) -> String {
     let ext = (path as NSString).pathExtension.lowercased()
     switch ext {
@@ -306,7 +316,8 @@ final class JobStore: ObservableObject {
 
     // actions: start / pause / resume
 
-    func start(_ job: DownloadJob, quality: String, category: String) {
+    func start(_ job: DownloadJob, quality: String, category: String,
+               destination: String? = nil) {
         var args = ["grab", job.url, "--json-progress", "--retries", "8"]
         if quality == "audio" {
             args += ["--quality", "audio"]
@@ -315,6 +326,9 @@ final class JobStore: ObservableObject {
         }
         if category != "auto" {
             args += ["-t", category]
+        }
+        if let dest = destination, !dest.isEmpty {
+            args += ["-d", dest]
         }
         job.phase = .running
         jobs.insert(job, at: 0)
@@ -820,6 +834,13 @@ final class Session: ObservableObject {
     @Published var showLog = false
     @Published var probing = false
     @Published var qualitySheet: QualityProbe?
+    /// nil = auto (~/Downloads/mgd with per-type folders); otherwise an
+    /// absolute path chosen with the folder picker, passed to mgd as -d.
+    @Published var destination: String?
+    /// true while a drag hovers the window (link drop-target highlight)
+    @Published var dropActive = false
+    /// drives the folder picker (fileImporter)
+    @Published var pickingFolder = false
 }
 
 struct ContentView: View {
@@ -838,6 +859,32 @@ struct ContentView: View {
         .padding(.vertical, 10)
         .onAppear { store.refreshPaused() }
         .onReceive(timer) { _ in store.refreshPaused() }
+        .onDrop(of: [UTType.url, UTType.text], isTargeted: $session.dropActive) {
+            providers in dropped(providers)
+        }
+        .overlay {
+            if session.dropActive {
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(Color.accentColor, lineWidth: 3)
+                    .background(RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.accentColor.opacity(0.10)))
+                    .overlay(alignment: .center) {
+                        Label("Drop link to download", systemImage: "arrow.down.circle.fill")
+                            .font(.title2.bold())
+                            .foregroundColor(.accentColor)
+                    }
+                    .padding(8)
+                    .allowsHitTesting(false)
+            }
+        }
+        .fileImporter(isPresented: $session.pickingFolder,
+                      allowedContentTypes: [.folder],
+                      allowsMultipleSelection: false) { result in
+            if let urls = try? result.get(), let first = urls.first {
+                session.destination = first.path
+                store.statusFooter = "this download goes to \(first.path)"
+            }
+        }
         .sheet(item: $session.qualitySheet) { probe in
             QualitySheet(probe: probe, onStart: { quality in
                 begin(url: probe.url, quality: quality)
@@ -904,10 +951,11 @@ struct ContentView: View {
                 Spacer()
             }
             HStack(spacing: 8) {
-                TextField("Paste a link: file, page, youtube.com, x.com …",
+                TextField("Paste a link (or drag one here): file, page, youtube.com, x.com …",
                           text: $session.urlString)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(grab)
+                destinationMenu
                 if session.probing {
                     ProgressView().controlSize(.small)
                 }
@@ -941,7 +989,7 @@ struct ContentView: View {
                     Image(systemName: "tray")
                         .font(.system(size: 34)).foregroundColor(.secondary.opacity(0.5))
                     Text("No downloads yet").foregroundColor(.secondary)
-                    Text("Paste a link above to start. " +
+                    Text("Paste or drag a link above to start. " +
                          "Finished files show a file icon — click it to open its folder.")
                         .font(.caption).foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -986,6 +1034,54 @@ struct ContentView: View {
         }
     }
 
+    // MARK: destination picker
+
+    @ViewBuilder
+    private var destinationMenu: some View {
+        Menu {
+            Button {
+                session.destination = nil
+                store.statusFooter = ""
+            } label: {
+                if session.destination == nil {
+                    Label("Default (~/Downloads/mgd)", systemImage: "checkmark")
+                } else {
+                    Text("Default (~/Downloads/mgd)")
+                }
+            }
+            Button {
+                session.pickingFolder = true
+            } label: {
+                if session.destination != nil {
+                    Label("Choose folder…", systemImage: "checkmark")
+                } else {
+                    Text("Choose folder…")
+                }
+            }
+        } label: {
+            Label(session.destination.map { ($0 as NSString).lastPathComponent } ?? "Folder",
+                  systemImage: session.destination == nil ? "folder" : "folder.fill")
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .frame(maxWidth: 130)
+        .help("Where the next downloads are saved (only for downloads started from this window)")
+    }
+
+    private var totalSpeedText: String {
+        let acc = store.jobs
+            .filter { $0.phase == .running }
+            .reduce(0.0) { $0 + $1.bytesPerSecond }
+        return acc > 1 ? "· total \(fmtSpeed(acc))" : ""
+    }
+
+    private var footerDestination: String {
+        if let d = session.destination, !d.isEmpty {
+            return "Saving to: \(d) (this window only)"
+        }
+        return "Destination: ~/Downloads/mgd (change with the Folder menu)"
+    }
+
     private var footer: some View {
         VStack(spacing: 6) {
             HStack {
@@ -994,10 +1090,11 @@ struct ContentView: View {
                     .toggleStyle(.checkbox)
                 Spacer()
                 Text(store.statusFooter.isEmpty
-                     ? "Destination: ~/Downloads/mgd (change with `mgd set-default root …`)"
+                     ? "\(footerDestination) \(totalSpeedText)".trimmingCharacters(in: .whitespaces)
                      : store.statusFooter)
                     .font(.caption).foregroundColor(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.head)
             }
             .padding(.horizontal)
             if session.showLog {
@@ -1052,6 +1149,36 @@ struct ContentView: View {
 
     private func begin(url: String, quality: String) {
         session.qualitySheet = nil
-        store.start(DownloadJob(url: url), quality: quality, category: "auto")
+        store.start(DownloadJob(url: url), quality: quality, category: "auto",
+                    destination: session.destination)
+    }
+
+    // MARK: drag & drop
+
+    private func dropped(_ providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first else { return false }
+        if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                DispatchQueue.main.async {
+                    guard let u = url else { return }
+                    session.urlString = u.absoluteString
+                    grab()
+                }
+            }
+            return true
+        }
+        if provider.canLoadObject(ofClass: NSString.self) {
+            _ = provider.loadObject(ofClass: NSString.self) { obj, _ in
+                DispatchQueue.main.async {
+                    guard let s = obj as? String else { return }
+                    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard t.hasPrefix("http"), !t.contains("\n") else { return }
+                    session.urlString = t
+                    grab()
+                }
+            }
+            return true
+        }
+        return false
     }
 }
