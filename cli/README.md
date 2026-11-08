@@ -38,6 +38,9 @@ mgd grab "x.com/user/status/.."    # X/Twitter media: yt-dlp guest flow first,
 mgd grab "x.com/.." -Q 480         # bridge returns a resolution ladder (2xx/4xx)
 mgd grab "x.com/.." -Q audio       # same bridge converts to mp3
 mgd grab "x.com/.." --resolver ytdlp|x  # force a resolver (default auto)
+mgd grab "https://www.erome.tv/.."  # KVS player pages (erome & tube sites):
+                                    # inline flashvars quality list, Referer on
+                                    # requests, auto cdn mirror fallback
 mgd jobs                           # [running]/[paused] + per-item actions
 mgd pause 1 / mgd resume 1 / mgd cancel 1
 mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)

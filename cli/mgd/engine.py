@@ -33,6 +33,7 @@ import pathlib
 import random
 import threading
 import time
+import urllib.parse as u
 
 from . import net
 from .net import HttpError
@@ -91,11 +92,13 @@ class ProbeResult:
 
 
 def probe(url: str, proxy: str | None = None,
-          timeout: float = net.DEFAULT_TIMEOUT) -> ProbeResult:
+          timeout: float = net.DEFAULT_TIMEOUT,
+          headers: dict | None = None) -> ProbeResult:
     """Ranged GET (bytes=0-0): learns size/range support without the body."""
     r = ProbeResult()
     r.url = url
-    conn, resp = net.open_request(url, proxy, "GET", headers=DEFAULT_HEADERS,
+    conn, resp = net.open_request(url, proxy, "GET",
+                                  headers=headers or dict(DEFAULT_HEADERS),
                                   timeout=timeout, range_start=0, range_end=0)
     try:
         status = resp.status
@@ -120,6 +123,11 @@ def probe(url: str, proxy: str | None = None,
         r.content_type = resp.getheader("Content-Type")
         resp.read(2)
         return r
+    except HttpError as exc:
+        # a 5xx on the redirect target carries the CDN url the redirect
+        # chain landed on - the retry loop uses it for mirror probing
+        exc.final_url = getattr(resp, "final_url", None)
+        raise
     finally:
         _close_quietly(conn)
 
@@ -181,7 +189,9 @@ class Downloader:
     def __init__(self, url: str, out_path, proxy: str | None = None,
                  conns: int = 6, retries: int = 8, stopper: Stopper | None = None,
                  expected_sha256: str | None = None, resume_state: bytes | None = None,
-                 timeout: float = net.DEFAULT_TIMEOUT):
+                 timeout: float = net.DEFAULT_TIMEOUT,
+                 referer: str | None = None,
+                 mirror_hosts: list[str] | None = None):
         self.url = url
         self.out_path = pathlib.Path(out_path).expanduser()
         self.proxy = proxy
@@ -191,6 +201,11 @@ class Downloader:
         self.expected_sha256 = expected_sha256
         self.timeout = timeout
         self._resume_state: bytes | None = resume_state
+        # pages that hand out expiring/tiered media links (KVS sites) route
+        # by Referer; without it the CDN can answer 502 or a bot-check page
+        self.referer = referer
+        # backup cdn mirror hostnames for the site (see _probe_with_retries)
+        self.mirror_hosts = list(mirror_hosts or [])
 
         self._seg_lock = threading.Lock()
         self._segments: list[Segment] = []
@@ -239,24 +254,46 @@ class Downloader:
                 raise
         return self._finalize()
 
+    # ── headers ───────────────────────────────────────────────────────────
+    def _headers(self) -> dict[str, str]:
+        """Base headers + the source page as Referer when this media link
+        was scraped from a page (tiered CDNs route by Referer)."""
+        h = dict(DEFAULT_HEADERS)
+        if self.referer:
+            h["Referer"] = self.referer
+        return h
+
     def _probe_with_retries(self) -> ProbeResult:
         """Probe with bounded retries and backoff: TLS handshake hiccups
         (BAD_SIGNATURE), connection resets and timeouts are transient and
-        must not kill the download. 4xx answers are real and fail fast."""
+        must not kill the download. 4xx answers are real and fail fast.
+
+        Site resilience: when probes keep hitting 5xx on the redirect
+        target, erome-style CDN edges (cdn77) can be down on one mirror
+        hostname while siblings still serve. Each 5xx wave rotates
+        self.url over the remaining mirror hosts - run()'s post-probe
+        step keeps whoever succeeded."""
         attempt = 0
+        streak_5xx = 0
+        cdn_url: str | None = None
+        probed_mirrors: set[str] = {u.urlsplit(self.url).netloc}
         while True:
             attempt += 1
             self.stopper.check()
             try:
-                return probe(self.url, self.proxy, self.timeout)
+                return probe(self.url, self.proxy, self.timeout,
+                             headers=self._headers())
             except Interrupted:
                 raise
             except HttpError as exc:
                 if 400 <= exc.status < 500 and exc.status not in RETRYABLE_STATUS:
                     raise
+                cdn_url = getattr(exc, "final_url", None) or cdn_url
+                streak_5xx += 1
                 if attempt >= self.retries:
                     raise DownloadError(
                         f"server unreachable after {attempt} probes: {exc}") from exc
+                self._maybe_rotate_mirror(cdn_url, streak_5xx, probed_mirrors)
                 self._backoff_sleep(attempt)
             except (TimeoutError, OSError) as exc:
                 if attempt >= self.retries:
@@ -264,6 +301,26 @@ class Downloader:
                         f"could not reach the server after {attempt} probes: "
                         f"{type(exc).__name__}: {exc}") from exc
                 self._backoff_sleep(attempt)
+
+    def _maybe_rotate_mirror(self, cdn_url: str | None,
+                             streak: int,
+                             probed: set[str]) -> None:
+        """After several consecutive 5xx probes on one cdn mirror, move the
+        probe target to another mirror host for the site (self.mirror_hosts).
+        Pure no-op when the caller did not register mirrors or there is
+        nothing new to try."""
+        if not self.mirror_hosts or not cdn_url or streak < 3:
+            return
+        p = u.urlsplit(cdn_url)
+        if not p.netloc or p.netloc not in probed:
+            if p.netloc:
+                probed.add(p.netloc)
+        for cand in self.mirror_hosts:
+            if cand in probed:
+                continue
+            probed.add(cand)
+            self.url = p._replace(netloc=cand).geturl()
+            break
 
     # ── init / resume ─────────────────────────────────────────────────────
     def _init_for(self, pr: ProbeResult) -> None:
@@ -448,7 +505,7 @@ class Downloader:
                     start, end = None, None  # full body stream
                 conn, resp = net.open_request(
                     self.url, self.proxy, "GET",
-                    headers=dict(DEFAULT_HEADERS), timeout=self.timeout,
+                    headers=self._headers(), timeout=self.timeout,
                     range_start=start, range_end=end)
                 status = resp.status
                 if status >= 400:

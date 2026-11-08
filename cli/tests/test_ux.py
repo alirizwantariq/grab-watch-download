@@ -289,6 +289,121 @@ def test_state_tiles_whole_file_on_pause(tmp_path):
         origin.stop()
 
 
+def test_kvs_flashvars_extraction():
+    """KVS (erome-style) player pages hide media urls inside a JS flashvars
+    object; the attribute scanners never see them. Parsing must produce
+    best-first candidates with quality labels from *_text keys."""
+    from mgd import grab
+    html = """
+    <html><head><title>My Video</title></head><body>
+    <div id="preview"><img src="/thumb.jpg"></div>
+    <script>
+    var video = null;
+    var flashvars = {
+        video_id: 289910,
+        video_title: 'Cory Chase Takes Video',
+        video_url: 'https://www.erome.tv/get_file/3/hash/289000/289910/289910_1080p.mp4/?v-acctoken=Mjg5OTE',
+        video_url_text: '1080p',
+        video_alt_url: 'https://www.erome.tv/get_file/3/hash2/289000/289910/289910_720p.mp4/?v-acctoken=Mjg5OTE',
+        video_alt_url_text: '720p',
+        video_alt_url2: 'https://www.erome.tv/get_file/3/hash3/289000/289910/289910_480p.mp4/?v-acctoken=Mjg5OTE',
+        video_alt_url2_text: '-',
+        poster_url: 'https://www.erome.tv/contents/videos_screenshots/preview.jpg',
+        license_code: '$123'
+    };
+    </script>
+    </body></html>"""
+    cand = grab._kvs_flashvars_candidates(html)
+    assert len(cand) == 3, f"expected 3 quality candidates, got {cand}"
+    urls = [c[0] for c in cand]
+    assert "_1080p" in urls[0] and "_480p" in urls[2]
+    assert cand[0][1] == "1080p"     # from *_text key
+    assert cand[1][1] == "720p"
+    assert cand[2][1] == "480p"      # '-' falls back to the filename quality
+    assert cand[0][2] == "Cory Chase Takes Video"
+    # the thumbnail/license must not leak in
+    for c in cand:
+        assert "preview.jpg" not in c[0] and "$123" not in c[0]
+    # extract_links: flashvars candidates first, picked as the media link
+    links = grab.extract_links(html, "https://www.erome.tv/v/289910/")
+    best = grab.pick_media_candidate(links)
+    assert best["kind"] == "flashvars"
+    assert "/thumb.jpg" not in best["url"]
+
+
+def test_kvs_single_quality_dash_text():
+    """erome pages with video_url only and video_url_text '-' still label."""
+    from mgd import grab
+    html = """
+    <script>
+    var flashvars = {
+        video_url: 'https://x.tv/get_file/3/h/289000/289910/289910_1080p.mp4/?v-acctoken=AA',
+        video_url_text: '-',
+        alt_video_url: '-'
+    };
+    </script>"""
+    cand = grab._kvs_flashvars_candidates(html)
+    assert len(cand) == 1 and cand[0][1] == "1080p", cand
+
+
+def test_mirror_rotation_on_dead_cdn(tmp_path):
+    """When probes keep landing 5xx on one cdn mirror, the engine rotates
+    to the site's backup mirror hosts (erome nudges dead edges)."""
+    import http.server
+    import threading
+    from mgd import engine
+
+    content = bytes(range(256)) * 64
+
+    class Bad(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(502)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    class Good(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(206)
+            self.send_header("Content-Range",
+                             f"bytes 0-{len(content) - 1}/{len(content)}")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+    bad = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bad)
+    good = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Good)
+    for srv, srv_thread in ((bad, bad), (good, good)):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        bad_port = bad.server_address[1]
+        good_port = good.server_address[1]
+        out = tmp_path / "mirror.bin"
+        dl = engine.Downloader(
+            f"http://127.0.0.1:{bad_port}/mirror.bin", out,
+            conns=1, retries=12,
+            mirror_hosts=[f"127.0.0.1:{good_port}", "127.0.0.1:9"])
+        result = dl.run()
+        assert result.path.read_bytes() == content
+        assert result.path.name == "mirror.bin.mgdpart".replace(".mgdpart", "")
+    finally:
+        bad.shutdown(); bad.server_close()
+        good.shutdown(); good.server_close()
+        try:
+            out.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")

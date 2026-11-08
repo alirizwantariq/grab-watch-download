@@ -817,6 +817,9 @@ def cmd_grab(args) -> int:
         dl = Downloader(url_i, out_path, proxy=args.proxy, conns=conns,
                         retries=retries, stopper=stopper,
                         timeout=DEFAULT_TIMEOUT,
+                        referer=args.url if page_links is not None else None,
+                        mirror_hosts=_mirror_hosts_for(url_i) or
+                                     _mirror_hosts_for(args.url),
                         expected_sha256=args.sha256 if t["kind"] == "direct" else None)
         dl.pid = os.getpid()
         try:
@@ -843,8 +846,8 @@ def cmd_grab(args) -> int:
             return 130
         except (DownloadError, HttpError, OSError) as err:
             if getattr(args, "json_progress", False):
-                print(json.dumps({"type": "error", "message": str(err)},
-                                 flush=True))
+                print(json.dumps(
+                    {"type": "error", "message": str(err)}), flush=True)
             else:
                 print(_fail(f"{url_i}: {err}"), file=sys.stderr)
             failures += 1
@@ -886,6 +889,22 @@ def _page_media(url: str, headers: dict, proxy: str | None,
             if attempt < attempts:
                 time.sleep(min(2.0, 0.5 * (2 ** (attempt - 1))))
     raise last_exc if last_exc else HttpError(500, "page fetch failed")
+
+
+# Backup cdn mirror hostnames per site. Sites that balance between several
+# edge hosts (erome uses cdn77: observed "nude.erome.tv" hard-502ing for a
+# region while "sextape.erome.tv" served the very same contents path) get
+# another round of probes on a sibling host when one edge is down.
+MIRROR_HOSTS = {
+    "erome.tv": ["sextape.erome.tv", "nude.erome.tv"],
+}
+
+
+def _mirror_hosts_for(url: str) -> list[str]:
+    for site, hosts in MIRROR_HOSTS.items():
+        if site in url:
+            return list(hosts)
+    return []
 
 
 def _destination(args, cfg: dict, url: str) -> pathlib.Path:
@@ -1289,6 +1308,7 @@ def cmd_resume(args) -> int:
             out_path = st_path.parent / (st.get("filename") or "download")
         dl = Downloader(st.get("url", ""), out_path,
                         proxy=_cfg().get("proxy") or os.environ.get("HTTPS_PROXY"),
+                        mirror_hosts=_mirror_hosts_for(st.get("url", "")),
                         resume_state=st_path.read_bytes())
         dl.pid = os.getpid()
         if as_json:
