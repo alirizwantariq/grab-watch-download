@@ -26,9 +26,48 @@ _MEDIA_TAG_RE = re.compile(
 _META_RE = re.compile(
     r"<meta\b[^>]*property=[\"'](?:og:video(:?:(?:secure_)?url)?|twitter:player:stream)[\"'][^>]*\bcontent=[\"']([^\"']+)[\"']", re.I)
 
+# KVS (Kernel Video Sharing) player config - flashvars powers erome.tv and
+# most tube sites. The video urls live as JS string values inside a JS object,
+# so the tag/attribute scanners above never see them.
+_KVS_BLOCK_RE = re.compile(r"flashvars\s*=\s*\{(.{50,}?)\}\s*;", re.S)
+_KVS_PAIR_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*'([^']*)'")
+# canonical KVS video keys: video_url, video_url_text, video_alt_url,
+# video_alt_url_text, video_alt_url2, _3, ... (+ trailing slideshow nums)
+_KVS_QUALITY_KEY_RE = re.compile(
+    r"^video_url\d{0,2}_alt_url\d{0,2}$|^video_alt_url\d{0,2}$|^video_url\d{0,2}$")
+_KVS_QUALITY_RE = re.compile(r"(?:^|[_/.])(\d{3,4}[pP])\.m(?:p4|3u8)", re.I)
+_KVS_MEDIA_HINT = (".mp4", ".m3u8", ".webm", ".mpd")
+
 
 def _strip_amp(url: str) -> str:
     return url.replace("&amp;", "&").strip()
+
+
+def _kvs_flashvars_candidates(html: str) -> list[tuple[str, str, str]]:
+    """KVS player config ('var flashvars = { video_url: …, … }') →
+    [(url, quality_label, video_title)] in quality-listed order, best first.
+    Only entries whose value points at a media file are returned; e.g.
+    erome.tv, countless tube sites."""
+    out: list[tuple[str, str, str]] = []
+    for block in _KVS_BLOCK_RE.findall(html):
+        pairs = {k: v for k, v in _KVS_PAIR_RE.findall(block)}
+        title = pairs.get("video_title", "")
+
+        def label_for(key: str) -> str:
+            text = pairs.get(key + "_text", "")
+            if text and text not in ("-", "none", "None"):
+                return text
+            q = _KVS_QUALITY_RE.search(pairs[key])
+            return q.group(1) if q else ""
+
+        for key, url in pairs.items():
+            if not _KVS_QUALITY_KEY_RE.match(key):
+                continue
+            path = url.partition("?")[0].rstrip("/").lower()
+            if not path.endswith(_KVS_MEDIA_HINT):
+                continue
+            out.append((url, label_for(key), title))
+    return out
 
 
 def extract_links(html: str, base_url: str) -> list[dict]:
@@ -50,6 +89,9 @@ def extract_links(html: str, base_url: str) -> list[dict]:
         seen.add(url)
         out.append({"kind": kind, "url": url, "title": title})
 
+    # KVS players first: these are the qualities of the page's own video
+    for url, label, title in _kvs_flashvars_candidates(html):
+        add("flashvars", url, label or title)
     for tag_kind in ("video", "audio"):
         for m in re.finditer(rf"<{tag_kind}\b[^>]*>", html, re.I):
             src = re.search(r"\bsrc=[\"']([^\"']+)[\"']", m.group(0), re.I)
@@ -77,8 +119,8 @@ def extract_links(html: str, base_url: str) -> list[dict]:
 
 
 def pick_media_candidate(links: list[dict]) -> dict | None:
-    videos = [l for l in links if l["kind"] in ("video", "source", "meta",
-                                                "link-video")]
+    videos = [l for l in links if l["kind"] in ("flashvars", "video", "source",
+                                               "meta", "link-video")]
     return videos[0] if videos else (links[0] if links else None)
 
 
