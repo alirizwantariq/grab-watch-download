@@ -4,16 +4,123 @@ Supports:
   - direct connections
   - HTTP proxies: forward proxy for http:// targets, CONNECT tunnel for https://
   - SOCKS5 proxies (no auth, or username:password auth) for http:// and https://
+  - DNS fallback: when the system resolver fails (flaky router DNS,
+    NXDOMAIN storms), A records are fetched directly from public
+    resolvers (8.8.8.8, 1.1.1.1). SNI/Host stay on the original hostname,
+    so TLS validation is unaffected.
 """
 from __future__ import annotations
 
 import http.client
+import random
 import socket
 import ssl
+import struct
 import urllib.parse as u
 
 DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) mgd/1.0"
 DEFAULT_TIMEOUT = 30.0
+
+FALLBACK_DNS = ["8.8.8.8", "1.1.1.1", "9.9.9.9"]
+_dns_cache: dict[str, str | None] = {}
+_DNS_QTYPE_A = 1
+
+
+def _dns_query_a(server: str, name: str, timeout: float = 3.0) -> str | None:
+    """Minimal UDP A-record lookup (no dnspython dependency).
+    `server` may be an IP or an IP:port (for tests / non-standard resolvers)."""
+    if ":" in server and not server.startswith("["):
+        host_part, _, port_part = server.rpartition(":")
+        if not port_part.isdigit():
+            host_part, port_part = server, "53"
+    else:
+        host_part, port_part = server, "53"
+    qid = random.randint(0, 65535)
+    q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    for part in name.split("."):
+        q += bytes([len(part)]) + part.encode("idna" if not part.isascii() else "ascii")
+    q += b"\x00" + struct.pack(">HH", _DNS_QTYPE_A, 1)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(q, (host_part, int(port_part)))
+        data, _ = s.recvfrom(512)
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    try:
+        rcode = data[3] & 0xF
+        qdcount, ancount = struct.unpack(">HH", data[4:8])
+        if rcode != 0 or ancount == 0:
+            return None
+        pos = 12
+        for _ in range(qdcount):  # skip the question section
+            while data[pos]:
+                pos += data[pos] + 1
+            pos += 5
+        for _ in range(ancount):
+            if data[pos] & 0xC0:  # compressed name pointer
+                pos += 2
+            else:
+                while data[pos]:
+                    pos += data[pos] + 1
+                pos += 1
+            atype, _, _, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+            pos += 10
+            if atype == _DNS_QTYPE_A and rdlen == 4:
+                return ".".join(str(b) for b in data[pos:pos + 4])
+            pos += rdlen
+    except (IndexError, struct.error):
+        return None
+    return None
+
+
+def resolve_with_fallback(host: str, timeout: float = 3.0) -> str | None:
+    """Resolve via public resolvers when the system resolver has no answer
+    (cached; None cached as a miss too)."""
+    if not host or all(c in "0123456789.:" for c in host):
+        return host  # already an IP
+    if host in _dns_cache:
+        return _dns_cache[host]
+    ip: str | None = None
+    for server in FALLBACK_DNS:
+        ip = _dns_query_a(server, host, timeout)
+        if ip:
+            break
+    _dns_cache[host] = ip
+    return ip
+
+
+# ── system-resolver fallback patch ───────────────────────────────────────
+# http.client uses socket.create_connection -> getaddrinfo(host). On a
+# resolver outage getaddrinfo raises gaierror; we retry the public
+# resolvers and return entries for the resolved IP. TLS SNI and the Host
+# header keep using the ORIGINAL hostname (http.client stores it), so
+# certificate validation is unaffected.
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _mgd_getaddrinfo(host, port, *args, **kwargs):
+    try:
+        return _orig_getaddrinfo(host, port, *args, **kwargs)
+    except socket.gaierror:
+        if host and isinstance(host, str):
+            ip = resolve_with_fallback(host)
+            if ip:
+                return _orig_getaddrinfo(ip, port, *args, **kwargs)
+        raise
+
+
+def install_dns_fallback() -> None:
+    if socket.getaddrinfo is not _mgd_getaddrinfo:
+        socket.getaddrinfo = _mgd_getaddrinfo
+
+
+install_dns_fallback()
 
 
 class ProxyError(Exception):
