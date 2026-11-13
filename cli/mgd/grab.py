@@ -38,6 +38,83 @@ _KVS_QUALITY_KEY_RE = re.compile(
 _KVS_QUALITY_RE = re.compile(r"(?:^|[_/.])(\d{3,4}[pP])\.m(?:p4|3u8)", re.I)
 _KVS_MEDIA_HINT = (".mp4", ".m3u8", ".webm", ".mpd")
 
+_VIDEO_BLOCK_RE = re.compile(r"<video\b([^>]*)>(.*?)</video>", re.S | re.I)
+_POSTER_RE = re.compile(r"\bposter=[\"']([^\"']+)[\"']", re.I)
+
+
+def _quality_from_filename(url: str) -> str:
+    m = _KVS_QUALITY_RE.search(url)
+    return m.group(1) if m else ""
+
+
+def _title_from_filename(url: str) -> str:
+    name = u.urlsplit(url).path.rsplit("/", 1)[-1]
+    stem = name.rsplit(".", 1)[0]
+    return stem[:80] if stem else name
+
+
+def extract_media_catalog(html: str, base_url: str) -> list[dict]:
+    """Richer page scan for the batch/multi-download UI: returns
+    [{url, kind, title, quality, poster, source}] with the page's own
+    thumbnails (video poster attributes) where available.
+
+    Sources, in order:
+      - KVS flashvars player configs (title/poster from the block)
+      - <video poster=…><source src=…> blocks (pairs poster with its sources)
+      - standalone <source>/<audio>, og:video metas, direct-file anchors
+    All deduplicated by absolute url."""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(url: str, kind: str, title: str = "", quality: str = "",
+            poster: str = "") -> None:
+        url = _strip_amp(url)
+        absu = u.urljoin(base_url, url)
+        if u.urlsplit(absu).scheme not in ("http", "https") or absu in seen:
+            return
+        seen.add(absu)
+        out.append({
+            "url": absu, "kind": kind,
+            "title": title or _title_from_filename(absu),
+            "quality": quality or _quality_from_filename(absu),
+            "poster": u.urljoin(base_url, poster) if poster else "",
+        })
+
+    # 1. KVS flashvars (erome.tv, tube sites)
+    for block in _KVS_BLOCK_RE.findall(html):
+        pairs = {k: v for k, v in _KVS_PAIR_RE.findall(block)}
+        title = pairs.get("video_title", "")
+        poster = pairs.get("preview_url", "") or pairs.get("poster_url", "")
+
+        def kv_label(key: str) -> str:
+            text = pairs.get(key + "_text", "")
+            if text and text not in ("-", "none", "None"):
+                return text
+            return _quality_from_filename(pairs[key])
+
+        for key, url in pairs.items():
+            if not _KVS_QUALITY_KEY_RE.match(key):
+                continue
+            path = url.partition("?")[0].rstrip("/").lower()
+            if not path.endswith(_KVS_MEDIA_HINT):
+                continue
+            add(url, "flashvars", title, kv_label(key), poster)
+
+    # 2. <video> blocks: keep the poster with the sources inside them
+    for attrs, inner in _VIDEO_BLOCK_RE.findall(html):
+        poster = _POSTER_RE.search(attrs)
+        poster_url = poster.group(1) if poster else ""
+        for m in re.finditer(r"<source\b[^>]*\bsrc=[\"']([^\"']+)[\"']", inner, re.I):
+            add(m.group(1), "source", "", "", poster_url)
+        src = re.search(r"\bsrc=[\"']([^\"']+)[\"']", attrs, re.I)
+        if src:
+            add(src.group(1), "video", "", "", poster_url)
+
+    # 3. everything the plain scanner finds (without the video blocks above)
+    for item in extract_links(html, base_url):
+        add(item["url"], item["kind"], item.get("title", ""))
+    return out
+
 
 def _strip_amp(url: str) -> str:
     return url.replace("&amp;", "&").strip()

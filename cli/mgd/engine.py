@@ -691,6 +691,7 @@ class Downloader:
                 "accept_ranges": self._accept_ranges,
                 "pid": getattr(self, "pid", None),
                 "out_path": str(self.out_path),
+                "referer": self.referer,
                 "segments": [s.to_json() for s in self._segments],
             }), encoding="utf-8")
         except OSError:

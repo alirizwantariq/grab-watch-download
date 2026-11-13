@@ -112,6 +112,20 @@ def build_parser() -> argparse.ArgumentParser:
     ql.add_argument("--proxy", default=None)
     ql.add_argument("--cookies", default=None)
     ql.add_argument("--cookies-from-browser", default=None)
+
+    pm = sub.add_parser("page-media", aliases=["catalog"],
+                        help="list every media item on a page with quality/"
+                             "thumbnail/size info (JSON; used by the GUI "
+                             "batch sheet and the Chrome extension)")
+    pm.add_argument("url")
+    pm.add_argument("--proxy", default=None)
+    pm.add_argument("--user-agent", default=None)
+    pm.add_argument("--limit", type=int, default=100)
+    pm.add_argument("--no-size", action="store_true",
+                    help="skip parallel size probing (titles only)")
+    nh = sub.add_parser("native-host",
+                        help="Chrome native-messaging host for the MediaGrab "
+                             "extension (stdio protocol; run by Chrome)")
     return ap
 
 
@@ -856,9 +870,9 @@ def cmd_grab(args) -> int:
     return 1 if failures and not results else 0
 
 
-def _page_media(url: str, headers: dict, proxy: str | None,
-                attempts: int = 3):
-    """None if url is a plain file; [{kind,url,title}] if it is an HTML page.
+def _fetch_page(url: str, headers: dict, proxy: str | None,
+                attempts: int = 3) -> str | None:
+    """Full page text, or None when the url is a plain file (not HTML).
     Retries transient connection failures (TLS hiccups, resets)."""
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -875,8 +889,7 @@ def _page_media(url: str, headers: dict, proxy: str | None,
                 body_head = resp.read(4096)
                 if not grab.is_html(resp.getheader("Content-Type"), body_head):
                     return None
-                html = (body_head + resp.read()).decode("utf-8", "replace")
-                return grab.extract_links(html, url)
+                return (body_head + resp.read()).decode("utf-8", "replace")
             finally:
                 if callable(close):
                     try:
@@ -889,6 +902,13 @@ def _page_media(url: str, headers: dict, proxy: str | None,
             if attempt < attempts:
                 time.sleep(min(2.0, 0.5 * (2 ** (attempt - 1))))
     raise last_exc if last_exc else HttpError(500, "page fetch failed")
+
+
+def _page_media(url: str, headers: dict, proxy: str | None,
+                attempts: int = 3):
+    """None if url is a plain file; [{kind,url,title}] if it is an HTML page."""
+    html = _fetch_page(url, headers, proxy, attempts)
+    return None if html is None else grab.extract_links(html, url)
 
 
 # Backup cdn mirror hostnames per site. Sites that balance between several
@@ -1202,6 +1222,183 @@ def cmd_doctor(_args) -> int:
     return 0
 
 
+def _probe_size(url: str, referer: str | None, proxy: str | None,
+                timeout: float = 10.0):
+    """(size, accept_ranges) for one media url; (None, False) on failure."""
+    from .engine import probe as engine_probe, DEFAULT_HEADERS
+    headers = dict(DEFAULT_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+    try:
+        pr = engine_probe(url, proxy, timeout, headers=headers)
+        return pr.size, pr.accept_ranges
+    except Exception:
+        return None, False
+
+
+def cmd_page_media(args) -> int:
+    """Everything a batch UI needs from a page, in one JSON document:
+
+    {"url":..., "items":[{url,kind,title,quality,poster,size}], "error":?}
+
+    Fetches the page, extracts the media catalog (KVS flashvars, <video>
+    posters + sources, direct links), then probes every item's size in
+    parallel (ranged GET, no body transfer)."""
+    url = args.url
+    cfg = _cfg()
+    proxy = args.proxy or cfg.get("proxy") or os.environ.get("HTTPS_PROXY")
+    headers = {"User-Agent": net.DEFAULT_UA}
+    if args.user_agent:
+        headers["User-Agent"] = args.user_agent
+    out = {"url": url, "items": [], "error": None}
+    try:
+        html = _fetch_page(url, headers, proxy)
+    except (HttpError, OSError) as err:
+        out["error"] = f"{type(err).__name__}: {err}"
+        print(json.dumps(out))
+        return 1
+    if html is None:
+        # plain file, not a page: single item, itself
+        out["items"] = [{"url": url, "kind": "direct", "title": "",
+                         "quality": "", "poster": "", "size": None}]
+        size, _ = _probe_size(url, None, proxy)
+        out["items"][0]["size"] = size
+        print(json.dumps(out))
+        return 0
+    catalog = grab.extract_media_catalog(html, url)
+    if args.limit:
+        catalog = catalog[:args.limit]
+    if not args.no_size and catalog:
+        # parallel size probing; referer makes tiered cdns (KVS/erome) answer
+        results: dict[str, int | None] = {}
+        lock = threading.Lock()
+
+        def worker(item: dict) -> None:
+            size, _ = _probe_size(item["url"], url, proxy)
+            with lock:
+                results[item["url"]] = size
+
+        threads = [threading.Thread(target=worker, args=(it,), daemon=True)
+                   for it in catalog]
+        for t in threads[:8]:
+            t.start()
+            remaining = threads[8:]
+        running = threads[:8]
+        # simple sliding window of 8 workers
+        pending = list(threads[8:])
+        while True:
+            running = [t for t in running if t.is_alive()]
+            while len(running) < 8 and pending:
+                t = pending.pop(0)
+                t.start()
+                running.append(t)
+            if not running:
+                break
+            time.sleep(0.02)
+        for it in catalog:
+            it["size"] = results.get(it["url"])
+    else:
+        for it in catalog:
+            it["size"] = None
+    out["items"] = catalog
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_native_host(_args) -> int:
+    """Chrome native-messaging host (stdio, 4-byte LE length + JSON).
+
+    Messages (from the MediaGrab Chrome extension):
+      {"command":"ping"}                                  -> {"ok":true,...}
+      {"command":"probe","urls":[...],"referer":?}        -> {"sizes":{url:size}}
+      {"command":"download","urls":[...],"destination":?} -> {"ok":...,"spawned":n}
+    Downloads are spawned detached (one at a time, sequential queue) so the
+    browser never waits on them."""
+    import struct
+
+    def read_message() -> dict | None:
+        raw = sys.stdin.buffer.read(4)
+        if len(raw) < 4:
+            return None
+        (length,) = struct.unpack("<I", raw)
+        if not 0 < length <= 16 * 1024 * 1024:
+            return None
+        body = sys.stdin.buffer.read(length)
+        if len(body) < length:
+            return None
+        try:
+            return json.loads(body.decode("utf-8"))
+        except ValueError:
+            return None
+
+    def write_message(obj: dict) -> None:
+        body = json.dumps(obj).encode("utf-8")
+        sys.stdout.buffer.write(struct.pack("<I", len(body)))
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
+
+    mgd_bin = str(pathlib.Path(__file__).resolve().parent.parent / "bin" / "mgd")
+    while True:
+        msg = read_message()
+        if msg is None:
+            return 0
+        command = msg.get("command")
+        if command == "ping":
+            write_message({"ok": True, "app": "mgd", "version": "1.2"})
+            continue
+        if command == "probe":
+            urls = [str(x) for x in msg.get("urls", [])][:64]
+            referer = msg.get("referer")
+            sizes: dict[str, int | None] = {}
+            for chunk_start in range(0, len(urls), 8):
+                chunk = urls[chunk_start:chunk_start + 8]
+                results: dict[str, int | None] = {}
+                lock = threading.Lock()
+
+                def worker(u_: str) -> None:
+                    size, _ = _probe_size(u_, referer, None)
+                    with lock:
+                        results[u_] = size
+
+                ts = [threading.Thread(target=worker, args=(u_,), daemon=True)
+                      for u_ in chunk]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join()
+                sizes.update(results)
+            write_message({"ok": True, "sizes": sizes})
+            continue
+        if command == "download":
+            urls = [str(x) for x in msg.get("urls", [])][:128]
+            destination = msg.get("destination")
+            spawned = 0
+            for u_ in urls:
+                cmd = [sys.executable, mgd_bin, "grab", u_]
+                if destination:
+                    cmd += ["-d", str(destination)]
+                try:
+                    subprocess.Popen(
+                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL, start_new_session=True)
+                    spawned += 1
+                except OSError:
+                    pass
+            write_message({"ok": True, "spawned": spawned})
+            continue
+        if command == "open":
+            try:
+                subprocess.Popen(["open", "-a", "MediaGrab"],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  stdin=subprocess.DEVNULL)
+                write_message({"ok": True})
+            except OSError as err:
+                write_message({"ok": False, "error": str(err)})
+            continue
+        write_message({"ok": False, "error": f"unknown command {command!r}"})
+
+
 def cmd_qualities(args) -> int:
     """Machine-readable quality menu for a URL (NDJSON-ish single JSON line).
 
@@ -1308,6 +1505,7 @@ def cmd_resume(args) -> int:
             out_path = st_path.parent / (st.get("filename") or "download")
         dl = Downloader(st.get("url", ""), out_path,
                         proxy=_cfg().get("proxy") or os.environ.get("HTTPS_PROXY"),
+                        referer=st.get("referer"),
                         mirror_hosts=_mirror_hosts_for(st.get("url", "")),
                         resume_state=st_path.read_bytes())
         dl.pid = os.getpid()
@@ -1372,6 +1570,8 @@ def main(argv=None) -> int:
         "cancel": cmd_cancel, "rm": cmd_cancel, "del": cmd_cancel,
         "doctor": cmd_doctor,
         "qualities": cmd_qualities, "formats": cmd_qualities,
+        "page-media": cmd_page_media, "catalog": cmd_page_media,
+        "native-host": cmd_native_host,
     }
     try:
         return handlers[args.cmd](args)

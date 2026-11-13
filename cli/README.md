@@ -41,6 +41,11 @@ mgd grab "x.com/.." --resolver ytdlp|x  # force a resolver (default auto)
 mgd grab "https://www.erome.tv/.."  # KVS player pages (erome & tube sites):
                                     # inline flashvars quality list, Referer on
                                     # requests, auto cdn mirror fallback
+mgd grab "erome.com/a/<album>" --all  # multi-video pages: albums, galleries
+mgd page-media "erome.com/a/…"    # JSON catalog of every media item on a page
+                                   # (url/title/quality/poster + probed sizes)
+mgd native-host                    # Chrome native-messaging host for the
+                                   # MediaGrab extension (see chrome-extension/)
 mgd jobs                           # [running]/[paused] + per-item actions
 mgd pause 1 / mgd resume 1 / mgd cancel 1
 mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)
