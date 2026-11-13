@@ -541,6 +541,79 @@ def test_native_host_protocol():
     assert len(replies) == 2
 
 
+def test_dns_fallback_resolver():
+    """When the system resolver is dead (router outage, NXDOMAIN storms),
+    mgd queries public resolvers directly and keeps SNI/Host on the real
+    hostname. Tested against a local UDP DNS server on a custom port."""
+    import socket
+    import struct
+    import threading
+    from mgd import net
+
+    # minimal UDP DNS server: anything.mgd.test -> 127.0.0.1
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+
+    def serve():
+        while True:
+            try:
+                data, addr = sock.recvfrom(512)
+            except OSError:
+                return
+            qid = data[:2]
+            qdcount = struct.unpack(">H", data[4:6])[0]
+            pos = 12
+            for _ in range(qdcount):
+                while data[pos]:
+                    pos += data[pos] + 1
+                pos += 5
+            question = data[12:pos]
+            answer = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) \
+                + bytes([127, 0, 0, 1])
+            msg = qid + struct.pack(">HHHHH", 0x8180, qdcount, 1, 0, 0) \
+                + question + answer
+            try:
+                sock.sendto(msg, addr)
+            except OSError:
+                return
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        server = f"127.0.0.1:{port}"
+        # raw query layer
+        assert net._dns_query_a(server, "mgd.test", 2.0) == "127.0.0.1"
+        assert net._dns_query_a(server, "doesnotexist.mgd.test", 2.0) is None \
+            or net._dns_query_a(server, "doesnotexist.mgd.test", 2.0)
+        # entry point with the fallback list pointed at the local server
+        saved, saved_cache = net.FALLBACK_DNS, dict(net._dns_cache)
+        net.FALLBACK_DNS = [server]
+        net._dns_cache.clear()
+        assert net.resolve_with_fallback("mgd.test") == "127.0.0.1"
+        # caching: a second hit must not touch the network (cache serves it)
+        net.FALLBACK_DNS = []  # no servers left -> network would fail
+        assert net.resolve_with_fallback("mgd.test") == "127.0.0.1"
+        # IP passthrough never queries
+        assert net.resolve_with_fallback("192.0.2.9") == "192.0.2.9"
+        # a name with no working server caches/returns None, not a crash
+        net._dns_cache.clear()
+        assert net.resolve_with_fallback("unresolvable.example") is None
+        # patched getaddrinfo: system resolver raises gaierror for mgd.test
+        # (NXDOMAIN) -> the patch must fall back to the local server
+        net.FALLBACK_DNS = [server]
+        net._dns_cache.clear()
+        try:
+            infos = socket.getaddrinfo("mgd.test", 80)
+            assert infos, "getaddrinfo returned nothing"
+            assert {i[4][0] for i in infos} == {"127.0.0.1"}
+        except socket.gaierror:
+            raise AssertionError("gaierror leaked through the DNS fallback patch")
+    finally:
+        net.FALLBACK_DNS = saved
+        net._dns_cache = saved_cache
+        sock.close()
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")
