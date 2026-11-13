@@ -122,6 +122,10 @@ async function downloadSelected() {
   const dest = $("dest").value.trim();
   const payload = { command: "download", urls };
   if (dest) payload.destination = dest;
+  // the source page as Referer - erome-style CDNs 403 without it
+  if (currentPageUrl && /^https?:/.test(currentPageUrl)) {
+    payload.referer = currentPageUrl;
+  }
   const resp = await native(payload);
   const btn = $("download");
   if (resp && resp.ok) {
