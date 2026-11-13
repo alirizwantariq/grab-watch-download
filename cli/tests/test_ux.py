@@ -541,6 +541,41 @@ def test_native_host_protocol():
     assert len(replies) == 2
 
 
+def test_native_host_download(tmp_path):
+    """'download' command spawns a detached mgd grab that really lands."""
+    import conftest
+    import struct
+    import sys as _sys
+    import subprocess
+    import time
+    import pathlib
+
+    content = b"extension round trip " * 2048
+    origin = conftest.DripOrigin(content, chunk=32 * 1024, delay=0)
+
+    def frame(obj):
+        body = json.dumps(obj).encode()
+        return struct.pack("<I", len(body)) + body
+
+    dest = tmp_path / "ext"
+    payload = frame({"command": "download",
+                     "urls": [origin.url], "destination": str(dest)})
+    p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
+                       input=payload, capture_output=True, timeout=30)
+    (ln,) = struct.unpack("<I", p.stdout[:4])
+    reply = json.loads(p.stdout[4:4 + ln])
+    assert reply["ok"] and reply["spawned"] == 1, reply
+    out = dest / "drip.bin"
+    for _ in range(120):
+        time.sleep(0.25)
+        if out.exists() and out.stat().st_size == len(content):
+            assert out.read_bytes() == content
+            break
+    else:
+        raise AssertionError("extension-spawned grab did not finish")
+    origin.stop()
+
+
 def test_dns_fallback_resolver():
     """When the system resolver is dead (router outage, NXDOMAIN storms),
     mgd queries public resolvers directly and keeps SNI/Host on the real
