@@ -29,7 +29,18 @@ LAUNCHER="$LAUNCH_DIR/mgd-native-host"
 cat > "$LAUNCHER" <<EOF
 #!/bin/sh
 # MediaGrab native-messaging launcher (created by install_chrome_host.sh)
-exec "$MGD" native-host
+# Logs every spawn/exit to native-host.log so Chrome-side failures are
+# diagnosable ("Native host has exited" tells you nothing on its own).
+LOG="\${HOME:-/tmp}/.config/mgd/native-host.log"
+[ -n "\$HOME" ] || LOG="/tmp/mgd-native-host.log"
+PY="/opt/homebrew/bin/python3"
+[ -x "\$PY" ] || PY="/usr/local/bin/python3"
+[ -x "\$PY" ] || PY="/usr/bin/python3"
+echo "\$(date '+%F %T') spawn pid=\$\$ py=\$PY" >> "\$LOG"
+"\$PY" "$MGD" native-host 2>>"\$LOG"
+rc=\$?
+echo "\$(date '+%F %T') exit pid=\$\$ rc=\$rc" >> "\$LOG"
+exit \$rc
 EOF
 chmod +x "$LAUNCHER"
 echo "launcher: $LAUNCHER -> $MGD native-host"
