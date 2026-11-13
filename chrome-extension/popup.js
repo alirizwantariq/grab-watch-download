@@ -143,7 +143,16 @@ async function checkHost() {
     st.textContent = "mgd engine connected";
     st.className = "ok";
   } else {
-    st.textContent = "native host not installed — run cli/script/install_chrome_host.sh";
+    const detail = resp && resp.error ? String(resp.error) : "";
+    if (detail.includes("not found") || detail.includes("Invalid")) {
+      st.textContent = "native host missing — run cli/script/install_chrome_host.sh, then fully quit Chrome (⌘Q) and reopen";
+    } else if (detail.includes("forbidden")) {
+      st.textContent = "host registered for a different extension id — re-run cli/script/install_chrome_host.sh";
+    } else {
+      st.textContent = detail
+        ? "host error: " + detail.slice(0, 80)
+        : "native host not visible yet — fully quit Chrome (⌘Q) and reopen";
+    }
     st.className = "bad";
   }
   updateSummary();
