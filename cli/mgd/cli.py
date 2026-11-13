@@ -56,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "mgd asks interactively when run in a terminal)")
     g.add_argument("--proxy", default=None,
                    help="proxy URL: http://h:p, https://h:p or socks5://h:p")
+    g.add_argument("--referer", default=None,
+                   help="Referer header for the media requests (some CDNs "
+                        "require the source page; set automatically when "
+                        "grabbing via a scanned page)")
     g.add_argument("--cookies", default=None, help="Netscape cookie file for yt-dlp")
     g.add_argument("--cookies-from-browser", default=None,
                    help="browser to pull cookies from for yt-dlp: chrome, firefox, edge, safari, brave")
@@ -755,6 +759,11 @@ def cmd_grab(args) -> int:
         headers[k.strip()] = v.strip()
     stopper = Stopper()
 
+    if args.referer:
+        # explicit referer: CDNs gated by it (erome etc.) would 403 even the
+        # is-it-a-page probe below, sending the grab down a dead-end path
+        headers.setdefault("Referer", args.referer)
+
     if _is_platform(args.url):
         return _grab_platform(args, cfg)
 
@@ -831,7 +840,8 @@ def cmd_grab(args) -> int:
         dl = Downloader(url_i, out_path, proxy=args.proxy, conns=conns,
                         retries=retries, stopper=stopper,
                         timeout=DEFAULT_TIMEOUT,
-                        referer=args.url if page_links is not None else None,
+                        referer=(getattr(args, "referer", None)
+                                 or (args.url if page_links is not None else None)),
                         mirror_hosts=_mirror_hosts_for(url_i) or
                                      _mirror_hosts_for(args.url),
                         expected_sha256=args.sha256 if t["kind"] == "direct" else None)
@@ -1372,6 +1382,7 @@ def cmd_native_host(_args) -> int:
         if command == "download":
             urls = [str(x) for x in msg.get("urls", [])][:128]
             destination = msg.get("destination")
+            referer = msg.get("referer")
             log_path = pathlib.Path(
                 os.environ.get("HOME") or "/tmp") / ".config/mgd/native-host.log"
             spawned = 0
@@ -1379,6 +1390,10 @@ def cmd_native_host(_args) -> int:
                 cmd = [sys.executable, mgd_bin, "grab", u_]
                 if destination:
                     cmd += ["-d", str(destination)]
+                if referer:
+                    # tiered CDNs (erome etc.) 403 media requests without the
+                    # source page as Referer
+                    cmd += ["--referer", str(referer)]
                 try:
                     err_sink = open(log_path, "a", encoding="utf-8")
                     print(f"{time.strftime('%F %T')} grab spawn: {u_}",

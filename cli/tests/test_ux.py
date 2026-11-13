@@ -649,6 +649,92 @@ def test_dns_fallback_resolver():
         sock.close()
 
 
+def test_native_host_download_referer(tmp_path):
+    """Reproduces the erome failure: CDNs that 403 media requests without
+    the source page as Referer. The host must pass --referer through and
+    the engine must send it on every request."""
+    import http.server
+    import struct
+    import sys as _sys
+    import subprocess
+    import threading
+    import time
+    import pathlib
+
+    content = b"referer required " * 4096
+    PAGE = "https://example.com/watch/42"
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.headers.get("Referer") != PAGE:
+                body = b"403 forbidden"
+                self.send_response(403)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            start, end = 0, len(content) - 1
+            rng = self.headers.get("Range", "")
+            if rng.startswith("bytes="):
+                spec = rng[6:].split(",", 1)[0]
+                first, _, last = spec.partition("-")
+                start = int(first)
+                end = int(last) if last else len(content) - 1
+            self.send_response(206)
+            self.send_header("Content-Range",
+                             f"bytes {start}-{end}/{len(content)}")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.end_headers()
+            self.wfile.write(content[start:end + 1])
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/video.mp4"
+        dest = tmp_path / "ref"
+        dest.mkdir(exist_ok=True)
+
+        def frame(obj):
+            body = json.dumps(obj).encode()
+            return struct.pack("<I", len(body)) + body
+
+        # without referer: fails 403
+        payload = frame({"command": "download", "urls": [url],
+                         "destination": str(dest)})
+        p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
+                           input=payload, capture_output=True, timeout=30)
+        (ln,) = struct.unpack("<I", p.stdout[:4])
+        assert json.loads(p.stdout[4:4 + ln])["spawned"] == 1
+        out = dest / "video.mp4"
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            time.sleep(0.5)
+            if out.exists():
+                raise AssertionError("download should have 403'd without referer")
+        # with referer: completes
+        payload = frame({"command": "download", "urls": [url],
+                         "destination": str(dest), "referer": PAGE})
+        p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
+                           input=payload, capture_output=True, timeout=30)
+        (ln,) = struct.unpack("<I", p.stdout[:4])
+        assert json.loads(p.stdout[4:4 + ln])["spawned"] == 1
+        for _ in range(60):
+            time.sleep(0.5)
+            if out.exists() and out.stat().st_size == len(content):
+                assert out.read_bytes() == content
+                return
+        raise AssertionError("referer download did not finish")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")
