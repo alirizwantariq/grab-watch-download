@@ -125,10 +125,18 @@ async function downloadSelected() {
   const resp = await native(payload);
   const btn = $("download");
   if (resp && resp.ok) {
+    const n = resp.spawned || 0;
+    if (n === 0) {
+      btn.textContent = "failed — retry";
+      $("hostStatus").textContent = "mgd could not start any download (see ~/.config/mgd/native-host.log)";
+      return;
+    }
     btn.textContent = "queued ✓";
     btn.classList.add("done");
-    $("hostStatus").textContent = `sent ${resp.spawned || urls.length} download${urls.length === 1 ? "" : "s"} to mgd`;
-    setTimeout(() => window.close(), 700);
+    $("hostStatus").textContent =
+      `queued ${n} of ${urls.length} — watch them in the MediaGrab app` +
+      (n < urls.length ? " (partial: see ~/.config/mgd/native-host.log)" : "");
+    setTimeout(() => window.close(), 900);
   } else {
     btn.textContent = "failed — retry";
     $("hostStatus").textContent = (resp && resp.error) || "native host error";

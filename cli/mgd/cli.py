@@ -1372,15 +1372,22 @@ def cmd_native_host(_args) -> int:
         if command == "download":
             urls = [str(x) for x in msg.get("urls", [])][:128]
             destination = msg.get("destination")
+            log_path = pathlib.Path(
+                os.environ.get("HOME") or "/tmp") / ".config/mgd/native-host.log"
             spawned = 0
             for u_ in urls:
                 cmd = [sys.executable, mgd_bin, "grab", u_]
                 if destination:
                     cmd += ["-d", str(destination)]
                 try:
+                    err_sink = open(log_path, "a", encoding="utf-8")
+                    print(f"{time.strftime('%F %T')} grab spawn: {u_}",
+                          file=err_sink)
+                    err_sink.flush()
                     subprocess.Popen(
-                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        cmd, stdout=subprocess.DEVNULL, stderr=err_sink,
                         stdin=subprocess.DEVNULL, start_new_session=True)
+                    err_sink.close()
                     spawned += 1
                 except OSError:
                     pass

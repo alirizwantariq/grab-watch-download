@@ -88,6 +88,7 @@ struct ListEntry: Identifiable {
     let done: Int64
     let size: Int64
     let state: String
+    let outPath: String
 
     static func parse(_ stdout: String) -> [ListEntry] {
         guard let data = stdout.data(using: .utf8),
@@ -99,7 +100,8 @@ struct ListEntry: Identifiable {
                       filename: it["filename"] as? String ?? "",
                       done: (it["done"] as? NSNumber)?.int64Value ?? 0,
                       size: (it["size"] as? NSNumber)?.int64Value ?? 0,
-                      state: it["state"] as? String ?? "paused")
+                      state: it["state"] as? String ?? "paused",
+                      outPath: it["out_path"] as? String ?? "")
         }
     }
 }
@@ -556,6 +558,58 @@ final class JobStore: ObservableObject {
         refreshPaused()
     }
 
+    // MARK: external downloads (started from the extension or a terminal)
+
+    @Published var externalRunning: [ListEntry] = []
+    /// url -> (entry, lastDone, lastDate) for speed estimation + completion
+    private var seenExternal: [String: (entry: ListEntry, lastDone: Int64, at: Date)] = [:]
+
+    var externalSpeeds: [String: Double] = [:]
+
+    func pauseExternalRunning(_ entry: ListEntry) {
+        Task {
+            // re-resolve the id: the list may have shifted since the last poll
+            let out = await MGDPaths.run(["list", "--json"])
+            let fresh = ListEntry.parse(out)
+            let idx = fresh.first(where: { $0.url == entry.url })?.index ?? entry.index
+            _ = await MGDPaths.run(["pause", "\(idx)"])
+            await MainActor.run { self.refreshPaused() }
+        }
+    }
+
+    func cancelExternalRunning(_ entry: ListEntry) {
+        Task {
+            let out = await MGDPaths.run(["list", "--json"])
+            let fresh = ListEntry.parse(out)
+            let idx = fresh.first(where: { $0.url == entry.url })?.index ?? entry.index
+            _ = await MGDPaths.run(["cancel", "\(idx)"])
+            await MainActor.run { self.refreshPaused() }
+        }
+    }
+
+    /// External downloads that finished while we watched -> Completed rows.
+    private func promoteFinishedExternal(vanished: [ListEntry]) {
+        for gone in vanished {
+            guard !jobs.contains(where: { $0.url == gone.url }) else { continue }
+            let path = gone.outPath
+            if !path.isEmpty && FileManager.default.fileExists(atPath: path) {
+                let job = DownloadJob(url: gone.url,
+                                      title: (path as NSString).lastPathComponent)
+                job.phase = .done
+                job.total = gone.size
+                job.done = gone.size
+                job.finishedSize = gone.size
+                job.finishedPath = path
+                job.finishedAt = Date()
+                jobs.insert(job, at: 0)
+                statusFooter = "finished: \((path as NSString).lastPathComponent)"
+            }
+            seenExternal.removeValue(forKey: gone.url)
+            externalSpeeds.removeValue(forKey: gone.url)
+        }
+        saveHistory()
+    }
+
     /// Stop an in-app paused job and delete its partial data.
     func cancel(job: DownloadJob) {
         job.pause()   // stop the process if somehow still running
@@ -665,8 +719,34 @@ final class JobStore: ObservableObject {
     func refreshPaused() {
         Task.detached {
             let out = await MGDPaths.run(["list", "--json"])
-            let items = ListEntry.parse(out).filter { $0.state != "running" }
-            await MainActor.run { self.pausedList = items }
+            let all = ListEntry.parse(out)
+            await MainActor.run {
+                let appUrls = Set(self.jobs.map(\.url))
+                let running = all.filter { $0.state == "running" }
+                self.externalRunning = running.filter { !appUrls.contains($0.url) }
+                self.pausedList = all.filter { $0.state != "running" }
+                    .filter { !appUrls.contains($0.url) }
+                // speed estimates between polls + completion detection
+                let now = Date()
+                var seen: [String: (entry: ListEntry, lastDone: Int64, at: Date)] = [:]
+                for e in running {
+                    if let prev = self.seenExternal[e.url] {
+                        let dt = now.timeIntervalSince(prev.at)
+                        if dt > 0.2 {
+                            self.externalSpeeds[e.url] =
+                                max(0, Double(e.done - prev.lastDone) / dt)
+                        }
+                    }
+                    seen[e.url] = (e, e.done, now)
+                }
+                let vanished = self.seenExternal.values
+                    .filter { seen[$0.entry.url] == nil }
+                    .map(\.entry)
+                self.seenExternal = seen
+                if !vanished.isEmpty {
+                    self.promoteFinishedExternal(vanished: vanished)
+                }
+            }
         }
     }
 }
@@ -853,6 +933,75 @@ struct ActiveJobRow: View {
             Button("Copy URL") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(job.url, forType: .string)
+            }
+        }
+    }
+}
+
+/// A download started outside this app (extension / terminal) that is live.
+struct ExternalRunningRow: View {
+    let entry: ListEntry
+    let speed: Double
+    var onPause: () -> Void
+    var onCancel: () -> Void
+
+    var speedText: String {
+        speed > 1 ? fmtSpeed(speed) : ""
+    }
+
+    var body: some View {
+        card(
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 16)).foregroundColor(.blue)
+                        .frame(width: 30)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(entry.filename.isEmpty ? entry.url : entry.filename)
+                            .lineLimit(1).font(.body.weight(.medium))
+                        HStack(spacing: 10) {
+                            if entry.size > 0 {
+                                Text("\(fmtBytes(entry.done)) / \(fmtBytes(entry.size)) — \(Int(min(100, Double(entry.done) * 100 / Double(entry.size))))%")
+                            }
+                            if !speedText.isEmpty {
+                                Text("· \(speedText)")
+                            }
+                            Text("· started outside this app")
+                                .font(.caption2)
+                        }
+                        .font(.caption).foregroundColor(.secondary)
+                        if entry.size > 0 {
+                            ProgressBar(fraction: Double(entry.done) / Double(entry.size),
+                                        color: .blue)
+                        }
+                    }
+                    Spacer()
+                    Button {
+                        onPause()
+                    } label: {
+                        Label("Pause", systemImage: "pause.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Pause (same as mgd pause)")
+                    Button {
+                        onCancel()
+                    } label: {
+                        Label("Cancel", systemImage: "xmark")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Stop and delete the partial data")
+                }
+            }
+        )
+        .contextMenu {
+            Button("Pause", action: onPause)
+            Button("Cancel and delete partial data", action: onCancel)
+            Divider()
+            Button("Copy URL") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(entry.url, forType: .string)
             }
         }
     }
@@ -1305,11 +1454,14 @@ struct ContentView: View {
     private func categoryCount(_ name: String) -> Int {
         if name == "All" {
             return store.jobs.count + store.pausedList.count
+                + store.externalRunning.count
+        }
+        let extCat = { (e: ListEntry) in
+            MediaGrabCategory.category(forPath: e.outPath.isEmpty ? e.filename : e.outPath)
         }
         return store.jobs.filter { $0.category == name }.count
-            + store.pausedList.filter {
-                MediaGrabCategory.category(forPath: $0.filename) == name
-            }.count
+            + store.pausedList.filter { extCat($0) == name }.count
+            + store.externalRunning.filter { extCat($0) == name }.count
     }
 
     private func matchesCategory(_ job: DownloadJob) -> Bool {
@@ -1408,8 +1560,14 @@ struct ContentView: View {
                 && matchesCategory($0)
         }
         let pausedExternal = store.pausedList.filter { matchesCategory($0) }
+        let runningExternal = store.externalRunning.filter {
+            session.category == "All"
+                || MediaGrabCategory.category(forPath: $0.outPath.isEmpty
+                    ? $0.filename : $0.outPath) == session.category
+        }
         return Group {
-            if active.isEmpty && finished.isEmpty && pausedExternal.isEmpty {
+            if active.isEmpty && finished.isEmpty && pausedExternal.isEmpty
+                    && runningExternal.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "tray")
                         .font(.system(size: 34)).foregroundColor(.secondary.opacity(0.5))
@@ -1417,7 +1575,7 @@ struct ContentView: View {
                          ? "No downloads yet" : "Nothing in \(session.category)")
                         .foregroundColor(.secondary)
                     Text("Paste or drag a link above to start. " +
-                         "Finished files show a file icon — click it to open its folder.")
+                         "Downloads from the Chrome extension and the terminal show up here too.")
                         .font(.caption).foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                 }
@@ -1432,6 +1590,17 @@ struct ContentView: View {
                                 ActiveJobRow(job: job,
                                              onResume: { store.resume(job: job) },
                                              onCancel: { store.cancel(job: job) })
+                            }
+                        }
+                        if !runningExternal.isEmpty {
+                            SectionHeader(title: "Downloading (extension · terminal)",
+                                          count: runningExternal.count,
+                                          systemImage: "terminal", color: .blue)
+                            ForEach(runningExternal) { entry in
+                                ExternalRunningRow(entry: entry,
+                                                   speed: store.externalSpeeds[entry.url] ?? 0,
+                                                   onPause: { store.pauseExternalRunning(entry) },
+                                                   onCancel: { store.cancelExternalRunning(entry) })
                             }
                         }
                         if !pausedExternal.isEmpty {
@@ -1469,6 +1638,7 @@ struct ContentView: View {
         let acc = store.jobs
             .filter { $0.phase == .running }
             .reduce(0.0) { $0 + $1.bytesPerSecond }
+            + store.externalSpeeds.values.reduce(0.0, +)
         return acc > 1 ? "· total \(fmtSpeed(acc))" : ""
     }
 
