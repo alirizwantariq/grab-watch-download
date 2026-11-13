@@ -1388,7 +1388,7 @@ def cmd_native_host(_args) -> int:
             continue
         if command == "open":
             try:
-                subprocess.Popen(["open", "-a", "MediaGrab"],
+                subprocess.Popen(["/usr/bin/open", "-a", "MediaGrab"],
                                   stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL,
                                   stdin=subprocess.DEVNULL)
