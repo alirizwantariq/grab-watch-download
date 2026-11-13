@@ -159,15 +159,27 @@ final class DownloadJob: ObservableObject, Identifiable {
     @Published var finishedPath: String?
     @Published var finishedSize: Int64 = 0
     @Published var showLog = false
+    /// page thumbnail (batch sheet / page-media); kept for history rows
+    var poster: String?
+    /// when the download finished (history list, newest first)
+    var finishedAt: Date?
     var process: Process?
     /// fallback path parsed from yt-dlp's "[download] Destination: …" output
     var candidatePath: String?
     private var lastTick = Date()
     private var lastBytes: Int64 = 0
 
-    init(url: String, title: String? = nil) {
+    init(url: String, title: String? = nil, poster: String? = nil) {
         self.url = url
         self.title = title ?? url
+        self.poster = poster
+    }
+
+    /// FDM-style category for the sidebar (from the finished file's path,
+    /// falling back to the url/title text).
+    var category: String {
+        let source = finishedPath ?? (candidatePath ?? url)
+        return MediaGrabCategory.category(forPath: source)
     }
 
     func ingest(_ line: String) {
@@ -187,6 +199,7 @@ final class DownloadJob: ObservableObject, Identifiable {
                     finishedSize = (obj["size"] as? NSNumber)?.int64Value ?? total
                     total = finishedSize
                     done = total
+                    finishedAt = Date()
                     phase = .done
                 case "error":
                     log += "✗ \(obj["message"] as? String ?? "error")\n"
@@ -298,6 +311,41 @@ func fileSymbol(forPath path: String) -> String {
     }
 }
 
+/// FDM-style sidebar categories.
+enum MediaGrabCategory {
+    static let names = ["All", "Video", "Audio", "Images", "Archives", "Documents", "Other"]
+
+    static func category(forPath path: String) -> String {
+        let ext = (path as NSString).pathExtension.lowercased()
+        switch ext {
+        case "mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg", "ts", "flv", "wmv", "3gp":
+            return "Video"
+        case "mp3", "m4a", "wav", "flac", "aac", "ogg", "opus", "wma":
+            return "Audio"
+        case "jpg", "jpeg", "png", "gif", "webp", "heic", "tiff", "bmp":
+            return "Images"
+        case "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "dmg", "iso", "apk":
+            return "Archives"
+        case "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "rtf", "csv", "epub":
+            return "Documents"
+        default:
+            return "Other"
+        }
+    }
+
+    static func symbol(for name: String) -> String {
+        switch name {
+        case "All": return "tray.2"
+        case "Video": return "film"
+        case "Audio": return "music.note"
+        case "Images": return "photo"
+        case "Archives": return "archivebox"
+        case "Documents": return "doc"
+        default: return "arrow.down.circle"
+        }
+    }
+}
+
 func revealInFinder(_ path: String) {
     let url = URL(fileURLWithPath: path)
     if FileManager.default.fileExists(atPath: path) {
@@ -309,12 +357,95 @@ func revealInFinder(_ path: String) {
 
 // MARK: - store
 
+/// One persisted history row (~/Library/Application Support/MediaGrab/history.json)
+struct HistoryEntry: Codable {
+    var url: String
+    var title: String
+    var phase: String
+    var done: Int64
+    var total: Int64
+    var finishedPath: String?
+    var finishedSize: Int64
+    var poster: String?
+    /// ISO-8601-ish free-form string (kept lenient on purpose so external
+    /// tools and older versions can hand-edit history.json safely)
+    var finishedAt: String?
+    var logTail: String?
+}
+
+extension HistoryEntry {
+    var finishedDate: Date? {
+        guard let finishedAt, !finishedAt.isEmpty else { return nil }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: finishedAt) { return d }
+        let f2 = ISO8601DateFormatter()
+        if let d = f2.date(from: finishedAt) { return d }
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+        if let d = df.date(from: finishedAt) { return d }
+        df.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return df.date(from: finishedAt)
+    }
+}
+
 final class JobStore: ObservableObject {
     @Published var jobs: [DownloadJob] = []
     @Published var pausedList: [ListEntry] = []   // paused elsewhere / before launch
     @Published var statusFooter = ""
 
-    // actions: start / pause / resume
+    init() {
+        loadHistory()
+    }
+
+    // MARK: persistence (the download list survives reboots, like FDM)
+
+    static var historyURL: URL {
+        let dir = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MediaGrab", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("history.json")
+    }
+
+    func saveHistory() {
+        let finished: [DownloadJob] = jobs.filter {
+            $0.phase == .done || $0.phase == .failed
+        }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let entries: [HistoryEntry] = finished.prefix(200).map { job in
+            HistoryEntry(url: job.url, title: job.title, phase: job.phase.rawValue,
+                         done: job.done, total: job.total,
+                         finishedPath: job.finishedPath, finishedSize: job.finishedSize,
+                         poster: job.poster,
+                         finishedAt: job.finishedAt.map { f.string(from: $0) },
+                         logTail: String(job.log.suffix(400)))
+        }
+        if let data = try? JSONEncoder().encode(entries) {
+            try? data.write(to: Self.historyURL, options: .atomic)
+        }
+    }
+
+    func loadHistory() {
+        guard let data = try? Data(contentsOf: Self.historyURL),
+              let entries = try? JSONDecoder().decode([HistoryEntry].self, from: data) else {
+            return
+        }
+        for e in entries.prefix(200).reversed() {
+            let job = DownloadJob(url: e.url, title: e.title, poster: e.poster)
+            job.phase = JobPhase(rawValue: e.phase) ?? .done
+            job.done = e.done
+            job.total = e.total
+            job.finishedPath = e.finishedPath
+            job.finishedSize = e.finishedSize
+            job.finishedAt = e.finishedDate
+            if let tail = e.logTail { job.appendLog(tail) }
+            jobs.insert(job, at: 0)
+        }
+    }
+
+    // MARK: actions: start / pause / resume
 
     func start(_ job: DownloadJob, quality: String, category: String,
                destination: String? = nil) {
@@ -341,6 +472,7 @@ final class JobStore: ObservableObject {
                 switch code {
                 case 0:
                     job.phase = .done
+                    job.finishedAt = Date()
                 case 130:
                     job.phase = .paused
                     job.appendLog("paused — progress saved")
@@ -349,9 +481,22 @@ final class JobStore: ObservableObject {
                 }
             }
             job.finalizeAfterExit(code: code)
+            if job.phase == .done, job.finishedAt == nil { job.finishedAt = Date() }
             self.refreshPaused()
             self.statusFooter = "\(job.title): \(job.phase.rawValue)"
+            self.saveHistory()
         })
+    }
+
+    /// Queue a batch of page items (albums, galleries) — one job per item.
+    func startBatch(_ items: [BatchItem], destination: String?) {
+        for item in items {
+            let job = DownloadJob(url: item.url,
+                                  title: item.title.isEmpty ? item.url : item.title,
+                                  poster: item.poster.isEmpty ? nil : item.poster)
+            start(job, quality: "auto", category: "auto", destination: destination)
+        }
+        statusFooter = "queued \(items.count) download\(items.count == 1 ? "" : "s")"
     }
 
     /// Resume a job the app itself paused (id resolved by url from `mgd list`).
@@ -438,19 +583,75 @@ final class JobStore: ObservableObject {
 
     func remove(_ job: DownloadJob) {
         jobs.removeAll { $0.id == job.id }
+        saveHistory()
     }
 
-    /// Move the finished file to Trash, then drop the row.
+    /// Reveal a finished file in Finder. Always tells the user what happened
+    /// via the status bar (the old silent no-op when the path was gone made
+    /// the button look broken) and falls back to opening the folder.
+    func reveal(_ job: DownloadJob) {
+        guard let path = job.finishedPath, !path.isEmpty else {
+            statusFooter = "no file path recorded for “\(job.title)”"
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            statusFooter = "revealed in Finder: \((path as NSString).lastPathComponent)"
+        } else {
+            let dir = (path as NSString).deletingLastPathComponent
+            if FileManager.default.fileExists(atPath: dir) {
+                NSWorkspace.shared.open(URL(fileURLWithPath: dir))
+                statusFooter = "file was moved/deleted — opened its folder instead"
+            } else {
+                NSWorkspace.shared.open(URL(fileURLWithPath:
+                    ("~/Downloads/mgd" as NSString).expandingTildeInPath))
+                statusFooter = "neither file nor folder exists — opened the download root"
+            }
+        }
+    }
+
+    /// Open the finished file itself with its default app.
+    func open(_ job: DownloadJob) {
+        guard let path = job.finishedPath, !path.isEmpty else {
+            statusFooter = "no file path recorded for “\(job.title)”"
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            statusFooter = "opened: \((path as NSString).lastPathComponent)"
+        } else {
+            statusFooter = "file no longer exists: \(path)"
+        }
+    }
+
+    /// Move the finished file to Trash, then drop the row (with feedback +
+    /// a second deletion path, so a failing API can never look like a no-op).
     func trashFile(of job: DownloadJob) {
         let path = job.finishedPath
         remove(job)
-        statusFooter = "removed from list: \(job.title)"
-        guard let path, FileManager.default.fileExists(atPath: path) else { return }
-        NSWorkspace.shared.recycle([URL(fileURLWithPath: path)]) { _, err in
-            DispatchQueue.main.async {
-                self.statusFooter = err == nil
-                    ? "moved to Trash: \((path as NSString).lastPathComponent)"
-                    : "could not delete file: \(err!.localizedDescription)"
+        guard let path, !path.isEmpty else {
+            statusFooter = "removed from list: \(job.title)"
+            return
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            statusFooter = "removed from list (file was already gone)"
+            return
+        }
+        do {
+            var resulting: NSURL?
+            try FileManager.default.trashItem(
+                at: URL(fileURLWithPath: path), resultingItemURL: &resulting)
+            statusFooter = "moved to Trash: \((path as NSString).lastPathComponent)"
+        } catch {
+            NSWorkspace.shared.recycle([URL(fileURLWithPath: path)]) {
+                [weak self] _, err in
+                DispatchQueue.main.async {
+                    self?.statusFooter = err == nil
+                        ? "moved to Trash: \((path as NSString).lastPathComponent)"
+                        : "could not delete file: \(err!.localizedDescription)"
+                }
             }
         }
     }
@@ -458,6 +659,7 @@ final class JobStore: ObservableObject {
     func clearFinished() {
         jobs.removeAll { $0.phase == .done || $0.phase == .failed || $0.phase == .cancelled }
         statusFooter = "cleared completed downloads"
+        saveHistory()
     }
 
     func refreshPaused() {
@@ -640,6 +842,19 @@ struct ActiveJobRow: View {
                 }
             }
         )
+        .contextMenu {
+            if job.phase == .running || job.phase == .queued {
+                Button("Pause", action: { job.pause() })
+            } else if job.phase == .paused {
+                Button("Resume", action: onResume)
+            }
+            Button("Cancel and delete partial data", action: onCancel)
+            Divider()
+            Button("Copy URL") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(job.url, forType: .string)
+            }
+        }
     }
 }
 
@@ -683,6 +898,8 @@ struct ExternalPausedRow: View {
 
 struct FinishedJobRow: View {
     @ObservedObject var job: DownloadJob
+    var onReveal: () -> Void
+    var onOpen: () -> Void
     var onRemove: () -> Void
     var onTrashFile: () -> Void
 
@@ -691,14 +908,14 @@ struct FinishedJobRow: View {
             HStack(alignment: .center, spacing: 12) {
                 if job.phase == .done, let path = job.finishedPath {
                     Button {
-                        revealInFinder(path)
+                        onReveal()
                     } label: {
                         Image(systemName: fileSymbol(forPath: path))
                             .font(.system(size: 26))
                             .foregroundColor(.accentColor)
                     }
                     .buttonStyle(.borderless)
-                    .help("Open the folder containing this file")
+                    .help("Show in Finder")
                 } else {
                     Image(systemName: job.phase == .failed
                           ? "exclamationmark.triangle.fill" : "xmark.circle.fill")
@@ -724,33 +941,62 @@ struct FinishedJobRow: View {
 
                 Spacer()
 
-                if job.phase == .done, let path = job.finishedPath {
+                if job.phase == .done, job.finishedPath != nil {
                     Button {
-                        revealInFinder(path)
+                        onReveal()
                     } label: {
                         Label("Show", systemImage: "folder")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .help("Open the folder containing this file")
+                    .help("Show in Finder")
+                    Button {
+                        onOpen()
+                    } label: {
+                        Label("Open", systemImage: "play")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Open the file with its default app")
                 }
                 Menu {
+                    Button("Show in Finder", action: onReveal)
+                        .help("Reveal the downloaded file in Finder")
+                    Button("Open file", action: onOpen)
+                        .help("Open the downloaded file")
+                    Divider()
+                    Button("Copy URL") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(job.url, forType: .string)
+                    }
+                    Divider()
                     Button("Remove from list", action: onRemove)
                         .help("Keep the file, forget this row")
                     if job.finishedPath != nil {
-                        Divider()
                         Button("Delete file (moves to Trash)", action: onTrashFile)
                             .help("Move the downloaded file to the Trash")
                     }
                 } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "ellipsis.circle")
                 }
                 .menuStyle(.borderlessButton)
                 .frame(width: 30)
                 .fixedSize()
-                .help("Delete options")
+                .help("Actions")
             }
         )
+        .contextMenu {
+            Button("Show in Finder", action: onReveal)
+            Button("Open file", action: onOpen)
+            Divider()
+            Button("Copy URL") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(job.url, forType: .string)
+            }
+            Divider()
+            Button("Remove from list", action: onRemove)
+            Button("Delete file (moves to Trash)", action: onTrashFile)
+        }
     }
 }
 
@@ -834,6 +1080,10 @@ final class Session: ObservableObject {
     @Published var showLog = false
     @Published var probing = false
     @Published var qualitySheet: QualityProbe?
+    /// multi-video page scan result (album/gallery batch sheet)
+    @Published var batchSheet: BatchProbe?
+    /// FDM-style sidebar filter
+    @Published var category = "All"
     /// nil = auto (~/Downloads/mgd with per-type folders); otherwise an
     /// absolute path chosen with the folder picker, passed to mgd as -d.
     @Published var destination: String?
@@ -843,21 +1093,80 @@ final class Session: ObservableObject {
     @Published var pickingFolder = false
 }
 
+// MARK: - batch (multi-video page) model
+
+/// One media item found by `mgd page-media` (url/title/quality/poster/size).
+struct BatchItem: Identifiable {
+    let id = UUID()
+    let url: String
+    let title: String
+    let quality: String
+    let poster: String
+    let size: Int64?
+
+    init?(dict: [String: Any]) {
+        guard let url = dict["url"] as? String else { return nil }
+        self.url = url
+        self.title = (dict["title"] as? String) ?? ""
+        self.quality = (dict["quality"] as? String) ?? ""
+        self.poster = (dict["poster"] as? String) ?? ""
+        if let n = dict["size"] as? NSNumber {
+            self.size = n.int64Value
+        } else {
+            self.size = nil
+        }
+    }
+
+    var sizeText: String {
+        guard let size, size > 0 else { return "size unknown" }
+        return fmtBytes(size)
+    }
+}
+
+/// Observable wrapper for the batch sheet (selection state lives here).
+final class BatchProbe: ObservableObject, Identifiable {
+    let id = UUID()
+    let url: String
+    let items: [BatchItem]
+    @Published var selected: Set<UUID> = []
+
+    init(url: String, items: [BatchItem]) {
+        self.url = url
+        self.items = items
+        selected = Set(items.map(\.id))   // everything checked by default
+    }
+
+    var chosen: [BatchItem] {
+        items.filter { selected.contains($0.id) }
+    }
+
+    var totalSelectedBytes: Int64 {
+        chosen.reduce(0) { $0 + ($1.size ?? 0) }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var store = JobStore()
     @StateObject private var session = Session()
     private let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            header
+        HStack(spacing: 0) {
+            sidebar
             Divider()
-            jobsArea
-            Divider()
-            footer
+            VStack(alignment: .leading, spacing: 12) {
+                header
+                Divider()
+                jobsArea
+                Divider()
+                footer
+            }
+            .padding(.vertical, 10)
         }
-        .padding(.vertical, 10)
-        .onAppear { store.refreshPaused() }
+        .onAppear {
+            store.refreshPaused()
+            store.saveHistory()   // prune/re-write after loading old rows
+        }
         .onReceive(timer) { _ in store.refreshPaused() }
         .onDrop(of: [UTType.url, UTType.text], isTargeted: $session.dropActive) {
             providers in dropped(providers)
@@ -890,6 +1199,14 @@ struct ContentView: View {
                 begin(url: probe.url, quality: quality)
             }, onClose: { session.qualitySheet = nil })
         }
+        .sheet(item: $session.batchSheet) { batch in
+            BatchSheet(batch: batch,
+                       onStart: { items in
+                           store.startBatch(items, destination: session.destination)
+                           session.batchSheet = nil
+                       },
+                       onClose: { session.batchSheet = nil })
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -897,6 +1214,15 @@ struct ContentView: View {
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
+            }
+            ToolbarItem {
+                Button {
+                    resumeAll()
+                } label: {
+                    Label("Resume all", systemImage: "play.circle")
+                }
+                .disabled(!store.jobs.contains { $0.phase == .paused }
+                         && store.pausedList.isEmpty)
             }
             ToolbarItem {
                 Button {
@@ -937,6 +1263,66 @@ struct ContentView: View {
         }
     }
 
+    // MARK: sidebar (FDM-style category filter)
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(MediaGrabCategory.names, id: \.self) { name in
+                let count = categoryCount(name)
+                let active = session.category == name
+                Button {
+                    session.category = name
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: MediaGrabCategory.symbol(for: name))
+                            .frame(width: 18)
+                        Text(name)
+                        Spacer()
+                        if count > 0 {
+                            Text("\(count)")
+                                .font(.caption.weight(.bold))
+                                .foregroundColor(active ? .white : .secondary)
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(Capsule().fill(
+                                    active ? Color.accentColor
+                                           : Color.secondary.opacity(0.15)))
+                        }
+                    }
+                    .padding(.vertical, 5).padding(.horizontal, 8)
+                    .background(active ? RoundedRectangle(cornerRadius: 7)
+                                        .fill(Color.accentColor.opacity(0.18)) : nil)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 6)
+            }
+            Spacer()
+        }
+        .frame(width: 172)
+        .padding(.top, 10)
+    }
+
+    private func categoryCount(_ name: String) -> Int {
+        if name == "All" {
+            return store.jobs.count + store.pausedList.count
+        }
+        return store.jobs.filter { $0.category == name }.count
+            + store.pausedList.filter {
+                MediaGrabCategory.category(forPath: $0.filename) == name
+            }.count
+    }
+
+    private func matchesCategory(_ job: DownloadJob) -> Bool {
+        session.category == "All" || job.category == session.category
+    }
+
+    private func matchesCategory(_ entry: ListEntry) -> Bool {
+        session.category == "All"
+            || MediaGrabCategory.category(forPath: entry.filename) == session.category
+    }
+
+    // MARK: header
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
@@ -969,69 +1355,11 @@ struct ContentView: View {
                 .disabled(session.urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                           || session.probing)
             }
-            Text("If the link has several resolutions, MediaGrab asks which one you want. " +
-                 "Downloads can be paused and resumed at any time — even from another terminal.")
+            Text("Multi-video pages (albums, galleries) open a picker with previews, "
+                 + "sizes and quality options. Pausing works from any terminal.")
                 .font(.caption).foregroundColor(.secondary)
         }
         .padding(.horizontal)
-    }
-
-    private var jobsArea: some View {
-        let active = store.jobs.filter {
-            $0.phase == .queued || $0.phase == .running || $0.phase == .paused
-        }
-        let finished = store.jobs.filter {
-            $0.phase == .done || $0.phase == .failed || $0.phase == .cancelled
-        }
-        return Group {
-            if active.isEmpty && finished.isEmpty && store.pausedList.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "tray")
-                        .font(.system(size: 34)).foregroundColor(.secondary.opacity(0.5))
-                    Text("No downloads yet").foregroundColor(.secondary)
-                    Text("Paste or drag a link above to start. " +
-                         "Finished files show a file icon — click it to open its folder.")
-                        .font(.caption).foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        if !active.isEmpty {
-                            SectionHeader(title: "Downloading", count: active.count,
-                                          systemImage: "arrow.down.circle", color: .accentColor)
-                            ForEach(active) { job in
-                                ActiveJobRow(job: job,
-                                             onResume: { store.resume(job: job) },
-                                             onCancel: { store.cancel(job: job) })
-                            }
-                        }
-                        if !store.pausedList.isEmpty {
-                            SectionHeader(title: "Paused elsewhere",
-                                          count: store.pausedList.count,
-                                          systemImage: "pause.circle", color: .orange)
-                            ForEach(store.pausedList) { entry in
-                                ExternalPausedRow(entry: entry,
-                                                  onResume: { store.resumeExternal(entry: entry) },
-                                                  onCancel: { store.cancel(entry: entry) })
-                            }
-                        }
-                        if !finished.isEmpty {
-                            SectionHeader(title: "Completed", count: finished.count,
-                                          systemImage: "checkmark.circle", color: .green)
-                            ForEach(finished) { job in
-                                FinishedJobRow(job: job,
-                                               onRemove: { store.remove(job) },
-                                               onTrashFile: { store.trashFile(of: job) })
-                            }
-                        }
-                    }
-                    .padding(.horizontal)
-                    .padding(.bottom, 8)
-                }
-            }
-        }
     }
 
     // MARK: destination picker
@@ -1067,6 +1395,75 @@ struct ContentView: View {
         .frame(maxWidth: 130)
         .help("Where the next downloads are saved (only for downloads started from this window)")
     }
+
+    // MARK: jobs
+
+    private var jobsArea: some View {
+        let active = store.jobs.filter {
+            ($0.phase == .queued || $0.phase == .running || $0.phase == .paused)
+                && matchesCategory($0)
+        }
+        let finished = store.jobs.filter {
+            ($0.phase == .done || $0.phase == .failed || $0.phase == .cancelled)
+                && matchesCategory($0)
+        }
+        let pausedExternal = store.pausedList.filter { matchesCategory($0) }
+        return Group {
+            if active.isEmpty && finished.isEmpty && pausedExternal.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "tray")
+                        .font(.system(size: 34)).foregroundColor(.secondary.opacity(0.5))
+                    Text(session.category == "All"
+                         ? "No downloads yet" : "Nothing in \(session.category)")
+                        .foregroundColor(.secondary)
+                    Text("Paste or drag a link above to start. " +
+                         "Finished files show a file icon — click it to open its folder.")
+                        .font(.caption).foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        if !active.isEmpty {
+                            SectionHeader(title: "Downloading", count: active.count,
+                                          systemImage: "arrow.down.circle", color: .accentColor)
+                            ForEach(active) { job in
+                                ActiveJobRow(job: job,
+                                             onResume: { store.resume(job: job) },
+                                             onCancel: { store.cancel(job: job) })
+                            }
+                        }
+                        if !pausedExternal.isEmpty {
+                            SectionHeader(title: "Paused elsewhere",
+                                          count: pausedExternal.count,
+                                          systemImage: "pause.circle", color: .orange)
+                            ForEach(pausedExternal) { entry in
+                                ExternalPausedRow(entry: entry,
+                                                  onResume: { store.resumeExternal(entry: entry) },
+                                                  onCancel: { store.cancel(entry: entry) })
+                            }
+                        }
+                        if !finished.isEmpty {
+                            SectionHeader(title: "Completed", count: finished.count,
+                                          systemImage: "checkmark.circle", color: .green)
+                            ForEach(finished) { job in
+                                FinishedJobRow(job: job,
+                                               onReveal: { store.reveal(job) },
+                                               onOpen: { store.open(job) },
+                                               onRemove: { store.remove(job) },
+                                               onTrashFile: { store.trashFile(of: job) })
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+                }
+            }
+        }
+    }
+
+    // MARK: footer
 
     private var totalSpeedText: String {
         let acc = store.jobs
@@ -1123,6 +1520,17 @@ struct ContentView: View {
         return "no engine output yet"
     }
 
+    // MARK: actions
+
+    private func resumeAll() {
+        for j in store.jobs where j.phase == .paused {
+            store.resume(job: j)
+        }
+        for e in store.pausedList {
+            store.resumeExternal(entry: e)
+        }
+    }
+
     // MARK: grab flow
 
     private func grab() {
@@ -1137,14 +1545,51 @@ struct ContentView: View {
                 let probe = QualityProbe.parse(url: url, out)
                 if probe.options.count > 1 {
                     session.qualitySheet = probe
-                } else if let err = probe.error, probe.options.isEmpty {
+                    return
+                }
+                if let err = probe.error, probe.options.isEmpty {
                     store.statusFooter = "quality check failed — \(err)"
                     session.qualitySheet = probe
+                    return
+                }
+                if isPlatformURL(url) {
+                    begin(url: url, quality: "auto")
+                    return
+                }
+                scanPage(url: url)
+            }
+        }
+    }
+
+    /// Multi-video pages (erome albums, galleries, playlists): list every
+    /// item with preview/size/quality and let the user pick a batch.
+    private func scanPage(url: String) {
+        session.probing = true
+        Task {
+            let out = await MGDPaths.run(["page-media", url])
+            await MainActor.run {
+                session.probing = false
+                var items: [BatchItem] = []
+                if let data = out.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let raw = obj["items"] as? [[String: Any]] {
+                    items = raw.compactMap { BatchItem(dict: $0) }
+                }
+                if items.count > 1 {
+                    session.batchSheet = BatchProbe(url: url, items: items)
+                    store.statusFooter = "\(items.count) media items found — pick some"
                 } else {
                     begin(url: url, quality: "auto")
                 }
             }
         }
+    }
+
+    private func isPlatformURL(_ url: String) -> Bool {
+        let platforms = ["youtube.com", "youtu.be", "x.com", "twitter.com",
+                          "instagram.com", "tiktok.com", "vimeo.com",
+                          "dailymotion.com", "twitch.tv", "facebook.com"]
+        return platforms.contains { url.contains($0) }
     }
 
     private func begin(url: String, quality: String) {
@@ -1180,5 +1625,122 @@ struct ContentView: View {
             return true
         }
         return false
+    }
+}
+
+// MARK: - batch sheet (multi-video picker, FDM "add batch" style)
+
+struct BatchSheet: View {
+    @ObservedObject var batch: BatchProbe
+    let onStart: ([BatchItem]) -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Add batch").font(.title3.bold())
+                    Text(batch.url).font(.caption).foregroundColor(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                Spacer()
+                Button("Select all") {
+                    batch.selected = Set(batch.items.map(\.id))
+                }
+                Button("None") { batch.selected = [] }
+            }
+            .padding()
+            Divider()
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(batch.items) { item in
+                        batchRow(item)
+                        Divider()
+                    }
+                }
+            }
+            Divider()
+            HStack {
+                Text("\(batch.selected.count) of \(batch.items.count) selected · " +
+                     fmtBytes(batch.totalSelectedBytes))
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button {
+                    onStart(batch.chosen)
+                } label: {
+                    Label("Download \(batch.selected.count) item\(batch.selected.count == 1 ? "" : "s")",
+                          systemImage: "arrow.down.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(batch.selected.isEmpty)
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+        }
+        .frame(width: 660, height: 520)
+    }
+
+    @ViewBuilder
+    private func batchRow(_ item: BatchItem) -> some View {
+        let isOn = batch.selected.contains(item.id)
+        Button {
+            if isOn {
+                batch.selected.remove(item.id)
+            } else {
+                batch.selected.insert(item.id)
+            }
+        } label: {
+            HStack(spacing: 10) {
+                thumb(item.poster)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title.isEmpty ? item.url : item.title)
+                        .lineLimit(1).font(.body.weight(.medium))
+                        .foregroundColor(.primary)
+                    HStack(spacing: 8) {
+                        if !item.quality.isEmpty {
+                            Text(item.quality)
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Capsule().fill(Color.accentColor.opacity(0.25)))
+                                .foregroundColor(.primary)
+                        }
+                        Text(item.sizeText)
+                            .font(.caption).foregroundColor(.secondary)
+                        Text(item.url)
+                            .font(.caption2).foregroundColor(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                Spacer()
+                Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(isOn ? .accentColor : .secondary)
+                    .font(.title3)
+            }
+            .padding(.horizontal).padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func thumb(_ poster: String) -> some View {
+        if !poster.isEmpty, let url = URL(string: poster) {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let img):
+                    img.resizable().aspectRatio(contentMode: .fill)
+                default:
+                    Rectangle().fill(Color.secondary.opacity(0.18))
+                }
+            }
+            .frame(width: 72, height: 44)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        } else {
+            Image(systemName: "film")
+                .frame(width: 72, height: 44)
+                .foregroundColor(.secondary)
+        }
     }
 }

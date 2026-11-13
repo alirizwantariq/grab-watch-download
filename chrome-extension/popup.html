@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MediaGrab fetcher</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <img src="icon32.png" alt="">
+  <div>
+    <b>MediaGrab fetcher</b>
+    <span id="hostStatus">checking native host…</span>
+  </div>
+  <button id="openApp" title="Open the MediaGrab app">⤢</button>
+</header>
+
+<div id="destRow">
+  <input id="dest" placeholder="save to ~/Downloads/mgd (leave empty) — or absolute folder path">
+</div>
+
+<div id="items">
+  <div class="placeholder">Scanning this page…</div>
+</div>
+
+<footer>
+  <label><input type="checkbox" id="all" checked> all</label>
+  <span id="summary">0 selected</span>
+  <button id="download" disabled>Download selected</button>
+</footer>
+<script src="popup.js"></script>
+</body>
+</html>

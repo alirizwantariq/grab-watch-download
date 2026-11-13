@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "MediaGrab fetcher",
+  "version": "1.0.0",
+  "description": "Find every video on the current page (previews, sizes, quality) and download them with MediaGrab — segmented, resumable, optimal-speed downloads.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsIMMdFGhYggf2sOtJjK5JTYmsS2WyFG7J5hS+7VTK9OWqkfhjgHtEQn/TNx3Bl0ZJVRAm+qbnZwolcNP0odBk0xls8dBc/+la6b9jFMmC+2T/lYedvKvFZUezvOBSNBXmcPXM57rJVv+SYTQbncDi/oTrc9ukmlkLNGIyaw9R+Lop69AbJi4AykWOe0Yl8Gnmpm8j/UCPGUpdLtx/Rhk31OX4DZhMEasVRHmdO69GDvrbEJksdLsmJErE5yLysARTIg+v/PzcqiWj10AkO6QLZB6UL1A9I8Q68PjX4cn/jLtnfiHuMeczZJKNk/eZpStIRaxPz/tVhxD9Egep+XhmQIDAQAB",
+  "permissions": ["activeTab", "scripting", "nativeMessaging"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "MediaGrab fetcher"
+  },
+  "background": { "service_worker": "background.js" },
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

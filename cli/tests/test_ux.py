@@ -404,6 +404,143 @@ def test_mirror_rotation_on_dead_cdn(tmp_path):
             pass
 
 
+def test_media_catalog_album():
+    """Album/gallery pages (erome.com/a/…): every <video poster=…><source…>
+    pair must become one catalog item with poster + quality, deduped
+    (albums embed each video twice - grid preview + lightbox)."""
+    from mgd import grab
+    html = """
+    <div class="video"><video poster="https://s9.x.com/a/Ab1/thumbA.jpg">
+      <source src="https://v9.x.com/a/Ab1/vidA_720p.mp4" type='video/mp4'></video></div>
+    <div class="video-lg"><video data-poster="https://s9.x.com/a/Ab1/thumbA.jpg">
+      <source src="https://v9.x.com/a/Ab1/vidA_720p.mp4"></video></div>
+    <div class="video"><video poster="https://s9.x.com/a/Ab1/thumbB.jpg">
+      <source src="https://v9.x.com/a/Ab1/vidB_1080p.mp4"></video></div>
+    <img data-src="https://s9.x.com/a/Ab1/other.jpg">
+    <a href="/a/Ab1">back</a>"""
+    cat = grab.extract_media_catalog(html, "https://www.x.com/a/Ab1")
+    urls = [c["url"] for c in cat]
+    assert len(cat) == 2, f"dedup/scan wrong: {cat}"
+    assert urls[0].endswith("vidA_720p.mp4") and cat[0]["quality"] == "720p"
+    assert cat[0]["poster"].endswith("thumbA.jpg")
+    assert cat[1]["quality"] == "1080p"
+    assert "other.jpg" not in urls and "/a/Ab1" not in urls
+
+
+def test_media_catalog_kvs_poster():
+    """KVS flashvars entries carry the player's own preview/poster + title."""
+    from mgd import grab
+    html = """
+    <script>
+    var flashvars = {
+        video_title: 'My KVS Video',
+        video_url: 'https://www.kvs.tv/get_file/3/h/289910/289910_1080p.mp4/?t=x',
+        video_url_text: '-',
+        preview_url: 'https://www.kvs.tv/preview.jpg'
+    };
+    </script>"""
+    cat = grab.extract_media_catalog(html, "https://www.kvs.tv/v/1/")
+    assert len(cat) == 1
+    assert cat[0]["quality"] == "1080p"
+    assert cat[0]["title"] == "My KVS Video"
+    assert cat[0]["poster"].endswith("preview.jpg")
+
+
+def test_page_media_command(tmp_path):
+    """`mgd page-media <url>`: one JSON document with items incl. probed
+    sizes (parallel), used by the GUI batch sheet and the extension."""
+    import http.server
+    import subprocess
+    import sys as _sys
+    import tempfile
+    import os
+    body_a = bytes(range(64)) * 1024   # 64 KB
+    body_b = bytes(range(128)) * 2048  # 256 KB
+    page = f"""<html><body>
+    <video poster="/thumbA.jpg"><source src="/a.mp4"></video>
+    <video poster="/thumbB.jpg"><source src="/b.mp4"></video>
+    </body></html>"""
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path == "/page":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page.encode())
+                return
+            body = body_a if self.path.startswith("/a.mp4") else body_b
+            start, end = 0, len(body) - 1
+            rng = self.headers.get("Range", "")
+            if rng.startswith("bytes="):
+                spec = rng[6:].split(",", 1)[0]
+                first, _, last = spec.partition("-")
+                start = int(first)
+                end = int(last) if last else len(body) - 1
+            self.send_response(206)
+            self.send_header("Content-Range",
+                             f"bytes {start}-{end}/{len(body)}")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.end_headers()
+            self.wfile.write(body[start:end + 1])
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    import threading
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/page"
+        cfg = tempfile.mkdtemp()
+        env = dict(os.environ, XDG_CONFIG_HOME=cfg)
+        out = subprocess.run(
+            [_sys.executable, "bin/mgd", "page-media", url],
+            capture_output=True, text=True, timeout=60, env=env, check=True)
+        doc = json.loads(out.stdout)
+        assert doc["error"] is None
+        assert doc["url"] == url
+        items = {i["url"].rsplit("/", 1)[-1]: i for i in doc["items"]}
+        assert set(items) == {"a.mp4", "b.mp4"}
+        assert items["a.mp4"]["size"] == len(body_a)
+        assert items["b.mp4"]["size"] == len(body_b)
+        assert items["a.mp4"]["poster"].endswith("/thumbA.jpg")
+        assert items["b.mp4"]["quality"] == ""
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_native_host_protocol():
+    """Chrome native-messaging host: 4-byte LE frames, ping/probe/download."""
+    import struct
+    import sys as _sys
+    import subprocess
+    from mgd import cli as _  # ensure import path works
+
+    def frame(obj):
+        body = json.dumps(obj).encode()
+        return struct.pack("<I", len(body)) + body
+
+    payload = (frame({"command": "ping"}) +
+               frame({"command": "bogus"}))
+    p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
+                       input=payload, capture_output=True, timeout=30)
+    replies, pos = [], 0
+    while pos + 4 <= len(p.stdout):
+        (ln,) = struct.unpack("<I", p.stdout[pos:pos + 4])
+        pos += 4
+        replies.append(json.loads(p.stdout[pos:pos + ln]))
+        pos += ln
+    assert replies[0]["ok"] is True and replies[0]["app"] == "mgd"
+    assert replies[1]["ok"] is False and "bogus" in replies[1]["error"]
+    assert len(replies) == 2
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")
