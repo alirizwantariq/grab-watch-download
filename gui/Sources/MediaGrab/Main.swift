@@ -541,6 +541,62 @@ final class JobStore: ObservableObject {
         statusFooter = "queued \(items.count) download\(items.count == 1 ? "" : "s")"
     }
 
+    /// Torrent download from the file-picker sheet (aria2 engine).
+    func startTorrent(_ probe: TorrentProbe, destination: String?) {
+        let job = DownloadJob(url: probe.url, title: probe.name)
+        var args = ["grab", probe.url, "--json-progress", "--retries", "8"]
+        if probe.selected.count < probe.files.count {
+            // only the checked files (1-based aria2 numbering)
+            let idx = probe.chosen.map { String($0.index) }.joined(separator: ",")
+            args += ["--select-files", idx]
+        }
+        if let d = destination, !d.isEmpty {
+            args += ["-d", d]
+        }
+        job.phase = .running
+        jobs.insert(job, at: 0)
+        refreshPaused()
+        job.process = MGDPaths.spawn(args, onLine: { [weak job] line in
+            job?.ingest(line)
+        }, onEnd: { [weak job, weak self] code in
+            guard let job, let self else { return }
+            if job.phase == .running || job.phase == .queued {
+                switch code {
+                case 0: job.phase = .done; job.finishedAt = Date()
+                case 130: job.phase = .paused
+                default: job.phase = .failed
+                }
+            }
+            if code == 0 {
+                // torrent done events carry the folder; expose it for reveal
+                if job.finishedPath == nil {
+                    job.finishedPath = destination ?? (
+                        "~/Downloads/mgd/video" as NSString)
+                        .expandingTildeInPath
+                }
+                job.finishedAt = Date()
+            }
+            self.refreshPaused()
+            self.statusFooter = "\(job.title): \(job.phase.rawValue)"
+            self.saveHistory()
+            self.updateDockBadge()
+            switch job.phase {
+            case .done: self.notify("Torrent complete", job.title)
+            case .failed: self.notify("Torrent failed", job.title)
+            default: break
+            }
+        })
+    }
+
+    /// Stream a torrent's video while it downloads (webtorrent + player).
+    func streamTorrent(_ probe: TorrentProbe) {
+        statusFooter = "streaming \(probe.name) — closing the player stops it"
+        _ = MGDPaths.spawn(["stream", probe.url],
+                           onLine: { _ in }, onEnd: { [weak self] _ in
+            DispatchQueue.main.async { self?.statusFooter = "stream ended" }
+        })
+    }
+
     /// Resume a job the app itself paused (id resolved by url from `mgd list`).
     func resume(job: DownloadJob) {
         Task {
@@ -1441,6 +1497,53 @@ struct QualitySheet: View {
 
 // MARK: - session + content view
 
+// MARK: - torrent sheet model
+
+/// One file inside a torrent (from `mgd torrent-info`).
+struct TorrentFile: Identifiable {
+    let id = UUID()
+    let index: Int        // aria2 --select-file numbering
+    let path: String
+    let size: Int64
+    let video: Bool
+
+    init?(dict: [String: Any]) {
+        guard let index = dict["index"] as? Int else { return nil }
+        self.index = index
+        self.path = (dict["path"] as? String) ?? ""
+        self.size = (dict["size"] as? NSNumber)?.int64Value ?? 0
+        self.video = (dict["video"] as? Bool) ?? false
+    }
+}
+
+/// Observable state for the torrent file-picker sheet.
+final class TorrentProbe: ObservableObject, Identifiable {
+    let id = UUID()
+    let url: String
+    let name: String
+    let files: [TorrentFile]
+    @Published var selected: Set<UUID> = []
+
+    init(url: String, name: String, files: [TorrentFile]) {
+        self.url = url
+        self.name = name
+        self.files = files
+        selected = Set(files.map(\.id))   // all checked by default
+    }
+
+    var chosen: [TorrentFile] {
+        files.filter { selected.contains($0.id) }
+    }
+
+    var hasVideo: Bool {
+        files.contains { $0.video }
+    }
+
+    var totalSelectedBytes: Int64 {
+        chosen.reduce(0) { $0 + $1.size }
+    }
+}
+
 final class Session: ObservableObject {
     @Published var urlString = ""
     @Published var showLog = false
@@ -1464,6 +1567,8 @@ final class Session: ObservableObject {
     /// rename-before-download popup state
     @Published var renameSheet: PendingDownload?
     @Published var renameDraft: RenameDraft?
+    /// torrent file-picker sheet (magnet / .torrent links)
+    @Published var torrentSheet: TorrentProbe?
 }
 
 // MARK: - batch (multi-video page) model
@@ -1600,6 +1705,19 @@ struct ContentView: View {
                            session.batchSheet = nil
                        },
                        onClose: { session.batchSheet = nil })
+        }
+        .sheet(item: $session.torrentSheet) { probe in
+            TorrentSheet(probe: probe,
+                         destination: session.destination,
+                         onStart: {
+                             store.startTorrent(probe, destination: session.destination)
+                             session.torrentSheet = nil
+                         },
+                         onStream: {
+                             session.torrentSheet = nil
+                             store.streamTorrent(probe)
+                         },
+                         onClose: { session.torrentSheet = nil })
         }
         .sheet(item: $session.renameSheet) { pending in
             RenameSheet(pending: pending,
@@ -2121,6 +2239,11 @@ struct ContentView: View {
     private func grab() {
         let url = session.urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !url.isEmpty, !session.probing else { return }
+        // torrents & magnets: open the file-picker sheet first
+        if url.hasPrefix("magnet:") || url.lowercased().hasSuffix(".torrent") {
+            scanTorrent(url: url)
+            return
+        }
         session.probing = true
         Task {
             let out = await MGDPaths.run(["qualities", url])
@@ -2142,6 +2265,34 @@ struct ContentView: View {
                     return
                 }
                 scanPage(url: url)
+            }
+        }
+    }
+
+    /// Torrents: fetch the manifest (mgd torrent-info) and open the
+    /// file-picker sheet with select/deselect, sizes and a stream option.
+    private func scanTorrent(url: String) {
+        session.probing = true
+        session.urlString = ""
+        Task {
+            let out = await MGDPaths.run(["torrent-info", url])
+            await MainActor.run {
+                session.probing = false
+                var name = url
+                var files: [TorrentFile] = []
+                if let data = out.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    name = (obj["name"] as? String) ?? url
+                    let raw = obj["files"] as? [[String: Any]] ?? []
+                    files = raw.compactMap { TorrentFile(dict: $0) }
+                }
+                guard !files.isEmpty else {
+                    store.statusFooter =
+                        "could not read this torrent (is the magnet alive? try again)"
+                    return
+                }
+                session.torrentSheet = TorrentProbe(url: url, name: name, files: files)
+                store.statusFooter = "torrent: \(name) — \(files.count) file(s), pick what you want"
             }
         }
     }
@@ -2229,6 +2380,110 @@ struct ContentView: View {
             return true
         }
         return false
+    }
+}
+
+// MARK: - torrent sheet (file picker for magnets/.torrents)
+
+struct TorrentSheet: View {
+    @ObservedObject var probe: TorrentProbe
+    let destination: String?
+    let onStart: () -> Void
+    let onStream: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.title3).foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Torrent").font(.title3.bold())
+                    Text(probe.name).font(.caption).foregroundColor(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                Spacer()
+                Button("Select all") { probe.selected = Set(probe.files.map(\.id)) }
+                    .controlSize(.small)
+                Button("None") { probe.selected = [] }
+                    .controlSize(.small)
+            }
+            .padding()
+            Divider()
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(probe.files) { file in
+                        row(file)
+                        Divider()
+                    }
+                }
+            }
+            Divider()
+            HStack(spacing: 8) {
+                Text("\(probe.selected.count) of \(probe.files.count) files · " +
+                     fmtBytes(probe.totalSelectedBytes))
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                if probe.hasVideo {
+                    Button {
+                        onStream()
+                    } label: {
+                        Label("Stream", systemImage: "play.tv")
+                    }
+                    .help("Stream the video while it downloads (sequential, opens your player)")
+                }
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button {
+                    onStart()
+                } label: {
+                    Label("Download", systemImage: "arrow.down.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(probe.selected.isEmpty)
+            }
+            .padding()
+            Text(destination == nil
+                 ? "Saving into ~/Downloads/mgd/<video or other> — change the Folder menu before Download for somewhere else."
+                 : "Saving into \(destination!)")
+                .font(.caption).foregroundColor(.secondary)
+                .padding(.bottom, 10)
+        }
+        .frame(width: 680, height: 520)
+    }
+
+    @ViewBuilder
+    private func row(_ file: TorrentFile) -> some View {
+        let isOn = probe.selected.contains(file.id)
+        Button {
+            if isOn { probe.selected.remove(file.id) }
+            else { probe.selected.insert(file.id) }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(isOn ? .accentColor : .secondary)
+                Image(systemName: file.video ? "film" : "doc")
+                    .foregroundColor(file.video ? .accentColor : .secondary)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(file.path.isEmpty ? "file \(file.index)" : file.path)
+                        .lineLimit(1).font(.body.weight(.medium))
+                        .foregroundColor(.primary)
+                        .truncationMode(.middle)
+                    if file.video {
+                        Text("video — streamable")
+                            .font(.caption2).foregroundColor(.accentColor)
+                    }
+                }
+                Spacer()
+                Text(fmtBytes(file.size))
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            .padding(.horizontal).padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 

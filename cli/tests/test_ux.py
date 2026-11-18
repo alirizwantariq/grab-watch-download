@@ -879,6 +879,150 @@ def test_out_name_renames_download(tmp_path):
         origin.stop()
 
 
+def test_bencode_roundtrip():
+    """bencode decode/encode (torrent metainfo is built on it)."""
+    from mgd import torrent
+    cases = [
+        {"a": 1, "b": b"xy", "c": [1, b"two", {"d": -3}]},
+        [0, 1, -1, b"", b"bytes"],
+        {"utf8-key": "héllo ✓".encode()},
+    ]
+    for obj in cases:
+        enc = torrent.bencode(obj)
+        dec = torrent.bdecode(enc)
+        assert dec == obj, (obj, dec)
+    # str values encode as utf-8 and decode back as bytes
+    assert torrent.bdecode(torrent.bencode({"k": "héllo"})) == {"k": "héllo".encode()}
+    # bytes dict keys are normalized to str on decode (metainfo access)
+    assert torrent.bdecode(torrent.bencode({b"key": 5})) == {"key": 5}
+    assert torrent.bdecode(b"i42e") == 42
+    assert torrent.bdecode(b"5:hello") == b"hello"
+    assert torrent.bdecode(b"le") == []
+    assert torrent.bdecode(b"de") == {}
+    for bad in (b"", b"x", b"i1", b"3:ab"):
+        try:
+            torrent.bdecode(bad)
+            raise AssertionError(f"should reject {bad!r}")
+        except torrent.BencodeError:
+            pass
+
+
+def test_torrent_parsing():
+    """metainfo parsing: multi/single file lists, video flags, detection."""
+    from mgd import torrent
+    assert torrent.is_magnet("magnet:?xt=urn:btih:abc")
+    assert torrent.is_torrent_file("movie.torrent")
+    assert torrent.is_torrent("magnet:?xt=urn:btih:" + "0" * 40)
+    assert torrent.is_torrent("/downloads/pack.torrent")
+    assert not torrent.is_torrent("https://erome.com/a/x")
+    h = torrent.magnet_info_hash(
+        "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=x")
+    assert h == "0123456789abcdef0123456789abcdef01234567"
+
+    meta = {b"info": {b"name": b"pack", b"piece length": 16384, b"pieces": b"x" * 20,
+                     b"files": [
+                         {b"length": 100, b"path": [b"video", b"a.mp4"]},
+                         {b"length": 200, b"path": [b"readme.txt"]}]}}
+    files = torrent.torrent_files(meta)
+    assert [f["index"] for f in files] == [1, 2]
+    assert files[0]["path"] == "pack/video/a.mp4" and files[0]["video"]
+    assert files[1]["video"] is False
+    single = {b"info": {b"name": b"movie.mp4", b"piece length": 16384,
+                        b"pieces": b"x" * 20, b"length": 42}}
+    assert torrent.torrent_files(single) == [
+        {"index": 1, "path": "movie.mp4", "size": 42, "video": True}]
+    assert torrent.torrent_name(meta) == "pack"
+
+
+def test_torrent_download_live():
+    """Full torrent lifecycle on loopback: mini tracker + aria2 seeder,
+    mgd grab with --select-files through the NDJSON contract."""
+    import hashlib
+    import http.server
+    import subprocess
+    import sys as _sys
+    import threading
+    import time
+    import urllib.parse
+    from mgd import torrent
+
+    piece_len = 16384
+    file_a = bytes(range(256)) * 128      # 32768 = exactly 2 pieces (aligned)
+    file_b = b"N" * 9000                  # own piece, stays unselected
+    data = file_a + file_b
+    pieces = b"".join(hashlib.sha1(data[i:i + piece_len]).digest()
+                      for i in range(0, len(data), piece_len))
+
+    class Tracker(http.server.BaseHTTPRequestHandler):
+        peers = []
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if not self.path.startswith("/announce"):
+                return
+            port = int(q["port"][0])
+            ip = self.client_address[0]
+            if (ip, port) not in Tracker.peers:
+                Tracker.peers.append((ip, port))
+            compact = b"".join(bytes(int(x) for x in ip.split("."))
+                               + port.to_bytes(2, "big")
+                               for ip, port in Tracker.peers)
+            body = (b"d8:completei1e10:incompletei1e8:intervali60e5:peers"
+                    + str(len(compact)).encode() + b":" + compact + b"e")
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    tracker = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Tracker)
+    tracker.daemon_threads = True
+    threading.Thread(target=tracker.serve_forever, daemon=True).start()
+    tport = tracker.server_address[1]
+
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    seed_dir = tmp / "seed"
+    (seed_dir / "My Test Pack" / "video").mkdir(parents=True)
+    (seed_dir / "My Test Pack" / "video" / "show.mp4").write_bytes(file_a)
+    (seed_dir / "My Test Pack" / "notes.txt").write_bytes(file_b)
+    meta = {"announce": f"http://127.0.0.1:{tport}/announce",
+            "info": {"name": "My Test Pack", "piece length": piece_len,
+                     "pieces": pieces,
+                     "files": [{"length": len(file_a), "path": ["video", "show.mp4"]},
+                               {"length": len(file_b), "path": ["notes.txt"]}]}}
+    tfile = tmp / "pack.torrent"
+    tfile.write_bytes(torrent.bencode(meta))
+
+    seeder = subprocess.Popen(
+        ["aria2c", str(tfile), "--dir", str(seed_dir), "--seed-time", "9999",
+         "--enable-dht=false", "--seed-ratio", "0", "--check-integrity=true"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(3)
+    try:
+        dest = tmp / "dest"
+        r = subprocess.run(
+            [_sys.executable, "bin/mgd", "grab", str(tfile),
+             "--select-files", "1", "-d", str(dest), "--json-progress"],
+            capture_output=True, text=True, timeout=120)
+        events = [json.loads(l) for l in r.stdout.splitlines()
+                  if l.startswith("{\"")]
+        types = [e["type"] for e in events]
+        assert "start" in types and "done" in types, types
+        got = dest / "My Test Pack" / "video" / "show.mp4"
+        assert got.exists() and got.read_bytes() == file_a, "selected file corrupt"
+        assert not (dest / "My Test Pack" / "notes.txt").exists(), \
+            "unselected file downloaded (piece alignment broken?)"
+        done_ev = next(e for e in events if e["type"] == "done")
+        assert done_ev["size"] == len(file_a), done_ev
+    finally:
+        seeder.terminate()
+        tracker.shutdown()
+        tracker.server_close()
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")

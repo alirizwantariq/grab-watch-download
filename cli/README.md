@@ -50,6 +50,11 @@ mgd watch                         # clipboard monitor: copy any link anywhere
                                    # and it auto-downloads (--all-types)
 mgd set-default speed-limit 2MB   # FDM-style global traffic limit (off to clear)
 mgd grab URL --max-speed 500KB    # per-download speed limit
+mgd grab "magnet:?xt=urn:btih:…"  # torrents & magnets: file picker (interactive)
+mgd grab "magnet:…" --select-files 1,3-5   # ...or pick files up front
+mgd torrent-info "magnet:…"       # JSON file manifest (drives the GUI picker)
+mgd stream "magnet:…"             # stream the video while it downloads
+                                   # (webtorrent-cli + VLC/IINA, sequential)
 mgd jobs                           # [running]/[paused] + per-item actions
 mgd pause 1 / mgd resume 1 / mgd cancel 1
 mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)
