@@ -445,6 +445,13 @@ final class JobStore: ObservableObject {
                          logTail: String(job.log.suffix(400)))
         }
         if let data = try? JSONEncoder().encode(entries) {
+            // rolling one-generation backup: a wipe or bad write is always
+            // recoverable from history.json.bak
+            let bak = Self.historyURL.appendingPathExtension("bak")
+            if FileManager.default.fileExists(atPath: Self.historyURL.path) {
+                try? FileManager.default.removeItem(at: bak)
+                try? FileManager.default.copyItem(at: Self.historyURL, to: bak)
+            }
             try? data.write(to: Self.historyURL, options: .atomic)
         }
     }
