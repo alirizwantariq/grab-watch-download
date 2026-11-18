@@ -796,12 +796,13 @@ class Downloader:
 
     # ── paths ─────────────────────────────────────────────────────────────
     def _part_path(self) -> pathlib.Path:
-        name = self._filename or self.out_path.name
-        return self.out_path.parent / (name + PART_SUFFIX)
+        # keyed to the (already uniquified) out_path: two downloads of the
+        # same URL must never share a part file, or the last one wins and
+        # replaces the other's data
+        return pathlib.Path(str(self.out_path) + PART_SUFFIX)
 
     def _state_path(self) -> pathlib.Path:
-        name = self._filename or self.out_path.name
-        return self.out_path.parent / (name + STATE_SUFFIX)
+        return pathlib.Path(str(self.out_path) + STATE_SUFFIX)
 
     def _close_part(self) -> None:
         f = self._file

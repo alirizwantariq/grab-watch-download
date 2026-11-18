@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import CoreServices
 import UserNotifications
 import UniformTypeIdentifiers
 
@@ -1662,6 +1663,14 @@ struct ContentView: View {
             store.refreshPaused()
             store.saveHistory()   // prune/re-write after loading old rows
         }
+        .onOpenURL { url in
+            // default torrent client: magnet links + .torrent files land here
+            let link = url.absoluteString
+            guard link.hasPrefix("magnet:") || link.lowercased().hasSuffix(".torrent") else {
+                return
+            }
+            scanTorrent(url: link)
+        }
         .onReceive(timer) { _ in store.refreshPaused() }
         .onDrop(of: [UTType.url, UTType.text], isTargeted: $session.dropActive) {
             providers in dropped(providers)
@@ -1717,6 +1726,7 @@ struct ContentView: View {
                              session.torrentSheet = nil
                              store.streamTorrent(probe)
                          },
+                         onChooseFolder: { session.pickingFolder = true },
                          onClose: { session.torrentSheet = nil })
         }
         .sheet(item: $session.renameSheet) { pending in
@@ -1733,6 +1743,7 @@ struct ContentView: View {
                                         destination: session.destination,
                                         outName: finalName)
                         },
+                        onChooseFolder: { session.pickingFolder = true },
                         onClose: {
                             session.renameSheet = nil
                             session.renameDraft = nil
@@ -1855,6 +1866,11 @@ struct ContentView: View {
                         NSWorkspace.shared.open(URL(fileURLWithPath:
                                 ("~/Downloads/mgd" as NSString).expandingTildeInPath))
                     }
+                    Divider()
+                    Button("Make default for magnet links") {
+                        makeDefaultTorrentApp()
+                    }
+                    .help("Browser magnet links open MediaGrab directly")
                 } label: {
                     Label("Diagnostics", systemImage: "stethoscope")
                 }
@@ -2234,6 +2250,16 @@ struct ContentView: View {
             : "global speed limit: \(v)/s (running downloads adjust within ~5s)"
     }
 
+    /// Claim the magnet: scheme so browser magnet links open MediaGrab.
+    private func makeDefaultTorrentApp() {
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.alirizwantariq.mediagrab"
+        let status = LSSetDefaultHandlerForURLScheme("magnet" as CFString,
+                                                    bundleId as CFString)
+        store.statusFooter = status == noErr
+            ? "MediaGrab is now the default app for magnet links"
+            : "could not set the default magnet handler (OSStatus \(status))"
+    }
+
     // MARK: grab flow
 
     private func grab() {
@@ -2333,12 +2359,22 @@ struct ContentView: View {
     }
 
     private func begin(url: String, quality: String, suggested: String? = nil) {
-        session.qualitySheet = nil
         session.batchSheet = nil
         let name = suggested ?? suggestedName(for: url)
-        session.renameDraft = RenameDraft(name: name)
-        session.renameSheet = PendingDownload(url: url, quality: quality,
-                                              suggestedName: name)
+        let present = {
+            session.renameDraft = RenameDraft(name: name)
+            session.renameSheet = PendingDownload(url: url, quality: quality,
+                                                  suggestedName: name)
+        }
+        if session.qualitySheet != nil {
+            // SwiftUI cannot present a new sheet in the same transaction as
+            // another sheet's dismissal — it silently swallows it. Dismiss
+            // first, present on the next runloop turn.
+            session.qualitySheet = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: present)
+        } else {
+            present()
+        }
     }
 
     /// A sensible default filename for the rename sheet: the page/video
@@ -2390,6 +2426,7 @@ struct TorrentSheet: View {
     let destination: String?
     let onStart: () -> Void
     let onStream: () -> Void
+    let onChooseFolder: () -> Void
     let onClose: () -> Void
 
     var body: some View {
@@ -2444,11 +2481,23 @@ struct TorrentSheet: View {
                 .disabled(probe.selected.isEmpty)
             }
             .padding()
-            Text(destination == nil
-                 ? "Saving into ~/Downloads/mgd/<video or other> — change the Folder menu before Download for somewhere else."
-                 : "Saving into \(destination!)")
-                .font(.caption).foregroundColor(.secondary)
-                .padding(.bottom, 10)
+            HStack(spacing: 6) {
+                Text(destination == nil
+                     ? "Saving into ~/Downloads/mgd/<video or other> — pick below or use the Folder menu."
+                     : "Saving into \(destination!)")
+                    .font(.caption).foregroundColor(.secondary)
+                    .lineLimit(1)
+                Button {
+                    onChooseFolder()
+                } label: {
+                    Label("Choose…", systemImage: "folder.badge.plus")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption)
+                }
+                .controlSize(.small)
+                .help("Save somewhere else for this torrent")
+            }
+            .padding(.bottom, 10)
         }
         .frame(width: 680, height: 520)
     }
@@ -2494,6 +2543,7 @@ struct RenameSheet: View {
     @ObservedObject var draft: RenameDraft
     let destination: String?
     let onStart: (String) -> Void
+    let onChooseFolder: () -> Void
     let onClose: () -> Void
 
     private var trimmedName: String {
@@ -2520,8 +2570,20 @@ struct RenameSheet: View {
             TextField("file name", text: $draft.name)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(startIfValid)
-            Text(destinationText)
-                .font(.caption).foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                Text(destinationText)
+                    .font(.caption).foregroundColor(.secondary)
+                    .lineLimit(1)
+                Button {
+                    onChooseFolder()
+                } label: {
+                    Label("Choose…", systemImage: "folder.badge.plus")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption)
+                }
+                .controlSize(.small)
+                .help("Save somewhere else for this download")
+            }
             HStack {
                 Button("Cancel", action: onClose)
                     .keyboardShortcut(.cancelAction)

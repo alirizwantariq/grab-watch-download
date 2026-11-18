@@ -1023,6 +1023,35 @@ def test_torrent_download_live():
         tracker.server_close()
 
 
+def test_concurrent_same_name_downloads():
+    """Two simultaneous downloads of the SAME url must never share a part
+    file (the old part naming keyed on the URL filename, so the second
+    grab truncated the first's data - 'replaces it instead of renaming')."""
+    import conftest
+    import subprocess
+    import sys as _sys
+    import threading
+
+    content = bytes(range(256)) * 2048   # 512 KB
+    origin = conftest.DripOrigin(content, chunk=32 * 1024, delay=0.002)
+    try:
+        dest = pathlib.Path(tempfile.mkdtemp())
+        procs = [subprocess.Popen(
+            [_sys.executable, "bin/mgd", "grab", origin.url, "-d", str(dest)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(2)]
+        for p in procs:
+            assert p.wait(timeout=120) == 0
+        outs = sorted(p for p in dest.iterdir()
+                     if p.is_file() and p.suffix == ".bin")
+        assert len(outs) == 2, f"expected 2 distinct outputs, got {[o.name for o in outs]}"
+        for o in outs:
+            assert o.read_bytes() == content, o.name
+        assert outs[0].name != outs[1].name   # renamed, never replaced
+    finally:
+        origin.stop()
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")

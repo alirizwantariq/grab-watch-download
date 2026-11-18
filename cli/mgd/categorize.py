@@ -126,6 +126,28 @@ def unique_path(dir_path: pathlib.Path, filename: str) -> pathlib.Path:
     return candidate
 
 
+def claim_unique_path(dir_path: pathlib.Path, filename: str,
+                      suffix: str = ".mgdpart") -> pathlib.Path:
+    """unique_path that also atomically CLAIMS the download's part file
+    (O_CREAT|O_EXCL), so two simultaneous downloads of the same URL can
+    never pick the same output name and truncate each other's data.
+    The claim is the part file itself; the engine truncates it on start."""
+    stem, ext = pathlib.Path(filename).stem, pathlib.Path(filename).suffix
+    candidate = dir_path / filename
+    n = 1
+    while True:
+        part = dir_path / (candidate.name + suffix)
+        try:
+            fd = os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.close(fd)
+            return candidate
+        except FileExistsError:
+            candidate = dir_path / f"{stem} ({n}){ext}"
+            n += 1
+            if n > 5000:
+                return unique_path(dir_path, filename)
+
+
 def filename_from_response_disposition(disposition: str | None) -> str | None:
     if not disposition:
         return None

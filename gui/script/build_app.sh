@@ -42,9 +42,35 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.5.0</string>
+    <string>1.5.1</string>
     <key>CFBundleVersion</key>
-    <string>8</string>
+    <string>9</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>BitTorrent magnet link</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>magnet</string>
+            </array>
+            <key>CFBundleURLRole</key>
+            <string>Viewer</string>
+        </dict>
+    </array>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>BitTorrent metainfo file</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSItemContentClass</key>
+            <string>public.bittorrent-torrent</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+        </dict>
+    </array>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
