@@ -843,6 +843,42 @@ def test_native_host_query():
     assert reply["ok"] is True and reply["items"] == []
 
 
+def test_out_name_renames_download(tmp_path):
+    """--out-name renames the file (category routing intact, original
+    extension appended when the user leaves it out)."""
+    import conftest
+    import subprocess
+    import sys as _sys
+    import os
+
+    content = b"rename me " * 512
+    origin = conftest.DripOrigin(content, chunk=16 * 1024, delay=0)
+    try:
+        dest = tmp_path / "ren"
+        dest.mkdir()
+        # with extension
+        r = subprocess.run(
+            [_sys.executable, "bin/mgd", "grab", origin.url,
+             "--out-name", "my video.mp4", "-d", str(dest)],
+            capture_output=True, text=True, timeout=60)
+        assert (dest / "my video.mp4").read_bytes() == content, r.stderr
+        # without extension -> original extension appended
+        r = subprocess.run(
+            [_sys.executable, "bin/mgd", "grab", origin.url,
+             "--out-name", "no ext", "-d", str(dest)],
+            capture_output=True, text=True, timeout=60)
+        assert (dest / "no ext.bin").read_bytes() == content, r.stderr
+        # empty name -> clean error, no download
+        r = subprocess.run(
+            [_sys.executable, "bin/mgd", "grab", origin.url,
+             "--out-name", "  ", "-d", str(dest)],
+            capture_output=True, text=True, timeout=60)
+        assert r.returncode != 0
+        assert "--out-name cannot be empty" in (r.stdout + r.stderr)
+    finally:
+        origin.stop()
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")
