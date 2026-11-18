@@ -320,7 +320,7 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
         out_dir = pathlib.Path(os.path.expanduser(args.dir)) if args.dir \
             else categorize.category_dir(cfg, category)
         from .engine import _url_filename
-        out_path = categorize.unique_path(
+        out_path = categorize.claim_unique_path(
             out_dir, local_name or _url_filename(dl_url))
         out_path.parent.mkdir(parents=True, exist_ok=True)
     dl = Downloader(dl_url, out_path, proxy=args.proxy,
@@ -1342,7 +1342,7 @@ def _destination(args, cfg: dict, url: str) -> pathlib.Path:
     d = pathlib.Path(os.path.expanduser(args.dir)) if args.dir \
         else categorize.category_dir(cfg, category)
     d.mkdir(parents=True, exist_ok=True)
-    return categorize.unique_path(d, name)
+    return categorize.claim_unique_path(d, name)
 
 
 class _Progress:
