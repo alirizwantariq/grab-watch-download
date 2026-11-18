@@ -42,9 +42,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.5.1</string>
+    <string>1.5.2</string>
     <key>CFBundleVersion</key>
-    <string>9</string>
+    <string>10</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
@@ -53,6 +53,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
             <key>CFBundleURLSchemes</key>
             <array>
                 <string>magnet</string>
+            </array>
+            <key>CFBundleURLRole</key>
+            <string>Viewer</string>
+        </dict>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>MediaGrab download handoff</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>mediagrab</string>
             </array>
             <key>CFBundleURLRole</key>
             <string>Viewer</string>
