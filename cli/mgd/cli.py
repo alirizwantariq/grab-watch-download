@@ -94,7 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("set-default",
                         help="set default dir for a category/root, or preferred cookie browser")
     sp.add_argument("category", choices=["root", "cookies-browser",
-                                         "speed-limit", *categorize.CATEGORIES])
+                                         "speed-limit", "open-app",
+                                         *categorize.CATEGORIES])
     sp.add_argument("value", help="path (or browser name for cookies-browser)")
 
     sub.add_parser("defaults", aliases=["config"], help="show defaults + config")
@@ -1059,10 +1060,17 @@ def cmd_set_default(args) -> int:
         else:
             cfg.pop("speed_limit", None)
             print("saved: global speed limit -> off")
+    elif args.category == "open-app":
+        val = args.value.strip().lower()
+        if val not in ("on", "off"):
+            print("error: open-app accepts on or off", file=sys.stderr)
+            return 2
+        cfg["open_app"] = val
+        print(f"saved: open MediaGrab on extension downloads -> {val}")
     else:
         cfg.setdefault("defaults", {})[args.category] = args.value
     categorize.save_config(cfg)
-    if args.category != "cookies-browser" and args.category != "speed-limit":
+    if args.category not in ("cookies-browser", "speed-limit", "open-app"):
         print(f"saved: {args.category} -> {args.value}")
     return 0
 
@@ -1453,6 +1461,17 @@ def cmd_native_host(_args) -> int:
                 except OSError:
                     pass
             write_message({"ok": True, "spawned": spawned})
+            # FDM-style: hand-off pops the MediaGrab app open so the user
+            # watches progress right away (mgd set-default open-app off to
+            # keep downloads headless). Best effort: CLI-only setups survive.
+            if spawned and _cfg().get("open_app", "on") != "off":
+                try:
+                    subprocess.Popen(["/usr/bin/open", "-a", "MediaGrab"],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    stdin=subprocess.DEVNULL)
+                except OSError:
+                    pass
             continue
         if command == "query":
             states = _find_states()
