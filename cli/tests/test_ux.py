@@ -560,8 +560,13 @@ def test_native_host_download(tmp_path):
     dest = tmp_path / "ext"
     payload = frame({"command": "download",
                      "urls": [origin.url], "destination": str(dest)})
+    # isolated config: never pop the real MediaGrab app open from tests
+    cfg_home = tmp_path / "xdg"
+    (cfg_home / "mgd").mkdir(parents=True)
+    (cfg_home / "mgd" / "config.json").write_text('{"open_app": "off"}')
+    env = dict(os.environ, XDG_CONFIG_HOME=str(cfg_home))
     p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
-                       input=payload, capture_output=True, timeout=30)
+                       input=payload, capture_output=True, timeout=30, env=env)
     (ln,) = struct.unpack("<I", p.stdout[:4])
     reply = json.loads(p.stdout[4:4 + ln])
     assert reply["ok"] and reply["spawned"] == 1, reply
@@ -699,6 +704,11 @@ def test_native_host_download_referer(tmp_path):
         url = f"http://127.0.0.1:{srv.server_address[1]}/video.mp4"
         dest = tmp_path / "ref"
         dest.mkdir(exist_ok=True)
+        # isolated config: never pop the real MediaGrab app open from tests
+        cfg_home = tmp_path / "xdg"
+        (cfg_home / "mgd").mkdir(parents=True)
+        (cfg_home / "mgd" / "config.json").write_text('{"open_app": "off"}')
+        env = dict(os.environ, XDG_CONFIG_HOME=str(cfg_home))
 
         def frame(obj):
             body = json.dumps(obj).encode()
@@ -708,7 +718,7 @@ def test_native_host_download_referer(tmp_path):
         payload = frame({"command": "download", "urls": [url],
                          "destination": str(dest)})
         p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
-                           input=payload, capture_output=True, timeout=30)
+                           input=payload, capture_output=True, timeout=30, env=env)
         (ln,) = struct.unpack("<I", p.stdout[:4])
         assert json.loads(p.stdout[4:4 + ln])["spawned"] == 1
         out = dest / "video.mp4"
@@ -721,7 +731,7 @@ def test_native_host_download_referer(tmp_path):
         payload = frame({"command": "download", "urls": [url],
                          "destination": str(dest), "referer": PAGE})
         p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
-                           input=payload, capture_output=True, timeout=30)
+                           input=payload, capture_output=True, timeout=30, env=env)
         (ln,) = struct.unpack("<I", p.stdout[:4])
         assert json.loads(p.stdout[4:4 + ln])["spawned"] == 1
         for _ in range(60):
