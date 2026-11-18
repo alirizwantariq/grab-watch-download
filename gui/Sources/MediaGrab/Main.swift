@@ -470,7 +470,7 @@ final class JobStore: ObservableObject {
     // MARK: actions: start / pause / resume
 
     func start(_ job: DownloadJob, quality: String, category: String,
-               destination: String? = nil) {
+               destination: String? = nil, outName: String? = nil) {
         var args = ["grab", job.url, "--json-progress", "--retries", "8"]
         if quality == "audio" {
             args += ["--quality", "audio"]
@@ -482,6 +482,9 @@ final class JobStore: ObservableObject {
         }
         if let dest = destination, !dest.isEmpty {
             args += ["-d", dest]
+        }
+        if let name = outName, !name.isEmpty {
+            args += ["--out-name", name]
         }
         job.phase = .running
         jobs.insert(job, at: 0)
@@ -586,6 +589,110 @@ final class JobStore: ObservableObject {
             self.refreshPaused()
         })
         refreshPaused()
+    }
+
+    // MARK: multi-select (remove vs delete)
+
+    /// selected app-spawned jobs (by UUID) + external downloads (by URL —
+    /// the list index shifts between polls, URLs are stable)
+    @Published var selectedJobs: Set<UUID> = []
+    @Published var selectedExternalURLs: Set<String> = []
+
+    var selectionCount: Int { selectedJobs.count + selectedExternalURLs.count }
+
+    func toggleJobSelection(_ job: DownloadJob) {
+        if selectedJobs.contains(job.id) { selectedJobs.remove(job.id) }
+        else { selectedJobs.insert(job.id) }
+    }
+
+    func toggleExternalSelection(_ entry: ListEntry) {
+        if selectedExternalURLs.contains(entry.url) { selectedExternalURLs.remove(entry.url) }
+        else { selectedExternalURLs.insert(entry.url) }
+    }
+
+    func clearSelection() {
+        selectedJobs.removeAll()
+        selectedExternalURLs.removeAll()
+    }
+
+    func selectAll() {
+        for j in jobs { selectedJobs.insert(j.id) }
+        for e in pausedList { selectedExternalURLs.insert(e.url) }
+        for e in externalRunning { selectedExternalURLs.insert(e.url) }
+    }
+
+    /// External cancel that re-resolves the fresh index by url (the list
+    /// shifts between polls).
+    private func cancelExternalByURL(_ entry: ListEntry) async {
+        let out = await MGDPaths.run(["list", "--json"])
+        let fresh = ListEntry.parse(out)
+        let idx = fresh.first(where: { $0.url == entry.url })?.index ?? entry.index
+        _ = await MGDPaths.run(["cancel", "\(idx)"])
+    }
+
+    /// Remove = forget the rows. Finished files stay; active downloads are
+    /// stopped and their partial data cleaned (otherwise they'd reappear
+    /// as paused).
+    func removeSelected() {
+        let jobsToDrop = jobs.filter { selectedJobs.contains($0.id) }
+        var removed = 0
+        for job in jobsToDrop {
+            switch job.phase {
+            case .queued, .running, .paused:
+                cancel(job: job)          // stop engine + delete partials
+            default:
+                remove(job)               // forget the row, keep the file
+                removed += 1
+            }
+        }
+        let extCount = selectedExternalURLs.count
+        if extCount > 0 {
+            for entry in pausedList where selectedExternalURLs.contains(entry.url) {
+                Task { await cancelExternalByURL(entry) }
+            }
+            for entry in externalRunning where selectedExternalURLs.contains(entry.url) {
+                Task { await cancelExternalByURL(entry) }
+            }
+            refreshPaused()
+        }
+        statusFooter = "removed \(jobsToDrop.count + extCount) item"
+            + ((jobsToDrop.count + extCount) == 1 ? "" : "s")
+            + " from the list (files kept)"
+        clearSelection()
+    }
+
+    /// Delete = remove from the list AND move the finished files to Trash.
+    func deleteSelected() {
+        let jobsToDrop = jobs.filter { selectedJobs.contains($0.id) }
+        var trashed = 0
+        for job in jobsToDrop {
+            switch job.phase {
+            case .queued, .running, .paused:
+                cancel(job: job)          // stop + clean partial data
+            default:
+                if job.finishedPath != nil,
+                   FileManager.default.fileExists(atPath: job.finishedPath!) {
+                    trashFile(of: job)    // row + file to Trash
+                    trashed += 1
+                } else {
+                    remove(job)
+                }
+            }
+        }
+        let extCount = selectedExternalURLs.count
+        if extCount > 0 {
+            for entry in pausedList where selectedExternalURLs.contains(entry.url) {
+                Task { await cancelExternalByURL(entry) }
+            }
+            for entry in externalRunning where selectedExternalURLs.contains(entry.url) {
+                Task { await cancelExternalByURL(entry) }
+            }
+            refreshPaused()
+        }
+        statusFooter = "deleted: \(trashed) file"
+            + (trashed == 1 ? "" : "s")
+            + " moved to Trash, \(jobsToDrop.count + extCount - trashed) partial removed"
+        clearSelection()
     }
 
     // MARK: external downloads (started from the extension or a terminal)
@@ -811,16 +918,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - UI pieces
 
-func card<Content: View>(_ content: Content) -> some View {
+func card<Content: View>(_ content: Content, selected: Bool = false) -> some View {
     content
         .padding(.vertical, 10)
         .padding(.horizontal, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 12)
-                .fill(Color(NSColor.controlBackgroundColor))
+                .fill(selected
+                      ? Color.accentColor.opacity(0.14)
+                      : Color(NSColor.controlBackgroundColor))
                 .shadow(color: Color.black.opacity(0.06), radius: 2, y: 1)
         )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.accentColor.opacity(selected ? 0.7 : 0),
+                              lineWidth: 1.5)
+        )
+}
+
+/// The multi-select toggle shown at the leading edge of every row.
+struct SelectDot: View {
+    let on: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 16))
+                .foregroundColor(on ? .accentColor : .secondary)
+        }
+        .buttonStyle(.borderless)
+        .frame(width: 22)
+        .help(on ? "Deselect" : "Select for bulk remove/delete")
+    }
 }
 
 struct SectionHeader: View {
@@ -867,6 +998,8 @@ struct ProgressBar: View {
 
 struct ActiveJobRow: View {
     @ObservedObject var job: DownloadJob
+    var isSelected: Bool = false
+    var onToggleSelect: () -> Void = {}
     var onResume: () -> Void
     var onCancel: () -> Void
 
@@ -874,6 +1007,7 @@ struct ActiveJobRow: View {
         card(
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .center, spacing: 12) {
+                    SelectDot(on: isSelected, action: onToggleSelect)
                     ZStack {
                         switch job.phase {
                         case .running:
@@ -959,7 +1093,7 @@ struct ActiveJobRow: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-        )
+        , selected: isSelected)
         .contextMenu {
             if job.phase == .running || job.phase == .queued {
                 Button("Pause", action: { job.pause() })
@@ -980,6 +1114,8 @@ struct ActiveJobRow: View {
 struct ExternalRunningRow: View {
     let entry: ListEntry
     let speed: Double
+    var isSelected: Bool = false
+    var onToggleSelect: () -> Void = {}
     var onPause: () -> Void
     var onCancel: () -> Void
 
@@ -991,6 +1127,7 @@ struct ExternalRunningRow: View {
         card(
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .center, spacing: 12) {
+                    SelectDot(on: isSelected, action: onToggleSelect)
                     Image(systemName: "terminal")
                         .font(.system(size: 16)).foregroundColor(.blue)
                         .frame(width: 30)
@@ -1032,7 +1169,7 @@ struct ExternalRunningRow: View {
                     .help("Stop and delete the partial data")
                 }
             }
-        )
+        , selected: isSelected)
         .contextMenu {
             Button("Pause", action: onPause)
             Button("Cancel and delete partial data", action: onCancel)
@@ -1047,12 +1184,15 @@ struct ExternalRunningRow: View {
 
 struct ExternalPausedRow: View {
     let entry: ListEntry
+    var isSelected: Bool = false
+    var onToggleSelect: () -> Void = {}
     var onResume: () -> Void
     var onCancel: () -> Void
 
     var body: some View {
         card(
             HStack(alignment: .center, spacing: 12) {
+                SelectDot(on: isSelected, action: onToggleSelect)
                 Image(systemName: "pause.circle.fill")
                     .font(.system(size: 22)).foregroundColor(.orange)
                     .padding(.leading, 8)
@@ -1079,12 +1219,14 @@ struct ExternalPausedRow: View {
                 .controlSize(.small)
                 .help("Stop and delete the partial data")
             }
-        )
+        , selected: isSelected)
     }
 }
 
 struct FinishedJobRow: View {
     @ObservedObject var job: DownloadJob
+    var isSelected: Bool = false
+    var onToggleSelect: () -> Void = {}
     var onReveal: () -> Void
     var onOpen: () -> Void
     var onRemove: () -> Void
@@ -1093,6 +1235,7 @@ struct FinishedJobRow: View {
     var body: some View {
         card(
             HStack(alignment: .center, spacing: 12) {
+                SelectDot(on: isSelected, action: onToggleSelect)
                 if job.phase == .done, let path = job.finishedPath {
                     Button {
                         onReveal()
@@ -1171,7 +1314,7 @@ struct FinishedJobRow: View {
                 .fixedSize()
                 .help("Actions")
             }
-        )
+        , selected: isSelected)
         .onTapGesture(count: 2) {
             if job.phase == .done {
                 onOpen()
@@ -1287,6 +1430,9 @@ final class Session: ObservableObject {
     @Published var searchText = ""
     /// global speed limit choice (mirror of mgd config speed_limit)
     @Published var speedLimit: String = "off"
+    /// rename-before-download popup state
+    @Published var renameSheet: PendingDownload?
+    @Published var renameDraft: RenameDraft?
 }
 
 // MARK: - batch (multi-video page) model
@@ -1341,6 +1487,23 @@ final class BatchProbe: ObservableObject, Identifiable {
     }
 }
 
+// MARK: - rename-before-download model
+
+/// A download paused for the user to confirm/rename its filename.
+struct PendingDownload: Identifiable {
+    let id = UUID()
+    let url: String
+    let quality: String
+    let suggestedName: String
+}
+
+/// Editable text for the rename sheet (kept in Session so re-renders of
+/// the sheet's parent never reset what the user typed).
+final class RenameDraft: ObservableObject {
+    @Published var name: String
+    init(name: String) { self.name = name }
+}
+
 struct ContentView: View {
     @StateObject private var store = JobStore()
     @StateObject private var session = Session()
@@ -1392,7 +1555,11 @@ struct ContentView: View {
         }
         .sheet(item: $session.qualitySheet) { probe in
             QualitySheet(probe: probe, onStart: { quality in
-                begin(url: probe.url, quality: quality)
+                let name = probe.title?
+                    .replacingOccurrences(of: "/", with: "-")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                begin(url: probe.url, quality: quality,
+                      suggested: (name?.isEmpty == false) ? name : nil)
             }, onClose: { session.qualitySheet = nil })
         }
         .sheet(item: $session.batchSheet) { batch in
@@ -1402,6 +1569,25 @@ struct ContentView: View {
                            session.batchSheet = nil
                        },
                        onClose: { session.batchSheet = nil })
+        }
+        .sheet(item: $session.renameSheet) { pending in
+            RenameSheet(pending: pending,
+                        draft: session.renameDraft ?? RenameDraft(name: pending.suggestedName),
+                        destination: session.destination,
+                        onStart: { finalName in
+                            session.renameSheet = nil
+                            session.renameDraft = nil
+                            let job = DownloadJob(url: pending.url,
+                                                  title: finalName)
+                            store.start(job, quality: pending.quality,
+                                        category: "auto",
+                                        destination: session.destination,
+                                        outName: finalName)
+                        },
+                        onClose: {
+                            session.renameSheet = nil
+                            session.renameDraft = nil
+                        })
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -1429,6 +1615,28 @@ struct ContentView: View {
                     Label("Pause all", systemImage: "pause.circle")
                 }
                 .disabled(!store.jobs.contains { $0.phase == .running })
+            }
+            ToolbarItem {
+                Button {
+                    store.removeSelected()
+                } label: {
+                    Label(store.selectionCount > 0
+                          ? "Remove (\(store.selectionCount))" : "Remove",
+                          systemImage: "minus.circle")
+                }
+                .disabled(store.selectionCount == 0)
+                .help("Remove the selected rows from the list (files are kept; active downloads are stopped)")
+            }
+            ToolbarItem {
+                Button {
+                    store.deleteSelected()
+                } label: {
+                    Label(store.selectionCount > 0
+                          ? "Delete (\(store.selectionCount))" : "Delete",
+                          systemImage: "trash")
+                }
+                .disabled(store.selectionCount == 0)
+                .help("Remove the selected rows and move their finished files to the Trash")
             }
             ToolbarItem {
                 Button {
@@ -1698,6 +1906,8 @@ struct ContentView: View {
                                           systemImage: "arrow.down.circle", color: .accentColor)
                             ForEach(active) { job in
                                 ActiveJobRow(job: job,
+                                             isSelected: store.selectedJobs.contains(job.id),
+                                             onToggleSelect: { store.toggleJobSelection(job) },
                                              onResume: { store.resume(job: job) },
                                              onCancel: { store.cancel(job: job) })
                             }
@@ -1709,6 +1919,8 @@ struct ContentView: View {
                             ForEach(runningExternal) { entry in
                                 ExternalRunningRow(entry: entry,
                                                    speed: store.externalSpeeds[entry.url] ?? 0,
+                                                   isSelected: store.selectedExternalURLs.contains(entry.url),
+                                                   onToggleSelect: { store.toggleExternalSelection(entry) },
                                                    onPause: { store.pauseExternalRunning(entry) },
                                                    onCancel: { store.cancelExternalRunning(entry) })
                             }
@@ -1719,6 +1931,8 @@ struct ContentView: View {
                                           systemImage: "pause.circle", color: .orange)
                             ForEach(pausedExternal) { entry in
                                 ExternalPausedRow(entry: entry,
+                                                  isSelected: store.selectedExternalURLs.contains(entry.url),
+                                                  onToggleSelect: { store.toggleExternalSelection(entry) },
                                                   onResume: { store.resumeExternal(entry: entry) },
                                                   onCancel: { store.cancel(entry: entry) })
                             }
@@ -1728,6 +1942,8 @@ struct ContentView: View {
                                           systemImage: "checkmark.circle", color: .green)
                             ForEach(finished) { job in
                                 FinishedJobRow(job: job,
+                                               isSelected: store.selectedJobs.contains(job.id),
+                                               onToggleSelect: { store.toggleJobSelection(job) },
                                                onReveal: { store.reveal(job) },
                                                onOpen: { store.open(job) },
                                                onRemove: { store.remove(job) },
@@ -1867,6 +2083,10 @@ struct ContentView: View {
                 if items.count > 1 {
                     session.batchSheet = BatchProbe(url: url, items: items)
                     store.statusFooter = "\(items.count) media items found — pick some"
+                } else if let item = items.first {
+                    let name = item.title.isEmpty ? nil :
+                        item.title.replacingOccurrences(of: "/", with: "-")
+                    begin(url: item.url, quality: "auto", suggested: name)
                 } else {
                     begin(url: url, quality: "auto")
                 }
@@ -1881,10 +2101,25 @@ struct ContentView: View {
         return platforms.contains { url.contains($0) }
     }
 
-    private func begin(url: String, quality: String) {
+    private func begin(url: String, quality: String, suggested: String? = nil) {
         session.qualitySheet = nil
-        store.start(DownloadJob(url: url), quality: quality, category: "auto",
-                    destination: session.destination)
+        session.batchSheet = nil
+        let name = suggested ?? suggestedName(for: url)
+        session.renameDraft = RenameDraft(name: name)
+        session.renameSheet = PendingDownload(url: url, quality: quality,
+                                              suggestedName: name)
+    }
+
+    /// A sensible default filename for the rename sheet: the page/video
+    /// title when mgd knows it, else the URL's filename.
+    private func suggestedName(for url: String) -> String {
+        let fromUrl = (url as NSString).lastPathComponent
+        if fromUrl.contains("."), fromUrl.count > 4 {
+            return fromUrl
+        }
+        return url
+            .replacingOccurrences(of: "https://", with: "")
+            .replacingOccurrences(of: "http://", with: "")
     }
 
     // MARK: drag & drop
@@ -1914,6 +2149,67 @@ struct ContentView: View {
             return true
         }
         return false
+    }
+}
+
+// MARK: - rename sheet (confirm/adjust the filename before downloading)
+
+struct RenameSheet: View {
+    let pending: PendingDownload
+    @ObservedObject var draft: RenameDraft
+    let destination: String?
+    let onStart: (String) -> Void
+    let onClose: () -> Void
+
+    private var trimmedName: String {
+        draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var destinationText: String {
+        if let d = destination {
+            return "Saving into \(d)"
+        }
+        return "Saving into ~/Downloads/mgd/<type> — the extension is added automatically if you leave it out."
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "pencil.circle.fill")
+                    .font(.title3).foregroundColor(.accentColor)
+                Text("Save as").font(.title3.bold())
+            }
+            Text(pending.url)
+                .font(.caption).foregroundColor(.secondary)
+                .lineLimit(1).truncationMode(.middle)
+            TextField("file name", text: $draft.name)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(startIfValid)
+            Text(destinationText)
+                .font(.caption).foregroundColor(.secondary)
+            HStack {
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button {
+                    startIfValid()
+                } label: {
+                    Label("Download", systemImage: "arrow.down.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(trimmedName.isEmpty
+                          || trimmedName.contains("/"))
+            }
+        }
+        .padding(16)
+        .frame(width: 480)
+    }
+
+    private func startIfValid() {
+        let name = trimmedName
+        guard !name.isEmpty, !name.contains("/") else { return }
+        onStart(name)
     }
 }
 

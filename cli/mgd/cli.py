@@ -47,6 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("url")
     g.add_argument("-o", "--out", default=None,
                    help="exact destination file path (overrides category dirs)")
+    g.add_argument("--out-name", default=None, dest="out_name",
+                   help="rename the file (keeps category folders; extension "
+                        "added automatically when omitted)")
     g.add_argument("-d", "--dir", default=None,
                    help="destination directory (skips category mapping)")
     g.add_argument("-t", "--type", default=None, dest="filetype",
@@ -282,6 +285,13 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
         dl_url = f"https://{chosen['host']}/" \
                  f"{u.quote(raw_name, safe='/')}"
         local_name = pathlib.PurePosixPath(raw_name).name  # keep emoji etc.
+        # user rename (GUI sheet): keep the bridge extension when omitted
+        out_name = getattr(args, "out_name", None)
+        if out_name:
+            base = str(out_name).strip().lstrip("/")
+            if "." not in pathlib.PurePosixPath(base).name:
+                base += pathlib.PurePosixPath(local_name).suffix
+            local_name = base
         print(_arrow(f"{st.get('title') or url} [{chosen.get('label', 'best')}]"))
     except RuntimeError as err:
         print(f"error: {err}", file=sys.stderr)
@@ -697,7 +707,17 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
     # ── destination ───────────────────────────────────────────────────────
     audio_only = bool(selector == "ba/bestaudio" or quality_extra)
     dest_args = []
-    if args.out:
+    out_name = getattr(args, "out_name", None)
+    if out_name and not args.out:
+        # user rename (GUI sheet): name template inside the category dir
+        base = str(out_name).strip().lstrip("/")
+        if "." not in pathlib.PurePosixPath(base).name:
+            base += ".%(ext)s"
+        d = (os.path.expanduser(args.dir) if args.dir
+             else str(categorize.category_dir(cfg, args.filetype or "video")))
+        pathlib.Path(d).mkdir(parents=True, exist_ok=True)
+        dest_args = ["-o", os.path.join(d, base)]
+    elif args.out:
         o = args.out
         if pathlib.Path(o).suffix and "%(ext)s" not in o:
             o += ".%(ext)s"
@@ -973,7 +993,18 @@ def _destination(args, cfg: dict, url: str) -> pathlib.Path:
             p = p / _url_filename(url)
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
+    # --out-name: rename while keeping the category folder routing
     name = _url_filename(url)
+    out_name = getattr(args, "out_name", None)
+    if out_name:
+        name = str(out_name).strip().lstrip("/")
+        if not name:
+            raise RuntimeError("--out-name cannot be empty")
+        if "." not in pathlib.PurePosixPath(name).name:
+            # no extension typed -> keep the original one
+            orig_ext = _url_filename(url).rpartition(".")[2]
+            if orig_ext:
+                name = f"{name}.{orig_ext}"
     category = args.filetype or categorize.categorize(name, None)
     d = pathlib.Path(os.path.expanduser(args.dir)) if args.dir \
         else categorize.category_dir(cfg, category)
