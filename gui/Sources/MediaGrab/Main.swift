@@ -598,6 +598,52 @@ final class JobStore: ObservableObject {
         })
     }
 
+    /// Batch handed over by the extension: one job per item with the
+    /// user-renamed filename + destination + the source page as referer.
+    func startHandoff(_ probe: HandoffProbe, destination: String?) {
+        for item in probe.items {
+            let name = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            var args = ["grab", item.url, "--json-progress", "--retries", "8"]
+            if !name.isEmpty && !name.contains("/") {
+                args += ["--out-name", name]
+            }
+            if let r = probe.referer, !r.isEmpty {
+                args += ["--referer", r]
+            }
+            if let d = destination, !d.isEmpty {
+                args += ["-d", d]
+            }
+            let job = DownloadJob(url: item.url,
+                                  title: name.isEmpty ? item.url : name)
+            job.phase = .running
+            jobs.insert(job, at: 0)
+            job.process = MGDPaths.spawn(args, onLine: { [weak job] line in
+                job?.ingest(line)
+            }, onEnd: { [weak job, weak self] code in
+                guard let job, let self else { return }
+                if job.phase == .running || job.phase == .queued {
+                    switch code {
+                    case 0: job.phase = .done; job.finishedAt = Date()
+                    case 130: job.phase = .paused
+                    default: job.phase = .failed
+                    }
+                }
+                job.finalizeAfterExit(code: code)
+                self.refreshPaused()
+                self.statusFooter = "\(job.title): \(job.phase.rawValue)"
+                self.saveHistory()
+                self.updateDockBadge()
+                switch job.phase {
+                case .done: self.notify("Download complete", job.title)
+                case .failed: self.notify("Download failed", job.title)
+                default: break
+                }
+            })
+        }
+        statusFooter = "downloading \(probe.items.count) item"
+            + (probe.items.count == 1 ? "" : "s")
+    }
+
     /// Resume a job the app itself paused (id resolved by url from `mgd list`).
     func resume(job: DownloadJob) {
         Task {
@@ -1570,6 +1616,8 @@ final class Session: ObservableObject {
     @Published var renameDraft: RenameDraft?
     /// torrent file-picker sheet (magnet / .torrent links)
     @Published var torrentSheet: TorrentProbe?
+    /// batch handed over by the extension (rename + destination sheet)
+    @Published var handoffSheet: HandoffProbe?
 }
 
 // MARK: - batch (multi-video page) model
@@ -1664,8 +1712,21 @@ struct ContentView: View {
             store.saveHistory()   // prune/re-write after loading old rows
         }
         .onOpenURL { url in
-            // default torrent client: magnet links + .torrent files land here
             let link = url.absoluteString
+            if link.hasPrefix("mediagrab://handoff") {
+                // extension batch: open the rename/destination sheet
+                if let handoff = HandoffProbe.readPending() {
+                    session.destination = handoff.destination ?? session.destination
+                    session.handoffSheet = handoff
+                    store.statusFooter = "MediaGrab received \(handoff.items.count) "
+                        + "download\(handoff.items.count == 1 ? "" : "s") — "
+                        + "rename and confirm"
+                } else {
+                    store.statusFooter = "handoff was empty or already handled"
+                }
+                return
+            }
+            // default torrent client: magnet links + .torrent files land here
             guard link.hasPrefix("magnet:") || link.lowercased().hasSuffix(".torrent") else {
                 return
             }
@@ -1714,6 +1775,17 @@ struct ContentView: View {
                            session.batchSheet = nil
                        },
                        onClose: { session.batchSheet = nil })
+        }
+        .sheet(item: $session.handoffSheet) { handoff in
+            HandoffSheet(probe: handoff,
+                         destination: session.destination,
+                         onStart: {
+                             store.startHandoff(handoff,
+                                                 destination: session.destination)
+                             session.handoffSheet = nil
+                         },
+                         onChooseFolder: { session.pickingFolder = true },
+                         onClose: { session.handoffSheet = nil })
         }
         .sheet(item: $session.torrentSheet) { probe in
             TorrentSheet(probe: probe,
@@ -2533,6 +2605,148 @@ struct TorrentSheet: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - handoff model (extension -> app -> rename/destination sheet)
+
+/// One URL handed over by the extension, with an editable filename.
+final class HandoffItem: ObservableObject, Identifiable {
+    let id = UUID()
+    let url: String
+    @Published var name: String
+
+    init(url: String, name: String) {
+        self.url = url
+        self.name = name
+    }
+}
+
+/// A batch the native host handed to the app (extension downloads).
+final class HandoffProbe: ObservableObject, Identifiable {
+    let id = UUID()
+    let items: [HandoffItem]
+    let referer: String?
+    let destination: String?
+
+    init(items: [HandoffItem], referer: String?, destination: String?) {
+        self.items = items
+        self.referer = referer
+        self.destination = destination
+    }
+
+    static func readPending() -> HandoffProbe? {
+        let path = (("~/.config/mgd/handoff.json" as NSString)
+            .expandingTildeInPath) as String
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let urls = obj["urls"] as? [String], !urls.isEmpty else {
+            return nil
+        }
+        let referer = obj["referer"] as? String
+        let destination = obj["destination"] as? String
+        let items = urls.map { u in
+            let suggested = (u as NSString).lastPathComponent
+            let name = suggested.contains(".") && suggested.count > 4
+                ? suggested : u
+            return HandoffItem(url: u, name: name)
+        }
+        try? FileManager.default.removeItem(atPath: path)   // consume
+        return HandoffProbe(items: items, referer: referer,
+                             destination: destination)
+    }
+}
+
+// MARK: - handoff sheet (extension batch: rename each file + destination)
+
+/// One renameable row (bindings need an @ObservedObject wrapper view).
+struct HandoffRow: View {
+    @ObservedObject var item: HandoffItem
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: fileSymbol(forPath: item.name))
+                .foregroundColor(.accentColor).frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                TextField("file name", text: $item.name)
+                    .textFieldStyle(.roundedBorder)
+                Text(item.url)
+                    .font(.caption2).foregroundColor(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+        }
+    }
+}
+
+struct HandoffSheet: View {
+    @ObservedObject var probe: HandoffProbe
+    let destination: String?
+    let onStart: () -> Void
+    let onChooseFolder: () -> Void
+    let onClose: () -> Void
+
+    private var valid: Bool {
+        probe.items.contains {
+            let n = $0.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !n.isEmpty && !n.contains("/")
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "square.and.arrow.down.fill")
+                    .font(.title3).foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Downloads from MediaGrab fetcher").font(.title3.bold())
+                    Text(probe.referer ?? "extension handoff")
+                        .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                Spacer()
+            }
+            .padding()
+            Divider()
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(probe.items) { item in
+                        HandoffRow(item: item)
+                            .padding(.horizontal)
+                    }
+                }
+                .padding(.vertical, 10)
+            }
+            Divider()
+            HStack(spacing: 8) {
+                Text(destination == nil
+                     ? "Saving into ~/Downloads/mgd/<type>"
+                     : "Saving into \(destination!)")
+                    .font(.caption).foregroundColor(.secondary)
+                    .lineLimit(1)
+                Button {
+                    onChooseFolder()
+                } label: {
+                    Label("Choose…", systemImage: "folder.badge.plus")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption)
+                }
+                .controlSize(.small)
+                Spacer()
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button {
+                    onStart()
+                } label: {
+                    Label("Download \(probe.items.count)",
+                          systemImage: "arrow.down.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!valid)
+            }
+            .padding()
+        }
+        .frame(width: 640, height: 420)
     }
 }
 

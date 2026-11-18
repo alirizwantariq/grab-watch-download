@@ -130,6 +130,14 @@ async function downloadSelected() {
   const btn = $("download");
   if (resp && resp.ok) {
     const n = resp.spawned || 0;
+    if (resp.handoff) {
+      btn.textContent = "sent ✓";
+      btn.classList.add("done");
+      $("hostStatus").textContent =
+        `handed ${n} download${n === 1 ? "" : "s"} to the MediaGrab app — rename & pick the folder there`;
+      setTimeout(() => window.close(), 900);
+      return;
+    }
     if (n === 0) {
       btn.textContent = "failed — retry";
       $("hostStatus").textContent = "mgd could not start any download (see ~/.config/mgd/native-host.log)";

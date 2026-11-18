@@ -1831,39 +1831,64 @@ def cmd_native_host(_args) -> int:
             referer = msg.get("referer")
             log_path = pathlib.Path(
                 os.environ.get("HOME") or "/tmp") / ".config/mgd/native-host.log"
-            spawned = 0
-            for u_ in urls:
-                cmd = [sys.executable, mgd_bin, "grab", u_]
-                if destination:
-                    cmd += ["-d", str(destination)]
-                if referer:
-                    # tiered CDNs (erome etc.) 403 media requests without the
-                    # source page as Referer
-                    cmd += ["--referer", str(referer)]
+
+            def spawn_all():
+                """Headless fallback: detached mgd grab per url."""
+                spawned = 0
+                for u_ in urls:
+                    cmd = [sys.executable, mgd_bin, "grab", u_]
+                    if destination:
+                        cmd += ["-d", str(destination)]
+                    if referer:
+                        # tiered CDNs (erome etc.) 403 media requests without
+                        # the source page as Referer
+                        cmd += ["--referer", str(referer)]
+                    try:
+                        err_sink = open(log_path, "a", encoding="utf-8")
+                        print(f"{time.strftime('%F %T')} grab spawn: {u_}",
+                              file=err_sink)
+                        err_sink.flush()
+                        subprocess.Popen(
+                            cmd, stdout=subprocess.DEVNULL, stderr=err_sink,
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+                        err_sink.close()
+                        spawned += 1
+                    except OSError:
+                        pass
+                return spawned
+
+            # FDM-style hand-off: instead of headless grabs, hand the batch
+            # to the MediaGrab app, which opens the rename/destination sheet
+            # and downloads after the user confirms (mgd set-default
+            # open-app off keeps downloads headless).
+            if urls and _cfg().get("open_app", "on") != "off":
+                handed = False
                 try:
-                    err_sink = open(log_path, "a", encoding="utf-8")
-                    print(f"{time.strftime('%F %T')} grab spawn: {u_}",
-                          file=err_sink)
-                    err_sink.flush()
+                    handoff = {"urls": [u for u in urls if u],
+                               "referer": referer or None,
+                               "destination": destination or None}
+                    cfg_base = (os.environ.get("XDG_CONFIG_HOME")
+                                or os.path.join(os.environ.get("HOME") or "/tmp",
+                                                ".config"))
+                    handoff_path = pathlib.Path(cfg_base) / "mgd" / "handoff.json"
+                    handoff_path.parent.mkdir(parents=True, exist_ok=True)
+                    handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
+                    if os.environ.get("MGD_NO_OPEN"):
+                        write_message({"ok": True, "handoff": True,
+                                       "spawned": len(urls)})
+                        continue
                     subprocess.Popen(
-                        cmd, stdout=subprocess.DEVNULL, stderr=err_sink,
-                        stdin=subprocess.DEVNULL, start_new_session=True)
-                    err_sink.close()
-                    spawned += 1
+                        ["/usr/bin/open", "mediagrab://handoff"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL)
+                    handed = True
                 except OSError:
                     pass
-            write_message({"ok": True, "spawned": spawned})
-            # FDM-style: hand-off pops the MediaGrab app open so the user
-            # watches progress right away (mgd set-default open-app off to
-            # keep downloads headless). Best effort: CLI-only setups survive.
-            if spawned and _cfg().get("open_app", "on") != "off":
-                try:
-                    subprocess.Popen(["/usr/bin/open", "-a", "MediaGrab"],
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                    stdin=subprocess.DEVNULL)
-                except OSError:
-                    pass
+                if handed:
+                    write_message({"ok": True, "handoff": True,
+                                   "spawned": len(urls)})
+                    continue
+            write_message({"ok": True, "spawned": spawn_all()})
             continue
         if command == "query":
             states = _find_states()

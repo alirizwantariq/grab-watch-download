@@ -1052,6 +1052,66 @@ def test_concurrent_same_name_downloads():
         origin.stop()
 
 
+def test_native_host_handoff(tmp_path):
+    """Extension downloads hand the batch to the MediaGrab app (rename +
+    destination sheet) instead of headless grabs when open-app is on;
+    open-app off keeps the headless spawn behavior."""
+    import conftest
+    import os
+    import struct
+    import sys as _sys
+    import subprocess
+    import time
+
+    content = b"handoff test " * 1024
+    origin = conftest.DripOrigin(content, chunk=16 * 1024, delay=0)
+
+    def frame(obj):
+        body = json.dumps(obj).encode()
+        return struct.pack("<I", len(body)) + body
+
+    def run_host(payload, open_app: str):
+        cfg_home = tmp_path / f"xdg-{open_app}"
+        (cfg_home / "mgd").mkdir(parents=True, exist_ok=True)
+        (cfg_home / "mgd" / "config.json").write_text(
+            json.dumps({"open_app": open_app}))
+        env = dict(os.environ, XDG_CONFIG_HOME=str(cfg_home),
+                   MGD_NO_OPEN="1")   # tests never launch the real app
+        p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
+                           input=payload, capture_output=True, timeout=30,
+                           env=env)
+        (ln,) = struct.unpack("<I", p.stdout[:4])
+        return json.loads(p.stdout[4:4 + ln])
+
+    payload = frame({"command": "download", "urls": [origin.url],
+                     "destination": str(tmp_path / "dest"),
+                     "referer": "https://example.com/x"})
+    try:
+        # open-app on: handoff file written, reply says handoff, no grab
+        reply = run_host(payload, "on")
+        assert reply["ok"] and reply["handoff"] is True, reply
+        handoff = json.loads((tmp_path / "xdg-on" / "mgd" / "handoff.json")
+                             .read_text())
+        assert handoff["urls"] == [origin.url]
+        assert handoff["referer"] == "https://example.com/x"
+        out = tmp_path / "dest" / "drip.bin"
+        time.sleep(1.5)
+        assert not out.exists(), "handoff must not download by itself"
+        # open-app off: headless spawn as before
+        reply2 = run_host(payload, "off")
+        assert reply2["ok"] and reply2.get("handoff") is None and \
+            reply2["spawned"] == 1, reply2
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            time.sleep(0.5)
+            if out.exists() and out.stat().st_size == len(content):
+                assert out.read_bytes() == content
+                return
+        raise AssertionError("headless fallback download did not finish")
+    finally:
+        origin.stop()
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")
