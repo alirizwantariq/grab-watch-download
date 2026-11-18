@@ -25,7 +25,7 @@ import threading
 import time
 import urllib.parse as u
 
-from . import categorize, grab, net
+from . import categorize, grab, net, torrent as _torrent_mod
 from .engine import (Downloader, DownloadError, HttpError, Interrupted,
                      Stopper, STATE_SUFFIX, PART_SUFFIX)
 
@@ -66,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--max-speed", default=None,
                    help="per-download speed limit: 2MB, 512KB, 500000 (bytes/s); "
                         "global default: mgd set-default speed-limit")
+    g.add_argument("--select-files", default=None,
+                   help="torrents: download only these file numbers (1-based, "
+                        "e.g. 1,3,5-7; see mgd torrent-info)")
+    g.add_argument("--all-files", action="store_true",
+                   help="torrents: download every file without asking")
     g.add_argument("--cookies", default=None, help="Netscape cookie file for yt-dlp")
     g.add_argument("--cookies-from-browser", default=None,
                    help="browser to pull cookies from for yt-dlp: chrome, firefox, edge, safari, brave")
@@ -147,6 +152,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pasteboard poll interval in seconds")
     w.add_argument("-d", "--dir", default=None,
                    help="destination directory for clipboard downloads")
+    ti = sub.add_parser("torrent-info", aliases=["torrent-files"],
+                        help="list the files inside a magnet/torrent (JSON; "
+                             "drives the GUI picker)")
+    ti.add_argument("url")
+    ti.add_argument("--proxy", default=None)
+    st = sub.add_parser("stream",
+                        help="stream a torrent's video while it downloads "
+                             "(sequential; webtorrent + VLC/IINA)")
+    st.add_argument("url")
     return ap
 
 
@@ -793,6 +807,9 @@ def cmd_grab(args) -> int:
         headers[k.strip()] = v.strip()
     stopper = Stopper()
 
+    if _torrent_mod.is_torrent(args.url):
+        return _grab_torrent(args, cfg, args.url)
+
     if args.referer:
         # explicit referer: CDNs gated by it (erome etc.) would 403 even the
         # is-it-a-page probe below, sending the grab down a dead-end path
@@ -965,6 +982,322 @@ MIRROR_HOSTS = {
 }
 
 
+# ── torrents & magnets (aria2 engine + webtorrent streaming) ────────────
+
+ARIA2_SUMMARY_RE = re.compile(
+    r"\[#\w+\s+([\d.]+)([KMGT]i?B)?/([\d.]+)([KMGT]i?B)?\((\d+)%\)")
+_ARIA2_UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20,
+                "GiB": 1 << 30, "TiB": 1 << 40, None: 1}
+TORRENT_STATE_KIND = "mgd-torrent-state"
+
+
+def _aria2_bytes(num: str, unit: str | None) -> int:
+    return int(float(num) * _ARIA2_UNITS.get(unit, 1))
+
+
+def _torrent_metadata(url: str, cfg: dict, proxy: str | None) -> tuple[dict, str]:
+    """(parsed metainfo, local .torrent path). Magnets resolve via aria2
+    DHT metadata fetch; remote .torrent urls are downloaded first."""
+    aria2 = shutil.which("aria2c")
+    if not aria2:
+        raise RuntimeError("aria2c not found (brew install aria2)")
+    import tempfile
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="mgd-torrent-"))
+    src = url
+    if _torrent_mod.is_magnet(url):
+        # DHT lookup; cold magnets can take 5-60s
+        proc = subprocess.run(
+            [aria2, url, "--bt-metadata-only=true", "--bt-save-metadata=true",
+             "--dir", str(tmp), "--console-log-level", "warn",
+             "--bt-max-peers", "80", "--enable-dht=true"],
+            capture_output=True, text=True, timeout=180)
+        saved = sorted(tmp.glob("*.torrent"), key=lambda p: p.stat().st_mtime)
+        if not saved:
+            raise RuntimeError("could not fetch magnet metadata via DHT "
+                               f"(aria2: {(proc.stderr or proc.stdout).strip()[-200:]})")
+        src = str(saved[-1])
+    elif re.match(r"^https?://", url):
+        conn, resp = net.open_request(url, proxy, "GET", timeout=DEFAULT_TIMEOUT)
+        try:
+            data = resp.read()
+        finally:
+            close = getattr(conn, "close", None)
+            if callable(close):
+                close()
+        if resp.status >= 400:
+            raise HttpError(resp.status)
+        src = str(tmp / "remote.torrent")
+        pathlib.Path(src).write_bytes(data)
+    raw = pathlib.Path(src).read_bytes()
+    meta = _torrent_mod.bdecode(raw)
+    if not isinstance(meta, dict):
+        raise RuntimeError("not a valid torrent file")
+    return meta, src
+
+
+def _torrent_file_picker(files: list[dict], interactive: bool,
+                         args) -> list[int] | None:
+    """Which file indices to download (1-based, aria2 --select-file).
+    None = all files; [] = user declined."""
+    pick = getattr(args, "select_files", None)
+    if pick:
+        out: list[int] = []
+        for part in str(pick).split(","):
+            part = part.strip()
+            if "-" in part:
+                a, _, b = part.partition("-")
+                out += list(range(int(a), int(b) + 1))
+            elif part:
+                out.append(int(part))
+        valid = {f["index"] for f in files}
+        bad = [i for i in out if i not in valid]
+        if bad:
+            raise RuntimeError(f"--select-files out of range: {bad}")
+        return sorted(set(out))
+    if getattr(args, "all_files", False):
+        return None
+    if not interactive or len(files) == 1:
+        return None          # non-tty default: everything
+    print(f"{len(files)} file(s) in this torrent:")
+    for f in files:
+        mark = " (video)" if f["video"] else ""
+        print(f"  {f['index']:>3}. {_size_str(f['size'])}  {f['path']}{mark}")
+    try:
+        answer = input("download which files (all / 1,3,5-7 / q): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return []
+    if answer in ("q", "quit", ""):
+        return []
+    if answer in ("all", "a", "*"):
+        return None
+    return _torrent_file_picker(files, False,
+                                argparse.Namespace(select_files=answer))
+
+
+def _torrent_state_path(dest_dir: pathlib.Path, name: str) -> pathlib.Path:
+    safe = re.sub(r"[^\w.\- ]", "_", name)[:80] or "torrent"
+    return dest_dir / f"{safe}{STATE_SUFFIX}"
+
+
+def _torrent_save_state(st: dict) -> None:
+    try:
+        st["_path"].write_text(json.dumps(
+            {k: v for k, v in st.items() if k != "_path"}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _torrent_spawn_aria2(url: str, src: str, dest_dir: pathlib.Path,
+                         select: list[int] | None, cfg: dict,
+                         json_mode: bool, on_progress=None):
+    """Run aria2c, translating its summary lines into mgd's NDJSON events.
+    Raises DownloadError when aria2 fails; SIGTERM surfaces as
+    KeyboardInterrupt (handled by the caller, state already on disk)."""
+    aria2 = shutil.which("aria2c")
+    if not aria2:
+        raise RuntimeError("aria2c not found (brew install aria2)")
+    cmd = [aria2, url,
+           "--dir", str(dest_dir),
+           "--seed-time", "0",
+           "--bt-detach-seed-only=true",
+           "--summary-interval", "1",
+           "--console-log-level", "warn",
+           "--file-allocation", "none",
+           "--auto-file-renaming=false",
+           "--continue=true",
+           "--bt-max-peers", "80",
+           "--enable-dht=true"]
+    if select:
+        cmd += ["--select-file", ",".join(str(i) for i in select)]
+    from .engine import parse_speed
+    limit = parse_speed(cfg.get("speed_limit"))
+    if limit:
+        cmd += ["--max-overall-download-limit", str(limit)]
+    if json_mode:
+        print(json.dumps({"type": "start", "url": url}), flush=True)
+    else:
+        print(_arrow(f"torrent: {url[:70]}"))
+        print(f"  engine: aria2c  dir: {dest_dir}"
+              + (f"  files: {','.join(str(i) for i in select)}"
+                 if select else "  files: all"))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    done = last_total = 0
+    last_save = 0.0
+    for line in proc.stdout:
+        m = ARIA2_SUMMARY_RE.search(line)
+        if not m:
+            continue
+        done = _aria2_bytes(m.group(1), m.group(2))
+        last_total = _aria2_bytes(m.group(3), m.group(4))
+        if json_mode:
+            print(json.dumps({"type": "progress", "done": done,
+                              "total": last_total}), flush=True)
+        else:
+            print(f"\r  {done} / {last_total} bytes", end="", flush=True)
+        # keep the state file's progress fresh (mgd jobs / GUI read it)
+        now = time.monotonic()
+        if now - last_save > 2.0:
+            last_save = now
+            if on_progress:
+                on_progress(done, last_total)
+    code = proc.wait()
+    if code != 0:
+        raise DownloadError(f"aria2c exited with {code}")
+    if not json_mode:
+        print()
+    return done, last_total
+
+
+def _grab_torrent(args, cfg: dict, url: str) -> int:
+    """Torrent/magnet grab: fetch metadata, let the user pick files
+    (interactive list, --select-files, or the GUI picker), then run
+    aria2c with mgd's NDJSON progress contract."""
+    meta, src = _torrent_metadata(url, cfg, proxy_of(args))
+    name = _torrent_mod.torrent_name(meta) or "torrent"
+    files = _torrent_mod.torrent_files(meta)
+    select = _torrent_file_picker(files, sys.stdin.isatty(), args)
+    if select == []:
+        print("no files selected - nothing to do")
+        return 130
+    if args.dir:
+        dest_dir = pathlib.Path(os.path.expanduser(args.dir))
+    elif args.out:
+        dest_dir = pathlib.Path(os.path.expanduser(args.out))
+        if dest_dir.suffix:
+            dest_dir = dest_dir.parent
+    else:
+        has_video = any(f["video"] for f in files)
+        dest_dir = categorize.category_dir(cfg, "video" if has_video else "other")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_files = files if select is None else [f for f in files
+                                                   if f["index"] in select]
+    total = sum(f["size"] for f in selected_files)
+    st = {"kind": TORRENT_STATE_KIND, "url": url, "name": name,
+          "dir": str(dest_dir), "select": select,
+          "files": selected_files, "size": total,
+          "done": 0, "pid": os.getpid(),
+          "filename": name, "out_path": str(dest_dir)}
+    st_path = _torrent_state_path(dest_dir, name)
+    st["_path"] = st_path
+    _torrent_save_state(st)
+    _journal_record(st_path)
+
+    json_mode = bool(getattr(args, "json_progress", False))
+
+    def _st_progress(done: int, total: int, _st=st) -> None:
+        _st["done"] = done
+        _st["size"] = total or _st.get("size", 0)
+        _torrent_save_state(_st)
+
+    try:
+        _torrent_spawn_aria2(url, src, dest_dir, select, cfg,
+                              json_mode, on_progress=_st_progress)
+        st_path.unlink(missing_ok=True)
+        if json_mode:
+            print(json.dumps({"type": "done", "path": str(dest_dir),
+                              "size": total}), flush=True)
+        else:
+            print(_ok(f"{name} complete → {dest_dir}"))
+        return 0
+    except KeyboardInterrupt:
+        if json_mode:
+            print(json.dumps({"type": "paused"}), flush=True)
+        else:
+            print("\npaused - state saved; resume with: mgd resume", file=sys.stderr)
+        return 130
+    except (DownloadError, RuntimeError) as err:
+        if json_mode:
+            print(json.dumps({"type": "error", "message": str(err)}), flush=True)
+            return 1
+        print(_fail(str(err)), file=sys.stderr)
+        return 1
+
+
+def _resume_torrent(st: dict, st_path: pathlib.Path, json_mode: bool) -> int:
+    """Resume a paused torrent (aria2's .aria2 control files hold the
+    piece state; we re-run with the stored magnet/dir/selection)."""
+    cfg = _cfg()
+    url = st.get("url", "")
+    dest_dir = pathlib.Path(st.get("dir") or st.get("out_path") or ".")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    meta, src = _torrent_metadata(url, cfg, cfg.get("proxy"))
+    st["pid"] = os.getpid()
+    st["_path"] = st_path
+    _torrent_save_state(st)
+
+    def _st_progress(done: int, total: int, _st=st) -> None:
+        _st["done"] = done
+        _st["size"] = total or _st.get("size", 0)
+        _torrent_save_state(_st)
+
+    try:
+        _torrent_spawn_aria2(url, src, dest_dir,
+                             st.get("select"), cfg, json_mode,
+                             on_progress=_st_progress)
+        st_path.unlink(missing_ok=True)
+        if json_mode:
+            print(json.dumps({"type": "done", "path": str(dest_dir),
+                              "size": st.get("size", 0)}), flush=True)
+        return 0
+    except KeyboardInterrupt:
+        if json_mode:
+            print(json.dumps({"type": "paused"}), flush=True)
+        return 130
+
+
+def cmd_torrent_info(args) -> int:
+    """JSON manifest for a magnet/torrent: {name, hash, files:[{index,
+    path, size, video}]}. Drives the GUI's torrent file-picker sheet."""
+    out = {"name": None, "hash": None, "files": [], "error": None}
+    try:
+        meta, _ = _torrent_metadata(args.url, _cfg(), args.proxy)
+        out["name"] = _torrent_mod.torrent_name(meta)
+        try:
+            out["hash"] = _torrent_mod.info_hash(meta)
+        except Exception:
+            h = _torrent_mod.magnet_info_hash(args.url)
+            out["hash"] = h if h else None
+        out["files"] = _torrent_mod.torrent_files(meta)
+    except Exception as err:
+        out["error"] = f"{type(err).__name__}: {err}"
+        print(json.dumps(out))
+        return 1
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_stream(args) -> int:
+    """Stream a torrent's video sequentially while it downloads
+    (webtorrent-cli + VLC/IINA)."""
+    url = args.url
+    if not _torrent_mod.is_torrent(url):
+        print("error: stream needs a magnet link or .torrent file", file=sys.stderr)
+        return 2
+    wt = shutil.which("webtorrent")
+    if not wt:
+        print("streaming needs webtorrent-cli (sequential download). "
+              "Install it with:\n  brew install webtorrent-cli", file=sys.stderr)
+        return 2
+    if pathlib.Path("/Applications/IINA.app").exists():
+        player = "iina"
+    elif pathlib.Path("/Applications/VLC.app").exists():
+        player = "vlc"
+    else:
+        print("no video player found - install VLC (brew install --cask vlc)",
+              file=sys.stderr)
+        return 2
+    print(_arrow(f"streaming {url[:70]}"))
+    print(_arrow(f"player: {player} — close the player when done watching"))
+    stream_dir = pathlib.Path("~/Downloads/mgd/torrent-stream").expanduser()
+    stream_dir.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run([wt, url, f"--{player}", "--keep-seeding"],
+                          cwd=stream_dir)
+    return proc.returncode
+
+
 def _speed_limit_arg(value) -> int | None:
     """--max-speed flag value -> bytes/s (None when unset)."""
     if not value:
@@ -1126,7 +1459,9 @@ def _journal_path() -> pathlib.Path:
 
 
 def _journal_record(out_path: pathlib.Path) -> None:
-    """Remember where downloads live so list/pause/resume can find them."""
+    """Remember where downloads live so list/pause/resume can find them.
+    Accepts either the output file path or a state path directly (torrent
+    state files are handed over as-is)."""
     try:
         jp = _journal_path()
         jp.parent.mkdir(parents=True, exist_ok=True)
@@ -1136,7 +1471,10 @@ def _journal_record(out_path: pathlib.Path) -> None:
                 entries = json.loads(jp.read_text(encoding="utf-8"))
             except ValueError:
                 entries = []
-        sp = str(out_path.expanduser().parent / (out_path.name + STATE_SUFFIX))
+        if str(out_path).endswith(STATE_SUFFIX):
+            sp = str(out_path)
+        else:
+            sp = str(out_path.expanduser().parent / (out_path.name + STATE_SUFFIX))
         if sp not in entries:
             entries.append(sp)
             jp.write_text(json.dumps(entries[-500:]), encoding="utf-8")
@@ -1190,8 +1528,11 @@ def cmd_list(args) -> int:
                 st = json.loads(p.read_text(encoding="utf-8"))
             except (ValueError, OSError):
                 continue
-            done = sum(s.get("pos", 0) for s in st.get("segments", [])
-                       if s.get("pos", 0) != -2)
+            if st.get("kind") == TORRENT_STATE_KIND:
+                done = st.get("done", 0)
+            else:
+                done = sum(s.get("pos", 0) for s in st.get("segments", [])
+                           if s.get("pos", 0) != -2)
             items.append({"url": st.get("url"), "filename": st.get("filename"),
                           "out_path": st.get("out_path"), "size": st.get("size"),
                           "done": done, "state": "running" if _state_pid_alive(st) else "paused"})
@@ -1207,7 +1548,10 @@ def cmd_list(args) -> int:
             continue
         segs = st.get("segments", [])
         total = st.get("size")
-        done = sum(s.get("pos", 0) for s in segs if s.get("pos", 0) != -2)
+        if st.get("kind") == TORRENT_STATE_KIND:
+            done = st.get("done", 0)
+        else:
+            done = sum(s.get("pos", 0) for s in segs if s.get("pos", 0) != -2)
         pct = f"{done * 100 // total}%" if total else "?"
         status = "running" if _state_pid_alive(st) else "paused"
         print(f"  {i}. [{status}] {p.name[:-len(STATE_SUFFIX)]}")
@@ -1275,6 +1619,17 @@ def cmd_cancel(args) -> int:
     _kill_pid_of(st_path, st)
     time.sleep(0.4)
     removed = []
+    if st.get("kind") == TORRENT_STATE_KIND:
+        # remove only the recorded partial files + aria2 control files
+        d = pathlib.Path(st.get("dir") or st.get("out_path") or ".")
+        for f in st.get("files", []):
+            p = d / f.get("path", "")
+            for cand in (p, pathlib.Path(str(p) + ".aria2")):
+                try:
+                    cand.unlink(missing_ok=True)
+                    removed.append(cand.name)
+                except OSError:
+                    pass
     for suffix in (STATE_SUFFIX, PART_SUFFIX):
         part = st_path.with_name(st_path.name.replace(STATE_SUFFIX, suffix))
         if part.exists():
@@ -1307,8 +1662,14 @@ def cmd_doctor(_args) -> int:
         print(f"  impersonation {ok if targets > 0 else warn}  "
               f"{max(0, targets)} browser targets (Cloudflare-protected sites)")
     ff = shutil.which("ffmpeg")
-    print(f"  ffmpeg        {ok if ff else warn}  {ff or 'needed for MP3 conversion (' if True else ''}"
-          + ("" if ff else "brew install ffmpeg)"))
+    print(f"  ffmpeg        {ok if ff else warn}  {ff or 'install: brew install ffmpeg'}")
+    a2 = shutil.which("aria2c")
+    print(f"  aria2c        {ok if a2 else warn}  "
+          + (f"{a2} (torrents & magnets)" if a2 else "install: brew install aria2 (torrent support)"))
+    wt = shutil.which("webtorrent")
+    print(f"  webtorrent    {ok if wt else warn}  "
+          + (f"{wt} (torrent streaming)" if wt
+             else "install: brew install webtorrent-cli (torrent streaming)"))
     print(f"  cookie source {ok if cfg.get('cookies_browser') else warn}  "
           + (f"preferred: {cfg['cookies_browser']} (set with: mgd set-default cookies-browser chrome)"
              if cfg.get("cookies_browser") else "none chosen; auto-detect on first platform download"))
@@ -1709,6 +2070,8 @@ def cmd_resume(args) -> int:
         out_path = pathlib.Path(st.get("out_path") or "")
         if not out_path.name:
             out_path = st_path.parent / (st.get("filename") or "download")
+        if st.get("kind") == TORRENT_STATE_KIND:
+            return _resume_torrent(st, st_path, as_json)
         dl = Downloader(st.get("url", ""), out_path,
                         proxy=_cfg().get("proxy") or os.environ.get("HTTPS_PROXY"),
                         referer=st.get("referer"),
@@ -1779,6 +2142,8 @@ def main(argv=None) -> int:
         "page-media": cmd_page_media, "catalog": cmd_page_media,
         "native-host": cmd_native_host,
         "watch": cmd_watch, "clipboard-watch": cmd_watch,
+        "torrent-info": cmd_torrent_info, "torrent-files": cmd_torrent_info,
+        "stream": cmd_stream,
     }
     try:
         return handlers[args.cmd](args)
