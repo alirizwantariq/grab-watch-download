@@ -46,6 +46,10 @@ mgd page-media "erome.com/a/…"    # JSON catalog of every media item on a page
                                    # (url/title/quality/poster + probed sizes)
 mgd native-host                    # Chrome native-messaging host for the
                                    # MediaGrab extension (see chrome-extension/)
+mgd watch                         # clipboard monitor: copy any link anywhere
+                                   # and it auto-downloads (--all-types)
+mgd set-default speed-limit 2MB   # FDM-style global traffic limit (off to clear)
+mgd grab URL --max-speed 500KB    # per-download speed limit
 mgd jobs                           # [running]/[paused] + per-item actions
 mgd pause 1 / mgd resume 1 / mgd cancel 1
 mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)
