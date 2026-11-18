@@ -615,10 +615,31 @@ final class JobStore: ObservableObject {
         selectedExternalURLs.removeAll()
     }
 
-    func selectAll() {
+    /// Select everything currently visible (category + search filtered) —
+    /// the toolbar passes the same filtered lists the UI renders.
+    func selectAllVisible(jobs: [DownloadJob], externals: [ListEntry]) {
         for j in jobs { selectedJobs.insert(j.id) }
-        for e in pausedList { selectedExternalURLs.insert(e.url) }
-        for e in externalRunning { selectedExternalURLs.insert(e.url) }
+        for e in externals { selectedExternalURLs.insert(e.url) }
+    }
+
+    /// Drop selection ids whose rows no longer exist (individually removed,
+    /// cleared, or external downloads that finished and vanished) so the
+    /// toolbar never counts ghosts.
+    func pruneSelection() {
+        let jobIDs = Set(jobs.map(\.id))
+        selectedJobs.formIntersection(jobIDs)
+        let extURLs = Set(pausedList.map(\.url))
+            .union(Set(externalRunning.map(\.url)))
+        selectedExternalURLs.formIntersection(extURLs)
+    }
+
+    /// True when everything visible is already selected (drives the
+    /// Select All button's enabled state).
+    func allVisibleSelected(jobs: [DownloadJob], externals: [ListEntry]) -> Bool {
+        guard !jobs.isEmpty || !externals.isEmpty else { return false }
+        for j in jobs where !selectedJobs.contains(j.id) { return false }
+        for e in externals where !selectedExternalURLs.contains(e.url) { return false }
+        return true
     }
 
     /// External cancel that re-resolves the fresh index by url (the list
@@ -775,6 +796,7 @@ final class JobStore: ObservableObject {
 
     func remove(_ job: DownloadJob) {
         jobs.removeAll { $0.id == job.id }
+        selectedJobs.remove(job.id)   // never leave a ghost selection
         saveHistory()
     }
 
@@ -852,6 +874,7 @@ final class JobStore: ObservableObject {
         jobs.removeAll { $0.phase == .done || $0.phase == .failed || $0.phase == .cancelled }
         statusFooter = "cleared completed downloads"
         saveHistory()
+        pruneSelection()
     }
 
     func refreshPaused() {
@@ -885,6 +908,7 @@ final class JobStore: ObservableObject {
                     self.promoteFinishedExternal(vanished: vanished)
                 }
                 self.updateDockBadge()
+                self.pruneSelection()   // external rows may have vanished
             }
         }
     }
@@ -1618,6 +1642,30 @@ struct ContentView: View {
             }
             ToolbarItem {
                 Button {
+                    store.selectAllVisible(jobs: visibleJobsAll,
+                                            externals: visibleExternalAll)
+                    store.statusFooter =
+                        "selected \(store.selectionCount) item"
+                        + (store.selectionCount == 1 ? "" : "s")
+                } label: {
+                    Label("Select All", systemImage: "checkmark.circle")
+                }
+                .disabled(visibleJobsAll.isEmpty && visibleExternalAll.isEmpty
+                          || store.allVisibleSelected(jobs: visibleJobsAll,
+                                                      externals: visibleExternalAll))
+                .help("Select every download visible under the current category and search filter")
+            }
+            ToolbarItem {
+                Button {
+                    store.clearSelection()
+                } label: {
+                    Label("Clear All", systemImage: "xmark.circle")
+                }
+                .disabled(store.selectionCount == 0)
+                .help("Clear the selection (keeps the rows and their files)")
+            }
+            ToolbarItem {
+                Button {
                     store.removeSelected()
                 } label: {
                     Label(store.selectionCount > 0
@@ -1863,26 +1911,51 @@ struct ContentView: View {
         .help("Where the next downloads are saved (only for downloads started from this window)")
     }
 
-    // MARK: jobs
+    // MARK: visible lists (category + search filtered; shared by the rows
+    // and the Select All toolbar so they can never disagree)
 
-    private var jobsArea: some View {
-        let active = store.jobs.filter {
+    private var visibleActive: [DownloadJob] {
+        store.jobs.filter {
             ($0.phase == .queued || $0.phase == .running || $0.phase == .paused)
                 && matchesCategory($0) && matchesSearch($0)
         }
-        let finished = store.jobs.filter {
+    }
+
+    private var visibleFinished: [DownloadJob] {
+        store.jobs.filter {
             ($0.phase == .done || $0.phase == .failed || $0.phase == .cancelled)
                 && matchesCategory($0) && matchesSearch($0)
         }
-        let pausedExternal = store.pausedList.filter {
-            matchesCategory($0) && matchesSearch($0)
-        }
-        let runningExternal = store.externalRunning.filter {
+    }
+
+    private var visiblePausedExternal: [ListEntry] {
+        store.pausedList.filter { matchesCategory($0) && matchesSearch($0) }
+    }
+
+    private var visibleRunningExternal: [ListEntry] {
+        store.externalRunning.filter {
             (session.category == "All"
                 || MediaGrabCategory.category(forPath: $0.outPath.isEmpty
                     ? $0.filename : $0.outPath) == session.category)
                 && matchesSearch($0)
         }
+    }
+
+    private var visibleJobsAll: [DownloadJob] {
+        visibleActive + visibleFinished
+    }
+
+    private var visibleExternalAll: [ListEntry] {
+        visibleRunningExternal + visiblePausedExternal
+    }
+
+    // MARK: jobs
+
+    private var jobsArea: some View {
+        let active = visibleActive
+        let finished = visibleFinished
+        let pausedExternal = visiblePausedExternal
+        let runningExternal = visibleRunningExternal
         return Group {
             if active.isEmpty && finished.isEmpty && pausedExternal.isEmpty
                     && runningExternal.isEmpty {
