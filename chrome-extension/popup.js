@@ -178,4 +178,34 @@ $("all").onchange = e => {
 $("download").onclick = downloadSelected;
 $("openApp").onclick = async () => { await native({ command: "open" }); };
 
-checkHost().then(scan);
+// ── interception toggle (FDM-style "take over downloads") + active info ──
+
+chrome.storage.sync.get({ intercept: false }, ({ intercept }) => {
+  $("intercept").checked = !!intercept;
+});
+$("intercept").onchange = async e => {
+  const on = e.target.checked;
+  await native({ command: "watch", on });
+  $("hostStatus").textContent = on
+    ? "browser downloads now go to MediaGrab"
+    : "download interception off";
+};
+
+async function loadActiveInfo() {
+  if (!hostOk) return;
+  const resp = await native({ command: "query" }).catch(() => null);
+  if (!resp || !resp.ok) return;
+  const items = resp.items || [];
+  const running = items.filter(i => i.state === "running");
+  if (running.length) {
+    const done = running.reduce((a, i) => a + (i.done || 0), 0);
+    const size = running.reduce((a, i) => a + (i.size || 0), 0);
+    const pct = size ? Math.round(done * 100 / size) : 0;
+    $("activeInfo").textContent =
+      `⇣ ${running.length} active · ${pct}% overall`;
+  } else if (items.length) {
+    $("activeInfo").textContent = `${items.length} paused in mgd`;
+  }
+}
+
+checkHost().then(scan).then(loadActiveInfo);

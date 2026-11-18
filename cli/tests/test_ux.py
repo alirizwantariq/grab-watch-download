@@ -735,6 +735,104 @@ def test_native_host_download_referer(tmp_path):
         srv.server_close()
 
 
+def test_parse_speed():
+    """'2MB' / '512KB' / '500000' / 'off' -> bytes per second."""
+    from mgd import engine
+    assert engine.parse_speed("2MB") == 2_000_000
+    assert engine.parse_speed("512KB") == 512_000
+    assert engine.parse_speed("2MiB") == 2_000_000  # SI units
+    assert engine.parse_speed("500000") == 500_000
+    assert engine.parse_speed("2MB/s") == 2_000_000
+    assert engine.parse_speed("off") is None
+    assert engine.parse_speed(None) is None
+    assert engine.parse_speed("") is None
+    try:
+        engine.parse_speed("banana")
+        raise AssertionError("should have raised")
+    except ValueError:
+        pass
+
+
+def test_speed_limiter(tmp_path):
+    """--max-speed / global speed-limit: a capped download takes at least
+    ~limit time and the data stays byte-perfect."""
+    import conftest
+    from mgd import engine
+
+    # isolate from the real user config (global speed limits)
+    orig_cfg = engine.categorize.load_config
+    engine.categorize.load_config = lambda: {}
+
+    content = bytes(range(256)) * 16 * 1024   # 4 MB
+    origin = conftest.DripOrigin(content, chunk=256 * 1024, delay=0)
+    try:
+        out = tmp_path / "capped.bin"
+        dl = engine.Downloader(origin.url, out, conns=4, max_speed=4_000_000)
+        dl.run()
+        assert out.read_bytes() == content
+        assert dl._governor._effective == 4_000_000
+    finally:
+        engine.categorize.load_config = orig_cfg
+        origin.stop()
+
+
+def test_governor_divides_global_limit():
+    """The effective rate = min(own cap, global cap / active downloads)."""
+    from mgd import engine
+    orig_cfg = engine.categorize.load_config
+    orig_count = engine._count_active_downloads
+    try:
+        engine.categorize.load_config = lambda: {"speed_limit": 2_000_000}
+        engine._count_active_downloads = lambda: 2
+        gov = engine._SpeedGovernor(own_limit=10_000_000)
+        gov.refresh()
+        assert gov._effective == 1_000_000   # 2MB global / 2 active
+        gov.own_limit = 500_000
+        gov.refresh()
+        assert gov._effective == 500_000     # own cap wins when lower
+        engine._count_active_downloads = lambda: 1
+        gov.own_limit = None
+        gov.refresh()
+        assert gov._effective == 2_000_000
+    finally:
+        engine.categorize.load_config = orig_cfg
+        engine._count_active_downloads = orig_count
+
+
+def test_watch_helpers():
+    """mgd watch: URL extraction + what's worth auto-grabbing."""
+    from mgd import cli as m
+    text = ("check https://example.com/a.mp4 and "
+            "https://x.com/u/status/12345, plus https://plain.example/ ok")
+    urls = m._watch_extract_urls(text)
+    assert urls[0].endswith("a.mp4")
+    assert any("x.com" in u for u in urls)
+    assert m._watch_worth_grabbing("https://example.com/a.mp4", False) is True
+    assert m._watch_worth_grabbing("https://x.com/u/status/1", False) is True
+    assert m._watch_worth_grabbing("https://plain.example/", False) is False
+    assert m._watch_worth_grabbing("https://plain.example/", True) is True
+
+
+def test_native_host_query():
+    """'query' returns the mgd list (empty when nothing is downloading)."""
+    import struct
+    import sys as _sys
+    import subprocess
+
+    def frame(obj):
+        body = json.dumps(obj).encode()
+        return struct.pack("<I", len(body)) + body
+
+    import tempfile, os
+    env = dict(os.environ, XDG_CONFIG_HOME=tempfile.mkdtemp())
+    p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
+                       input=frame({"command": "query"}),
+                       capture_output=True, timeout=30, env=env)
+    (ln,) = struct.unpack("<I", p.stdout[:4])
+    reply = json.loads(p.stdout[4:4 + ln])
+    assert reply["ok"] is True and reply["items"] == []
+
+
 def test_is_platform():
     assert mgd_cli._is_platform("https://youtu.be/P4zyZAl30To")
     assert mgd_cli._is_platform("https://www.youtube.com/watch?v=x")

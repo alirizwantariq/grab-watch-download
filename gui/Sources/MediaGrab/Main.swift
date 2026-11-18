@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import UserNotifications
 import UniformTypeIdentifiers
 
 // MARK: - mgd process plumbing
@@ -400,6 +401,25 @@ final class JobStore: ObservableObject {
         loadHistory()
     }
 
+    // MARK: feedback (notifications + dock badge)
+
+    func notify(_ title: String, _ body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: UUID().uuidString,
+                                        content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    /// Dock icon badge with the number of active downloads (FDM-like).
+    func updateDockBadge() {
+        let running = jobs.filter { $0.phase == .running || $0.phase == .queued }.count
+            + externalRunning.count
+        NSApp.dockTile.badgeLabel = running > 0 ? String(running) : nil
+    }
+
     // MARK: persistence (the download list survives reboots, like FDM)
 
     static var historyURL: URL {
@@ -487,6 +507,16 @@ final class JobStore: ObservableObject {
             self.refreshPaused()
             self.statusFooter = "\(job.title): \(job.phase.rawValue)"
             self.saveHistory()
+            self.updateDockBadge()
+            switch job.phase {
+            case .done:
+                self.notify("Download complete",
+                            (job.finishedPath as NSString?)?.lastPathComponent ?? job.title)
+            case .failed:
+                self.notify("Download failed", job.title)
+            default:
+                break
+            }
         })
     }
 
@@ -603,6 +633,7 @@ final class JobStore: ObservableObject {
                 job.finishedAt = Date()
                 jobs.insert(job, at: 0)
                 statusFooter = "finished: \((path as NSString).lastPathComponent)"
+                notify("Download complete", (path as NSString).lastPathComponent)
             }
             seenExternal.removeValue(forKey: gone.url)
             externalSpeeds.removeValue(forKey: gone.url)
@@ -746,6 +777,7 @@ final class JobStore: ObservableObject {
                 if !vanished.isEmpty {
                     self.promoteFinishedExternal(vanished: vanished)
                 }
+                self.updateDockBadge()
             }
         }
     }
@@ -768,6 +800,12 @@ struct MediaGrabApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // FDM-style desktop notifications on completion (asks once)
+        UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .sound]) { _, _ in }
     }
 }
 
@@ -1134,6 +1172,11 @@ struct FinishedJobRow: View {
                 .help("Actions")
             }
         )
+        .onTapGesture(count: 2) {
+            if job.phase == .done {
+                onOpen()
+            }
+        }
         .contextMenu {
             Button("Show in Finder", action: onReveal)
             Button("Open file", action: onOpen)
@@ -1240,6 +1283,10 @@ final class Session: ObservableObject {
     @Published var dropActive = false
     /// drives the folder picker (fileImporter)
     @Published var pickingFolder = false
+    /// FDM-style list filter
+    @Published var searchText = ""
+    /// global speed limit choice (mirror of mgd config speed_limit)
+    @Published var speedLimit: String = "off"
 }
 
 // MARK: - batch (multi-video page) model
@@ -1395,6 +1442,28 @@ struct ContentView: View {
             }
             ToolbarItem {
                 Menu {
+                    ForEach(["off", "10MB", "5MB", "2MB", "1MB", "500KB"],
+                            id: \.self) { v in
+                        Button {
+                            setSpeedLimit(v)
+                        } label: {
+                            if session.speedLimit == v {
+                                Label(v == "off" ? "No limit" : "\(v)/s",
+                                      systemImage: "checkmark")
+                            } else {
+                                Text(v == "off" ? "No limit" : "\(v)/s")
+                            }
+                        }
+                    }
+                } label: {
+                    Label(session.speedLimit == "off"
+                          ? "Speed: unlimited" : "Speed: \(session.speedLimit)/s",
+                          systemImage: "speedometer")
+                }
+                .help("Global speed limit shared by every running download (mgd set-default speed-limit). New downloads and running ones (within ~5s) obey it.")
+            }
+            ToolbarItem {
+                Menu {
                     Button("mgd doctor") {
                         Task { store.statusFooter = await MGDPaths.run(["doctor"]) }
                     }
@@ -1473,6 +1542,27 @@ struct ContentView: View {
             || MediaGrabCategory.category(forPath: entry.filename) == session.category
     }
 
+    // MARK: search filter
+
+    private var searchQuery: String {
+        session.searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func matchesSearch(_ job: DownloadJob) -> Bool {
+        let q = searchQuery
+        guard !q.isEmpty else { return true }
+        return job.title.lowercased().contains(q)
+            || job.url.lowercased().contains(q)
+            || (job.finishedPath ?? "").lowercased().contains(q)
+    }
+
+    private func matchesSearch(_ entry: ListEntry) -> Bool {
+        let q = searchQuery
+        guard !q.isEmpty else { return true }
+        return entry.filename.lowercased().contains(q)
+            || entry.url.lowercased().contains(q)
+    }
+
     // MARK: header
 
     private var header: some View {
@@ -1506,6 +1596,23 @@ struct ContentView: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(session.urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                           || session.probing)
+            }
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(.secondary).font(.caption)
+                TextField("Filter downloads by name or URL", text: $session.searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                if !session.searchText.isEmpty {
+                    Button {
+                        session.searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Clear the filter")
+                }
+                Spacer()
             }
             Text("Multi-video pages (albums, galleries) open a picker with previews, "
                  + "sizes and quality options. Pausing works from any terminal.")
@@ -1553,17 +1660,20 @@ struct ContentView: View {
     private var jobsArea: some View {
         let active = store.jobs.filter {
             ($0.phase == .queued || $0.phase == .running || $0.phase == .paused)
-                && matchesCategory($0)
+                && matchesCategory($0) && matchesSearch($0)
         }
         let finished = store.jobs.filter {
             ($0.phase == .done || $0.phase == .failed || $0.phase == .cancelled)
-                && matchesCategory($0)
+                && matchesCategory($0) && matchesSearch($0)
         }
-        let pausedExternal = store.pausedList.filter { matchesCategory($0) }
+        let pausedExternal = store.pausedList.filter {
+            matchesCategory($0) && matchesSearch($0)
+        }
         let runningExternal = store.externalRunning.filter {
-            session.category == "All"
+            (session.category == "All"
                 || MediaGrabCategory.category(forPath: $0.outPath.isEmpty
-                    ? $0.filename : $0.outPath) == session.category
+                    ? $0.filename : $0.outPath) == session.category)
+                && matchesSearch($0)
         }
         return Group {
             if active.isEmpty && finished.isEmpty && pausedExternal.isEmpty
@@ -1699,6 +1809,15 @@ struct ContentView: View {
         for e in store.pausedList {
             store.resumeExternal(entry: e)
         }
+    }
+
+    /// FDM-style global traffic limit (shared across all mgd downloads).
+    private func setSpeedLimit(_ v: String) {
+        session.speedLimit = v
+        Task { _ = await MGDPaths.run(["set-default", "speed-limit", v]) }
+        store.statusFooter = v == "off"
+            ? "global speed limit off"
+            : "global speed limit: \(v)/s (running downloads adjust within ~5s)"
     }
 
     // MARK: grab flow

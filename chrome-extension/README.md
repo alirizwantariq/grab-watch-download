@@ -25,6 +25,14 @@ resumable, optimal-speed).
   nothing is downloaded during the scan).
 - **Hands the selected batch to mgd**, which downloads each file with its
   segmented engine — same behavior as the CLI and the MediaGrab app.
+- **Right-click menu**: "Download link with MediaGrab" on any link, video,
+  audio or image element — goes straight to mgd with the page as referer.
+- **Optional download interception** (FDM-style "take over downloads"):
+  flip the "intercept browser downloads" toggle in the popup and the
+  browser's own downloads are cancelled and re-routed to mgd instead
+  (small files and web resources are skipped automatically).
+- **Active downloads readout**: the popup shows how many downloads are
+  currently running in mgd and the overall completion percentage.
 
 ## Install (one time)
 

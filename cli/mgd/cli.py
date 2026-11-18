@@ -60,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Referer header for the media requests (some CDNs "
                         "require the source page; set automatically when "
                         "grabbing via a scanned page)")
+    g.add_argument("--max-speed", default=None,
+                   help="per-download speed limit: 2MB, 512KB, 500000 (bytes/s); "
+                        "global default: mgd set-default speed-limit")
     g.add_argument("--cookies", default=None, help="Netscape cookie file for yt-dlp")
     g.add_argument("--cookies-from-browser", default=None,
                    help="browser to pull cookies from for yt-dlp: chrome, firefox, edge, safari, brave")
@@ -90,7 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("set-default",
                         help="set default dir for a category/root, or preferred cookie browser")
-    sp.add_argument("category", choices=["root", "cookies-browser", *categorize.CATEGORIES])
+    sp.add_argument("category", choices=["root", "cookies-browser",
+                                         "speed-limit", *categorize.CATEGORIES])
     sp.add_argument("value", help="path (or browser name for cookies-browser)")
 
     sub.add_parser("defaults", aliases=["config"], help="show defaults + config")
@@ -130,6 +134,15 @@ def build_parser() -> argparse.ArgumentParser:
     nh = sub.add_parser("native-host",
                         help="Chrome native-messaging host for the MediaGrab "
                              "extension (stdio protocol; run by Chrome)")
+    w = sub.add_parser("watch", aliases=["clipboard-watch"],
+                       help="watch the clipboard and auto-download any link "
+                            "you copy (macOS)")
+    w.add_argument("--all-types", action="store_true",
+                   help="grab any copied http(s) URL, not just media/platform links")
+    w.add_argument("--interval", type=float, default=1.5,
+                   help="pasteboard poll interval in seconds")
+    w.add_argument("-d", "--dir", default=None,
+                   help="destination directory for clipboard downloads")
     return ap
 
 
@@ -840,6 +853,7 @@ def cmd_grab(args) -> int:
         dl = Downloader(url_i, out_path, proxy=args.proxy, conns=conns,
                         retries=retries, stopper=stopper,
                         timeout=DEFAULT_TIMEOUT,
+                        max_speed=_speed_limit_arg(getattr(args, "max_speed", None)),
                         referer=(getattr(args, "referer", None)
                                  or (args.url if page_links is not None else None)),
                         mirror_hosts=_mirror_hosts_for(url_i) or
@@ -930,6 +944,19 @@ MIRROR_HOSTS = {
 }
 
 
+def _speed_limit_arg(value) -> int | None:
+    """--max-speed flag value -> bytes/s (None when unset)."""
+    if not value:
+        return None
+    from .engine import parse_speed
+    try:
+        return parse_speed(value)
+    except ValueError as err:
+        print(f"warning: {err}; continuing without the per-download limit",
+              file=sys.stderr)
+        return None
+
+
 def _mirror_hosts_for(url: str) -> list[str]:
     for site, hosts in MIRROR_HOSTS.items():
         if site in url:
@@ -1017,10 +1044,25 @@ def cmd_set_default(args) -> int:
         cfg["cookies_browser"] = name
         print(f"saved: preferred yt-dlp cookie browser -> {name} "
               "(yt-dlp supports: brave, chrome, chromium, edge, firefox, opera, safari, vivaldi, whale)")
+    elif args.category in ("speed-limit", "speed_limit"):
+        from .engine import parse_speed
+        try:
+            limit = parse_speed(args.value)
+        except ValueError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        if limit:
+            cfg["speed_limit"] = limit
+            print(f"saved: global speed limit -> {args.value} "
+                  f"({limit} B/s, shared by every running download; "
+                  "applies to new downloads and within ~5s to running ones)")
+        else:
+            cfg.pop("speed_limit", None)
+            print("saved: global speed limit -> off")
     else:
         cfg.setdefault("defaults", {})[args.category] = args.value
     categorize.save_config(cfg)
-    if args.category != "cookies-browser":
+    if args.category != "cookies-browser" and args.category != "speed-limit":
         print(f"saved: {args.category} -> {args.value}")
     return 0
 
@@ -1029,6 +1071,10 @@ def cmd_defaults(_args) -> int:
     cfg = _cfg()
     root = categorize.default_root(cfg)
     print(f"root: {root}")
+    limit = cfg.get("speed_limit")
+    print(f"speed limit: "
+          + (f"{limit} B/s ({round(limit / 1_000_000, 2)} MB/s)" if limit
+             else "off"))
     for cat in categorize.CATEGORIES:
         v = cfg.get("defaults", {}).get(cat, "")
         print(f"  {cat:<10} {v if v else '-'}")
@@ -1408,6 +1454,24 @@ def cmd_native_host(_args) -> int:
                     pass
             write_message({"ok": True, "spawned": spawned})
             continue
+        if command == "query":
+            states = _find_states()
+            items = []
+            for st_path in states:
+                try:
+                    st = json.loads(st_path.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    continue
+                done = sum(s.get("pos", 0) for s in st.get("segments", [])
+                            if s.get("pos", 0) != -2)
+                items.append({"url": st.get("url"),
+                              "filename": st.get("filename"),
+                              "out_path": st.get("out_path"),
+                              "size": st.get("size"), "done": done,
+                              "state": "running" if _state_pid_alive(st)
+                              else "paused"})
+            write_message({"ok": True, "items": items[:64]})
+            continue
         if command == "open":
             try:
                 subprocess.Popen(["/usr/bin/open", "-a", "MediaGrab"],
@@ -1419,6 +1483,76 @@ def cmd_native_host(_args) -> int:
                 write_message({"ok": False, "error": str(err)})
             continue
         write_message({"ok": False, "error": f"unknown command {command!r}"})
+
+
+_URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
+
+
+def _watch_extract_urls(text: str) -> list[str]:
+    """URLs worth downloading from a piece of text (clipboard)."""
+    out, seen = [], set()
+    for m in _URL_RE.finditer(text or ""):
+        u = m.group(0).rstrip(".,;:!?")
+        if u not in seen and len(u) > 12:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _watch_worth_grabbing(url: str, all_types: bool) -> bool:
+    """Direct media files and platform pages are grabbed by default; with
+    --all-types any http(s) URL is."""
+    if all_types:
+        return True
+    from mgd.grab import VIDEO_EXTS, AUDIO_EXTS, DOWNLOADABLE_EXTS
+    if any(p.search(url) for p in (VIDEO_EXTS, AUDIO_EXTS, DOWNLOADABLE_EXTS)):
+        return True
+    return bool(PLATFORM_RE.match(url) or X_RE.match(url))
+
+
+def cmd_watch(args) -> int:
+    """FDM-style clipboard monitor: watch the pasteboard and auto-download
+    any link you copy (media files, platform URLs; --all-types for anything).
+
+    macOS only (uses pbpaste). Ctrl+C to stop."""
+    if sys.platform != "darwin":
+        print("error: mgd watch currently supports macOS (pbpaste)",
+              file=sys.stderr)
+        return 2
+    interval = max(0.5, args.interval)
+    seen: set[str] = set()
+    print(f"watching the clipboard every {interval}s — copy a link and it "
+          "downloads. Ctrl+C to stop.")
+    print(_arrow("press Cmd+C on any URL in any app"))
+    while True:
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nbye")
+            return 0
+        try:
+            out = subprocess.run(["pbpaste"], capture_output=True,
+                                 timeout=5).stdout.decode("utf-8", "replace")
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for url in _watch_extract_urls(out):
+            if url in seen or not _watch_worth_grabbing(url, args.all_types):
+                continue
+            seen.add(url)
+            print(_arrow(f"clipboard -> downloading {url}"))
+            cmd = [sys.executable,
+                   str(pathlib.Path(__file__).resolve().parent.parent
+                       / "bin" / "mgd"), "grab", url]
+            if args.dir:
+                cmd += ["-d", args.dir]
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+                print(_arrow(f"clipboard -> downloading {url}"))
+            except OSError as err:
+                print(f"error: could not start download: {err}", file=sys.stderr)
 
 
 def cmd_qualities(args) -> int:
@@ -1594,6 +1728,7 @@ def main(argv=None) -> int:
         "qualities": cmd_qualities, "formats": cmd_qualities,
         "page-media": cmd_page_media, "catalog": cmd_page_media,
         "native-host": cmd_native_host,
+        "watch": cmd_watch, "clipboard-watch": cmd_watch,
     }
     try:
         return handlers[args.cmd](args)

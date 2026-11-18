@@ -31,11 +31,12 @@ import json
 import os
 import pathlib
 import random
+import re
 import threading
 import time
 import urllib.parse as u
 
-from . import net
+from . import categorize, net
 from .net import HttpError
 
 CHUNK = 256 * 1024
@@ -50,6 +51,133 @@ RETRY_BACKOFF_BASE = 0.5
 RETRY_BACKOFF_CAP = 30.0
 DEFAULT_HEADERS = {"Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
 RETRYABLE_STATUS = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def parse_speed(value) -> int | None:
+    """'2MB' / '512KB' / '500000' -> bytes per second (None when unset).
+    Raises ValueError on garbage."""
+    if value in (None, "", "off", "none", "0"):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().upper().replace(" ", "")
+    m = re.match(r"^([\d.]+)\s*([KMGT])?(?:I?B)?(?:/S)?$", text)
+    if not m:
+        raise ValueError(f"bad speed limit: {value!r} (use e.g. 2MB, 512KB, off)")
+    num = float(m.group(1))
+    mult = {"": 1, "K": 1000, "M": 1_000_000, "G": 1_000_000_000,
+            "T": 1_000_000_000_000}[m.group(2) or ""]
+    if num <= 0:
+        return None
+    return int(num * mult)
+
+
+def _journal_dirs() -> list[pathlib.Path]:
+    """Dirs where download state files live (mirror of cli._find_states)."""
+    try:
+        cfg = categorize.load_config()
+    except Exception:
+        cfg = {}
+    dirs = [categorize.default_root(cfg)]
+    for v in (cfg.get("defaults") or {}).values():
+        if v:
+            dirs.append(pathlib.Path(os.path.expanduser(str(v))))
+    try:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(pathlib.Path.home() / ".config")
+        journal = pathlib.Path(base) / "mgd" / "journal.json"
+        entries = json.loads(journal.read_text(encoding="utf-8"))
+        for line in entries:
+            p = pathlib.Path(str(line))
+            if p.exists():
+                dirs.append(p.parent)
+    except (ValueError, OSError):
+        pass
+    return dirs
+
+
+def _count_active_downloads() -> int:
+    """Live mgd downloads (state files whose pid is alive), including self
+    (self has usually written its state by the time throttling matters)."""
+    count = 0
+    pids = set()
+    for d in _journal_dirs():
+        if not d.exists():
+            continue
+        for st_path in d.glob(f"**/*{STATE_SUFFIX}"):
+            try:
+                st = json.loads(st_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            pid = st.get("pid")
+            if not pid:
+                continue
+            pid = int(pid)
+            if pid in pids:
+                continue
+            try:
+                os.kill(pid, 0)
+                pids.add(pid)
+            except (ProcessLookupError, PermissionError, TypeError, ValueError):
+                continue
+    return max(1, len(pids))
+
+
+class _SpeedGovernor:
+    """Token-bucket throttle shared by all worker threads of a download.
+
+    The effective rate is min(own cap, global cap / active downloads):
+    - own cap: Downloader(max_speed=…) or the grab --max-speed flag
+    - global cap: config 'speed_limit' (mgd set-default speed-limit 2MB),
+      shared across every running mgd process - each divides it by the
+      number of active downloads, approximating an FDM-style global
+      traffic limit without inter-process coordination.
+    Re-checked every 5 seconds so limits apply mid-download."""
+
+    RECHECK = 5.0
+
+    def __init__(self, own_limit: int | None):
+        self.own_limit = own_limit
+        self._effective: int | None = None
+        self._checked_at = 0.0
+        self._lock = threading.Lock()
+        self._tokens = 0.0
+        self._last = time.monotonic()
+
+    def refresh(self) -> None:
+        global_limit = None
+        try:
+            cfg = categorize.load_config()
+            global_limit = parse_speed(cfg.get("speed_limit"))
+        except Exception:
+            global_limit = None
+        eff = None
+        if self.own_limit:
+            eff = self.own_limit
+        if global_limit:
+            share = global_limit / max(1, _count_active_downloads())
+            eff = share if eff is None else min(eff, share)
+        self._effective = eff
+
+    def wait(self, nbytes: int) -> None:
+        """Block until `nbytes` may be transferred under the current rate."""
+        now = time.monotonic()
+        if now - self._checked_at > self.RECHECK:
+            self._checked_at = now
+            self.refresh()
+        limit = self._effective
+        if not limit or limit <= 0:
+            return
+        with self._lock:
+            self._tokens = min(self._tokens + (now - self._last) * limit,
+                               limit * 2)   # allow a 2s burst
+            self._last = now
+            if self._tokens < nbytes:
+                deficit = nbytes - self._tokens
+                self._tokens = 0.0
+                time.sleep(min(deficit / limit, 10.0))   # cap a single sleep
+                self._last = time.monotonic()
+                return
+            self._tokens -= nbytes
 
 
 class DownloadError(Exception):
@@ -191,7 +319,8 @@ class Downloader:
                  expected_sha256: str | None = None, resume_state: bytes | None = None,
                  timeout: float = net.DEFAULT_TIMEOUT,
                  referer: str | None = None,
-                 mirror_hosts: list[str] | None = None):
+                 mirror_hosts: list[str] | None = None,
+                 max_speed: int | None = None):
         self.url = url
         self.out_path = pathlib.Path(out_path).expanduser()
         self.proxy = proxy
@@ -206,6 +335,8 @@ class Downloader:
         self.referer = referer
         # backup cdn mirror hostnames for the site (see _probe_with_retries)
         self.mirror_hosts = list(mirror_hosts or [])
+        # traffic shaping (mgd set-default speed-limit / --max-speed)
+        self._governor = _SpeedGovernor(own_limit=max_speed)
 
         self._seg_lock = threading.Lock()
         self._segments: list[Segment] = []
@@ -568,6 +699,7 @@ class Downloader:
                 if len(chunk) > room:
                     chunk = chunk[:room]  # rest of this response belongs to the stealer
             self._write(seg, chunk)
+            self._governor.wait(len(chunk))   # traffic shaping
             if seg.end >= 0 and seg.pos >= seg.span():
                 return
             if self._save_due():
