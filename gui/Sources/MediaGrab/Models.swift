@@ -26,6 +26,12 @@ final class DownloadJob: ObservableObject, Identifiable {
     @Published var errorMessage: String?
     /// what kind of failure: "link_expired" / "link_mismatch" offer Update Link
     @Published var errorKind: String?
+    /// making the finished file play smoothly on a Mac (engine "convert" events)
+    @Published var converting = false
+    @Published var convertProgress: Double = 0
+    var convertAction: String?
+    var convertReasons: [String] = []
+    var convertStarted: Date?
 
     /// the engine's stable id for this download (`mgd pause|resume|cancel
     /// <id>`); nil for yt-dlp-backed downloads, which have no state file
@@ -116,7 +122,9 @@ final class DownloadJob: ObservableObject, Identifiable {
             case "progress":
                 let newDone = (obj["done"] as? NSNumber)?.int64Value ?? done
                 let newTotal = (obj["total"] as? NSNumber)?.int64Value ?? total
-                if newTotal > 0 { total = newTotal }
+                // a total smaller than what already arrived is no total
+                // (older engines reported a stream playlist's ~1 KB size)
+                total = newTotal >= newDone ? newTotal : 0
                 setProgress(newDone)
             case "start":
                 phase = .running
@@ -141,6 +149,8 @@ final class DownloadJob: ObservableObject, Identifiable {
                 appendLog("✗ \(message)")
             case "note":
                 if let message = obj["message"] as? String { appendLog("• \(message)") }
+            case "convert":
+                ingestConvert(obj)
             case "paused":
                 phase = .paused
             default:
@@ -163,6 +173,58 @@ final class DownloadJob: ObservableObject, Identifiable {
             if !message.isEmpty, errorMessage == nil { errorMessage = message }
         }
         appendLog(line)
+    }
+
+    private func ingestConvert(_ obj: [String: Any]) {
+        if let fraction = (obj["progress"] as? NSNumber)?.doubleValue {
+            convertProgress = max(convertProgress, min(1, fraction))
+            return
+        }
+        switch obj["stage"] as? String {
+        case "start":
+            converting = true
+            convertProgress = 0
+            convertStarted = Date()
+            convertAction = obj["action"] as? String
+            convertReasons = obj["reasons"] as? [String] ?? []
+            appendLog("• making it play smoothly on a Mac: " + convertReasons.joined(separator: "; "))
+        case "done":
+            converting = false
+            convertProgress = 1
+            if let path = obj["path"] as? String {
+                // a row named after its file follows the new name (clip.webm
+                // -> clip.mp4); a name the user typed stays as it is
+                let before = (outPath ?? finishedPath).map { ($0 as NSString).lastPathComponent }
+                if let before, title == before { title = (path as NSString).lastPathComponent }
+                finishedPath = path
+                outPath = path
+            }
+            appendLog("• Mac-ready")
+        case "failed":
+            converting = false
+            appendLog("✗ could not convert (\(obj["message"] as? String ?? "error")) - kept the file as downloaded")
+        case "stopped":
+            converting = false
+            appendLog("• conversion skipped - kept the file as downloaded")
+        default:
+            break
+        }
+    }
+
+    /// What the conversion is doing, for the row.
+    var convertSummary: String {
+        switch convertAction {
+        case "remux": return "rewrapping for QuickTime (no quality loss)"
+        case "audio": return "converting the audio"
+        default: return "re-encoding with the Mac's hardware encoder"
+        }
+    }
+
+    var convertETA: String {
+        guard let start = convertStarted, convertProgress > 0.03, convertProgress < 1 else { return "" }
+        let elapsed = Date().timeIntervalSince(start)
+        let left = elapsed * (1 - convertProgress) / convertProgress
+        return left.isFinite && left < 60 * 60 * 6 ? fmtDuration(left) + " left" : ""
     }
 
     /// Progress update (pipe events and `mgd list` polls) + speed estimate.

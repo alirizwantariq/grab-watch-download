@@ -434,6 +434,10 @@ final class JobStore: ObservableObject {
 
     func pause(_ job: DownloadJob) {
         job.retryAt = nil
+        if job.converting, let process = job.process, process.isRunning {
+            process.terminate()            // the engine keeps the file as downloaded
+            return
+        }
         switch job.phase {
         case .queued:
             job.phase = .paused
@@ -738,7 +742,9 @@ final class JobStore: ObservableObject {
         // is gone and whose file is complete on disk has finished, even if
         // the engine's last lines never reached us. Give the normal "done"
         // a few seconds to arrive first.
-        for job in jobs where job.process != nil && job.phase == .running && !job.isTorrent {
+        // (never while it is being converted: its file is complete then too)
+        for job in jobs where job.process != nil && job.phase == .running && !job.isTorrent
+            && !job.converting {
             let fm = FileManager.default
             guard let id = job.engineID, byID[id] == nil, let out = job.outPath,
                   let size = (try? fm.attributesOfItem(atPath: out)[.size] as? NSNumber)?.int64Value,
@@ -815,7 +821,74 @@ final class JobStore: ObservableObject {
 
     // MARK: engine settings
 
-    /// true while yt-dlp is being updated
+    /// engine's Mac-ready mode: convert | fix | off
+    @Published var macReadyMode = "convert"
+
+    func setMacReadyMode(_ mode: String) {
+        macReadyMode = mode
+        Task { _ = await Engine.run(["set-default", "mac-ready", mode]) }
+        flash(mode == "off" ? "Downloads are kept exactly as they arrive"
+              : mode == "fix" ? "Downloads get their format fixed, never re-encoded"
+              : "Downloads are converted when they would play choppy on this Mac")
+    }
+
+    func isVideoFile(_ job: DownloadJob) -> Bool {
+        guard let path = job.finishedPath, FileManager.default.fileExists(atPath: path) else { return false }
+        return MediaGrabCategory.category(forPath: path) == "Video"
+    }
+
+    /// Convert finished files that would not play smoothly (one at a time:
+    /// they share the Mac's media engine).
+    func makeMacReady(_ list: [DownloadJob]) {
+        let picked = list.filter { isVideoFile($0) && $0.phase == .done && $0.process == nil }
+        guard !picked.isEmpty else {
+            flash("Nothing to convert — pick finished video files")
+            return
+        }
+        conversionQueue.append(contentsOf: picked.filter { j in !conversionQueue.contains { $0 === j } })
+        runNextConversion()
+    }
+
+    private var conversionQueue: [DownloadJob] = []
+    private weak var runningConversion: DownloadJob?
+
+    private func runNextConversion() {
+        guard runningConversion == nil, !conversionQueue.isEmpty else { return }
+        let job = conversionQueue.removeFirst()
+        guard let path = job.finishedPath, FileManager.default.fileExists(atPath: path) else {
+            runNextConversion()
+            return
+        }
+        runningConversion = job
+        job.phase = .running
+        job.converting = true
+        job.convertProgress = 0
+        job.convertAction = nil
+        job.convertStarted = Date()
+        job.stopRequested = false
+        job.process = Engine.spawn(["convert", path, "--json-progress"], onLine: { [weak job] line in
+            job?.ingest(line)
+        }, onEnd: { [weak self, weak job] _ in
+            guard let self else { return }
+            self.runningConversion = nil
+            guard let job else { self.runNextConversion(); return }
+            job.process = nil
+            let changed = job.convertAction != nil
+            job.converting = false
+            job.phase = .done
+            if let path = job.finishedPath {
+                job.finishedSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size]
+                                    as? NSNumber)?.int64Value ?? job.finishedSize
+                job.total = job.finishedSize
+                job.done = job.finishedSize
+            }
+            self.flash(changed ? "Mac-ready: \(job.title)" : "“\(job.title)” already plays smoothly on your Mac")
+            self.scheduleSave()
+            self.updateDockBadge()
+            self.runNextConversion()
+        })
+        updateDockBadge()
+    }
     @Published var updatingTool = false
     @Published var ytdlpBannerDismissed = false
 
@@ -830,6 +903,7 @@ final class JobStore: ObservableObject {
                 let store = JobStore.shared
                 if let cfg {
                     if let root = cfg["root"] as? String, !root.isEmpty { store.downloadRoot = root }
+                    if let mode = cfg["mac_ready"] as? String { store.macReadyMode = mode }
                     store.speedLimit = (cfg["speed_limit"] as? NSNumber)?.intValue ?? 0
                 }
                 if !checkUpdates, let old = store.report, old.ytdlpVersion == doc.ytdlpVersion {

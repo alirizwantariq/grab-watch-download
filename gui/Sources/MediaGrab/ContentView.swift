@@ -440,6 +440,16 @@ struct ContentView: View {
                 .controlSize(.small)
                 .keyboardShortcut(.cancelAction)
             Spacer()
+            if picked.contains(where: { store.isVideoFile($0) && $0.phase == .done }) {
+                Button {
+                    store.makeMacReady(picked)
+                    store.clearSelection()
+                } label: {
+                    Label("Make Mac-Ready", systemImage: "wand.and.stars")
+                }
+                .controlSize(.small)
+                .help("Convert the selected videos so they play smoothly on this Mac (only those that need it)")
+            }
             Button {
                 confirmRemoveSelected(active: active)
             } label: {

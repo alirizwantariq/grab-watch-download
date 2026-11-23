@@ -162,6 +162,22 @@ struct SettingsView: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             Section {
+                Picker("Make videos play smoothly on this Mac", selection: Binding(
+                    get: { store.macReadyMode },
+                    set: { store.setMacReadyMode($0) })) {
+                    Text("Convert when needed").tag("convert")
+                    Text("Only fix the format").tag("fix")
+                    Text("Off").tag("off")
+                }
+                Text(store.macReadyMode == "convert"
+                     ? "Videos QuickTime cannot open, or that would play choppy (VP9, AV1, 10-bit H.264…), are converted with the Mac's hardware encoder right after downloading. Files that already play well are left untouched."
+                     : store.macReadyMode == "fix"
+                     ? "Only quick, lossless fixes (container, audio). Videos that would need re-encoding are left as they are."
+                     : "Downloads are kept exactly as they arrive.")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
                 Toggle("Ask for the file name before each download", isOn: $store.askBeforeDownload)
                 Toggle("Notify when a download finishes", isOn: $store.notifyOnFinish)
                 Toggle("Keep the Mac awake while downloading", isOn: $store.keepAwake)

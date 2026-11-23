@@ -1298,3 +1298,46 @@ def test_doctor_checks_for_a_newer_ytdlp(tmp_path):
         assert "latest" not in quiet["ytdlp"], "no network check unless asked"
     finally:
         page.stop()
+
+
+# ── yt-dlp progress (the "13.9 MB of 1.0 KB · 100%" bug) ─────────────────
+
+def test_ytdlp_hls_progress_has_a_real_total():
+    """Lines as yt-dlp prints them for a YouTube HLS download (captured):
+    no total, a float estimate that starts at the playlist's size."""
+    p = m._YtdlpProgress()
+    lines = ["MGDPROG 712 NA 712 0 123 612",
+             "MGDPROG 1736 NA 87576.0 0 123 612",
+             "MGDPROG 6856 NA 591384.0 0 123 612",
+             "MGDPROG 6856 NA 930864.0 1 123 612",
+             "MGDPROG 7626815 NA 78090885.75 11 123 612",
+             "MGDPROG 15347639 NA 99155119.36363636 22 123 612"]
+    events = [p.feed(line) for line in lines]
+    assert [e["total"] for e in events[:3]] == [0, 0, 0], "no junk total before a piece arrived"
+    assert events[3]["total"] == 930864
+    assert events[4] == {"type": "progress", "done": 7626815, "total": 78090885}
+    assert all(e["total"] == 0 or e["total"] >= e["done"] for e in events)
+
+
+def test_ytdlp_video_then_audio_is_one_continuous_progress():
+    p = m._YtdlpProgress()
+    assert p.feed("MGDSIZE 1100000") is None              # expected size of both streams
+    v1 = p.feed("MGDPROG 500000 1000000 NA NA NA 298")
+    v2 = p.feed("MGDPROG 1000000 1000000 NA NA NA 298")
+    a1 = p.feed("MGDPROG 40000 100000 NA NA NA 258")      # audio starts from zero…
+    a2 = p.feed("MGDPROG 100000 100000 NA NA NA 258")
+    assert v1 == {"type": "progress", "done": 500000, "total": 1100000}
+    assert v2["done"] == 1000000
+    assert a1["done"] == 1040000, "…but the download does not jump back"
+    assert a2 == {"type": "progress", "done": 1100000, "total": 1100000}
+    # no size known up front: each stream's own total, still continuous
+    q = m._YtdlpProgress()
+    q.feed("MGDSIZE NA")
+    assert q.feed("MGDPROG 10 100 NA NA NA 1")["total"] == 100
+    assert q.feed("MGDPROG 5 50 NA NA NA 2") == {"type": "progress", "done": 105, "total": 150}
+
+
+def test_ytdlp_progress_event_reads_float_estimates():
+    f = m._ytdlp_progress_event
+    assert f("MGDPROG 1024 NA 87576.0") == {"type": "progress", "done": 1024, "total": 87576}
+    assert f("MGDPROG 14000000 NA 712")["total"] == 0, "a total below done is unknown"

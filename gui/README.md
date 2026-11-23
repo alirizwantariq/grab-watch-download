@@ -77,6 +77,13 @@ missing and the command that installs each.
   yt-dlp release; when yours is older, a banner offers to update it the way
   it was installed (Homebrew, pip or yt-dlp's own updater). Diagnostics
   shows the version, its age and an Update button.
+- **Mac-ready videos.** A finished video that QuickTime cannot open or that
+  would play choppy (VP9/AV1 4K from YouTube, 10-bit H.264, .mkv/.webm…) is
+  converted right away - only as much as needed, with the Mac's hardware
+  encoder - while its row shows a purple progress bar ("Making it play
+  smoothly on your Mac", percentage, time left, Skip Conversion). Settings
+  choose Convert when needed / Only fix the format / Off; finished rows and
+  the selection bar offer Make Mac-Ready for files downloaded earlier.
 - **Pause / resume / retry.** Pause signals the engine, which saves exact
   byte positions. Resume continues from them; a failed download keeps its
   partial data and offers *Try Again*. yt-dlp-backed downloads resume by

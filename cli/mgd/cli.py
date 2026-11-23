@@ -26,7 +26,7 @@ import threading
 import time
 import urllib.parse as u
 
-from . import categorize, grab, net, torrent as _torrent_mod
+from . import categorize, grab, macready, net, torrent as _torrent_mod
 from .engine import (Downloader, DownloadError, HttpError, Interrupted,
                      Stopper, STATE_SUFFIX, PART_SUFFIX)
 
@@ -106,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="set default dir for a category/root, or preferred cookie browser")
     sp.add_argument("category", choices=["root", "cookies-browser",
                                          "speed-limit", "open-app", "fragments",
+                                         "mac-ready",
                                          *categorize.CATEGORIES])
     sp.add_argument("value", help="path (or browser name for cookies-browser)")
 
@@ -140,6 +141,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "(yt-dlp: Homebrew, pip or its own updater)")
     ut.add_argument("tool", choices=["yt-dlp"])
     ut.add_argument("--json", action="store_true", dest="as_json")
+    cv = sub.add_parser("convert", aliases=["mac-ready"],
+                        help="make videos play smoothly on a Mac (QuickTime-ready, "
+                             "hardware-decoded): files or folders")
+    cv.add_argument("paths", nargs="+", help="video files or folders (searched recursively)")
+    cv.add_argument("--check", action="store_true",
+                    help="only report what each file needs, change nothing")
+    cv.add_argument("--mode", choices=["convert", "fix"], default="convert",
+                    help="fix = rewrap / convert audio only, never re-encode video")
+    cv.add_argument("--keep-original", action="store_true",
+                    help="keep the original next to the converted .mp4")
+    cv.add_argument("--json", action="store_true", dest="as_json",
+                    help="--check output as JSON")
+    cv.add_argument("--json-progress", action="store_true", dest="json_progress",
+                    help="NDJSON progress events (for the app)")
     ql = sub.add_parser("qualities", aliases=["formats"],
                         help="list downloadable qualities/resolutions for a "
                              "URL (JSON; used by the GUI and scripts)")
@@ -363,12 +378,13 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
         _journal_record(out_path)
         on_progress = _cb if (as_json or plain is not None) else None
         result = dl.run(on_progress=on_progress)
-        if as_json:
-            print(json.dumps({"type": "done", "path": str(result.path),
-                              "size": result.size}), flush=True)
-        else:
+        if not as_json:
             print()
-            print(_ok(f"{result.path} {_size_str(result.size)}"))
+        final = _make_mac_ready(result.path, as_json)
+        if as_json:
+            print(json.dumps(_done_event(final, result.size)), flush=True)
+        else:
+            print(_ok(f"{final} {_size_str(final.stat().st_size if final.exists() else result.size)}"))
         return 0
     except KeyboardInterrupt:
         dl.abort()
@@ -385,6 +401,83 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
         return 1
 
 BOT_CHECK_MARKERS = ("sign in to confirm", "not a bot", "confirm you")
+
+
+# ── Mac-ready videos (see macready.py) ───────────────────────────────────
+
+def _mac_ready_mode() -> str:
+    mode = str(_cfg().get("mac_ready") or "").lower()
+    if mode in macready.MODES:
+        return mode
+    return "convert" if sys.platform == "darwin" else "off"
+
+
+def _make_mac_ready(path, as_json: bool, mode: str | None = None,
+                    keep_original: bool = False) -> pathlib.Path:
+    """After a download: make the video play smoothly on a Mac when it would
+    not (see macready.py). Returns the file to report - the converted one, or
+    the original when nothing was needed, it is switched off, or it failed."""
+    path = pathlib.Path(path)
+    mode = mode or _mac_ready_mode()
+    if mode == "off" or not path.is_file() or not macready.is_video_file(path) \
+            or not macready.tools_available():
+        return path
+    plan = macready.plan_for(macready.probe(path))
+    if plan.action == "ok":
+        return path
+    if mode == "fix" and plan.action == "video":
+        _note(as_json, "this video needs re-encoding to play smoothly on a Mac "
+                       "(Mac-ready is set to fix formats only): " + "; ".join(plan.reasons))
+        return path
+    what = {"remux": "rewrapping it for QuickTime (no re-encoding)",
+            "audio": "converting its audio to AAC",
+            "video": "re-encoding it with the Mac's hardware encoder"}[plan.action]
+    if as_json:
+        print(json.dumps({"type": "convert", "stage": "start", "action": plan.action,
+                          "reasons": plan.reasons}), flush=True)
+    else:
+        print(_arrow(f"making it play smoothly on a Mac: {what}"))
+        for reason in plan.reasons:
+            print(f"  - {reason}")
+
+    def progress(fraction: float) -> None:
+        if as_json:
+            print(json.dumps({"type": "convert", "progress": round(fraction, 3)}), flush=True)
+        else:
+            sys.stdout.write(f"\r  converting {int(fraction * 100):>3}%   ")
+            sys.stdout.flush()
+
+    try:
+        out = macready.convert(path, plan, on_progress=progress, keep_original=keep_original)
+    except KeyboardInterrupt:
+        # the download itself is complete: keep it as it is
+        if as_json:
+            print(json.dumps({"type": "convert", "stage": "stopped"}), flush=True)
+        else:
+            print("\n  conversion stopped - kept the original file")
+        return path
+    except (macready.ConversionFailed, OSError) as err:
+        if as_json:
+            print(json.dumps({"type": "convert", "stage": "failed",
+                              "message": str(err)}), flush=True)
+        else:
+            print(_fail(f"\n  could not convert ({err}) - kept the original file"))
+        return path
+    if as_json:
+        print(json.dumps({"type": "convert", "stage": "done", "path": str(out),
+                          "size": out.stat().st_size}), flush=True)
+    else:
+        print(f"\n  Mac-ready: {out.name}")
+    return out
+
+
+def _done_event(path, fallback_size=None) -> dict:
+    path = pathlib.Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = fallback_size
+    return {"type": "done", "path": str(path), "size": size}
 
 
 DEFAULT_FRAGMENTS = 8
@@ -428,25 +521,88 @@ def _ytdlp_base_args() -> list[str]:
             "--socket-timeout", "30", "--no-check-certificates"]
 
 
+def _progress_num(s: str) -> int | None:
+    """yt-dlp numbers: '1024', '87576.0' (estimates are floats), 'NA'."""
+    try:
+        value = float(s)
+    except (TypeError, ValueError):
+        return None
+    return int(value) if value >= 0 and value == value else None
+
+
 def _ytdlp_progress_event(line: str) -> dict | None:
     """'MGDPROG <done> <total> <estimate>' -> NDJSON progress event.
 
-    yt-dlp prints 'NA' for unknown values; total falls back to the estimate."""
+    yt-dlp prints 'NA' for unknown values; total falls back to the
+    estimate, and a total smaller than what is already downloaded is no
+    total at all (0 = unknown)."""
     parts = line.split()
     if len(parts) != 4:
         return None
-
-    def _num(s: str) -> int | None:
-        return int(s) if s.isdigit() else None
-
-    done = _num(parts[1])
-    total = _num(parts[2])
-    est = _num(parts[3])
+    done = _progress_num(parts[1])
+    total = _progress_num(parts[2])
+    est = _progress_num(parts[3])
     if done is None:
         return None
     if total is None or total <= 0:
         total = est or 0
+    if total < done:
+        total = 0
     return {"type": "progress", "done": done, "total": total}
+
+
+class _YtdlpProgress:
+    """yt-dlp progress lines -> one continuous progress for the whole download.
+
+    Lines: 'MGDPROG <done> <total> <estimate> <fragment> <fragments> <format>'
+    plus one 'MGDSIZE <bytes>' before the download (the expected size of
+    everything, e.g. video + audio). Fixes three things yt-dlp leaves to the
+    caller:
+      - HLS/DASH streams have no total, only an estimate - a float - that is
+        junk until the first piece arrived (it starts at the playlist's
+        ~1 KB): ignored until then, and never smaller than what is done;
+      - video and audio download one after the other, each counting from
+        zero: the second continues where the first ended;
+      - the overall size, when yt-dlp knows it up front, is the total."""
+
+    def __init__(self):
+        self.planned = 0
+        self.offset = 0
+        self.format: str | None = None
+        self.last_done = 0
+        self.last_size = 0
+
+    def feed(self, line: str) -> dict | None:
+        parts = line.split()
+        if parts[:1] == ["MGDSIZE"]:
+            self.planned = _progress_num(parts[1]) or 0 if len(parts) > 1 else 0
+            return None
+        if len(parts) < 4 or parts[0] != "MGDPROG":
+            return None
+        done = _progress_num(parts[1])
+        if done is None:
+            return None
+        total = _progress_num(parts[2])
+        est = _progress_num(parts[3])
+        fragment = _progress_num(parts[4]) if len(parts) > 4 else None
+        fragments = _progress_num(parts[5]) if len(parts) > 5 else None
+        fmt = parts[6] if len(parts) > 6 else None
+        if self.format is not None and fmt is not None and fmt != self.format:
+            # the next stream of the same download (audio after video)
+            self.offset += max(self.last_done, self.last_size)
+        if fmt is not None:
+            self.format = fmt
+        size = 0
+        if total and total >= done:
+            size = total
+        elif est and est >= done and not (fragments and not fragment):
+            size = est                          # trustworthy once a piece is in
+        self.last_done, self.last_size = done, size
+        overall_done = self.offset + done
+        overall = max(self.planned, self.offset + size) if size else self.planned
+        if overall < overall_done:
+            overall = 0                         # an estimate that ran short: unknown
+        return {"type": "progress", "done": overall_done, "total": overall}
 
 
 def _stop_child(proc) -> None:
@@ -471,17 +627,34 @@ def _run_ytdlp_strategy(ytdlp: str, name: str, cmd: list[str],
     proc = None
     try:
         if not json_progress:
-            proc = subprocess.Popen(cmd)
-            return proc.wait()
+            import tempfile
+            fd, paths_file = tempfile.mkstemp(prefix="mgd-ytdlp-", suffix=".txt")
+            os.close(fd)
+            try:
+                at = cmd.index("--")
+                full = cmd[:at] + ["--print-to-file", "after_move:%(filepath)s", paths_file] + cmd[at:]
+                proc = subprocess.Popen(full)
+                code = proc.wait()
+                if code == 0:
+                    for line in pathlib.Path(paths_file).read_text(encoding="utf-8").splitlines():
+                        if line.strip():
+                            _make_mac_ready(line.strip(), False)
+                return code
+            finally:
+                try:
+                    os.unlink(paths_file)
+                except OSError:
+                    pass
         # GUI mode: stream yt-dlp output, translating the MGD progress
         # template into NDJSON events and capturing the final file path.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True,
                                 bufsize=1, encoding="utf-8", errors="replace")
         final_path: str | None = None
+        progress = _YtdlpProgress()
         for raw in proc.stdout:
             line = raw.rstrip("\n")
-            if line.startswith("MGDPROG "):
-                ev = _ytdlp_progress_event(line)
+            if line.startswith(("MGDPROG ", "MGDSIZE")):
+                ev = progress.feed(line)
                 if ev:
                     print(json.dumps(ev), flush=True)
                 continue
@@ -491,13 +664,8 @@ def _run_ytdlp_strategy(ytdlp: str, name: str, cmd: list[str],
             print(line, flush=True)
         code = proc.wait()
         if code == 0 and final_path:
-            size = None
-            try:
-                size = os.path.getsize(final_path)
-            except OSError:
-                pass
-            print(json.dumps({"type": "done", "path": final_path,
-                              "size": size}), flush=True)
+            final = _make_mac_ready(final_path, True)
+            print(json.dumps(_done_event(final)), flush=True)
         return code
     except KeyboardInterrupt:
         # pause/cancel from the GUI arrives as SIGTERM to mgd only: yt-dlp
@@ -849,7 +1017,10 @@ def _grab_platform(args, cfg: dict, url: str | None = None,
         dl_flags = ["--newline", "--progress",
                     "--progress-template",
                     "download:MGDPROG %(progress.downloaded_bytes)s "
-                    "%(progress.total_bytes)s %(progress.total_bytes_estimate)s",
+                    "%(progress.total_bytes)s %(progress.total_bytes_estimate)s "
+                    "%(progress.fragment_index)s %(progress.fragment_count)s "
+                    "%(info.format_id)s",
+                    "--print", "before_dl:MGDSIZE %(filesize,filesize_approx)s",
                     "--print", "after_move:MGDFINAL %(filepath)s"]
     # For X posts without caller-supplied cookies, guest extraction never
     # succeeds for gated media - limit the chain to the two UA/impersonate
@@ -1113,11 +1284,11 @@ def cmd_grab(args) -> int:
                 progress_cb = _make_progress()
             result = dl.run(on_progress=progress_cb)
             print()
+            final = _make_mac_ready(result.path, bool(getattr(args, "json_progress", False)))
             if getattr(args, "json_progress", False):
-                print(json.dumps({"type": "done", "path": str(result.path),
-                                  "size": result.size}), flush=True)
+                print(json.dumps(_done_event(final, result.size)), flush=True)
             else:
-                print(_ok(f"{result.path} {_size_str(result.size)}"
+                print(_ok(f"{final} {_size_str(final.stat().st_size if final.exists() else result.size)}"
                           + (" [resumed]" if result.resumed else "")))
             results.append(result)
         except KeyboardInterrupt:
@@ -1436,6 +1607,7 @@ def _grab_torrent(args, cfg: dict, url: str) -> int:
                               json_mode, on_progress=_st_progress,
                               st_path=st_path)
         st_path.unlink(missing_ok=True)
+        _mac_ready_torrent(dest_dir, selected_files, json_mode)
         if json_mode:
             print(json.dumps({"type": "done", "path": str(dest_dir),
                               "size": total}), flush=True)
@@ -1454,6 +1626,12 @@ def _grab_torrent(args, cfg: dict, url: str) -> int:
             return 1
         print(_fail(str(err)), file=sys.stderr)
         return 1
+
+
+def _mac_ready_torrent(dest_dir: pathlib.Path, files: list, json_mode: bool) -> None:
+    for f in files:
+        if f.get("video") or macready.is_video_file(f.get("path", "")):
+            _make_mac_ready(dest_dir / f.get("path", ""), json_mode)
 
 
 def _resume_torrent(st: dict, st_path: pathlib.Path, json_mode: bool) -> int:
@@ -1478,6 +1656,7 @@ def _resume_torrent(st: dict, st_path: pathlib.Path, json_mode: bool) -> int:
                              st.get("select"), cfg, json_mode,
                              on_progress=_st_progress, st_path=st_path)
         st_path.unlink(missing_ok=True)
+        _mac_ready_torrent(dest_dir, st.get("files") or [], json_mode)
         if json_mode:
             print(json.dumps({"type": "done", "path": str(dest_dir),
                               "size": st.get("size", 0)}), flush=True)
@@ -1721,6 +1900,16 @@ def cmd_set_default(args) -> int:
         else:
             cfg.pop("speed_limit", None)
             print("saved: global speed limit -> off")
+    elif args.category == "mac-ready":
+        val = args.value.strip().lower()
+        if val not in macready.MODES:
+            print("error: mac-ready accepts convert, fix or off", file=sys.stderr)
+            return 2
+        cfg["mac_ready"] = val
+        print(f"saved: Mac-ready videos -> {val} ("
+              + {"convert": "re-encode when a video would play choppy or not open",
+                 "fix": "only rewrap / convert audio, never re-encode video",
+                 "off": "leave downloads exactly as they arrive"}[val] + ")")
     elif args.category == "fragments":
         try:
             n = int(args.value)
@@ -1739,7 +1928,8 @@ def cmd_set_default(args) -> int:
     else:
         cfg.setdefault("defaults", {})[args.category] = args.value
     categorize.save_config(cfg)
-    if args.category not in ("cookies-browser", "speed-limit", "open-app", "fragments"):
+    if args.category not in ("cookies-browser", "speed-limit", "open-app", "fragments",
+                             "mac-ready"):
         print(f"saved: {args.category} -> {args.value}")
     return 0
 
@@ -1754,6 +1944,7 @@ def cmd_defaults(_args) -> int:
             "defaults": cfg.get("defaults") or {},
             "conns": cfg.get("conns", 6),
             "open_app": cfg.get("open_app", "on"),
+            "mac_ready": _mac_ready_mode(),
             "cookies_browser": cfg.get("cookies_browser"),
         }))
         return 0
@@ -2195,6 +2386,56 @@ def cmd_update_tool(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_convert(args) -> int:
+    """Make videos Mac-ready (the download pipeline does this by itself;
+    this is for files already on disk)."""
+    if not macready.tools_available():
+        print("error: needs ffmpeg (brew install ffmpeg)", file=sys.stderr)
+        return 1
+    files: list[pathlib.Path] = []
+    for raw in args.paths:
+        p = pathlib.Path(os.path.expanduser(raw))
+        if p.is_dir():
+            files += sorted(f for f in p.rglob("*") if f.is_file()
+                            and macready.is_video_file(f) and not f.name.startswith("."))
+        elif p.is_file():
+            files.append(p)
+        else:
+            print(f"error: not found: {p}", file=sys.stderr)
+            return 2
+    if args.check:
+        rows = []
+        for f in files:
+            plan = macready.plan_for(macready.probe(f))
+            rows.append({"path": str(f), **plan.to_json()})
+        if args.as_json:
+            print(json.dumps({"files": rows}))
+        else:
+            labels = {"ok": "ready", "remux": "rewrap", "audio": "fix audio", "video": "re-encode"}
+            for row in rows:
+                print(f"{labels[row['action']]:>10}  {row['path']}")
+                for reason in row["reasons"]:
+                    print(f"{'':>12}- {reason}")
+        return 0
+    as_json = bool(getattr(args, "json_progress", False))
+    failed = 0
+    for f in files:
+        if not as_json:
+            print(_arrow(str(f)))
+        out = _make_mac_ready(f, as_json, mode=args.mode, keep_original=args.keep_original)
+        if as_json:
+            print(json.dumps(_done_event(out)), flush=True)
+        elif out == f:
+            plan = macready.plan_for(macready.probe(f))
+            if plan.action == "ok":
+                print("  already plays smoothly on a Mac")
+            elif args.mode == "fix" and plan.action == "video":
+                pass
+            else:
+                failed += 1
+    return 1 if failed else 0
+
+
 def cmd_doctor(_args) -> int:
     """Show what engines and setup mgd can use right now."""
     cfg = _cfg()
@@ -2219,6 +2460,9 @@ def cmd_doctor(_args) -> int:
                 ("yt-dlp", "yt-dlp"), ("ffmpeg", "ffmpeg"),
                 ("aria2c", "aria2c"), ("webtorrent", "webtorrent"))},
             "ytdlp": ytdlp_info,
+            "mac_ready": {"mode": _mac_ready_mode(),
+                          "hardware_encoder": macready.tools_available()
+                          and macready.hardware_encoder_available()},
             "unfinished": len(_find_states()),
         }))
         return 0
@@ -2991,12 +3235,13 @@ def _resume_one(st_path: pathlib.Path, as_json: bool, new_url: str | None = None
                 continue
             _emit_error(as_json, _error_message(err), kind=_error_kind(err))
             return 1
-        if as_json:
-            print(json.dumps({"type": "done", "path": str(result.path),
-                              "size": result.size}), flush=True)
-        else:
+        if not as_json:
             print()
-            print(_ok(f"{result.path} {_size_str(result.size)}"
+        final = _make_mac_ready(result.path, as_json)
+        if as_json:
+            print(json.dumps(_done_event(final, result.size)), flush=True)
+        else:
+            print(_ok(f"{final} {_size_str(final.stat().st_size if final.exists() else result.size)}"
                       + (" [was resumed]" if result.resumed else "")))
         return 0
 
@@ -3091,6 +3336,7 @@ def main(argv=None) -> int:
         "cancel": cmd_cancel, "rm": cmd_cancel, "del": cmd_cancel,
         "doctor": cmd_doctor,
         "update-tool": cmd_update_tool, "update": cmd_update_tool,
+        "convert": cmd_convert, "mac-ready": cmd_convert,
         "qualities": cmd_qualities, "formats": cmd_qualities,
         "page-media": cmd_page_media, "catalog": cmd_page_media,
         "native-host": cmd_native_host,

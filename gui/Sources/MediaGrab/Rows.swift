@@ -121,6 +121,12 @@ struct ActiveJobRow: View {
     }
 
     private var statusLine: String {
+        if job.converting {
+            var parts = ["Making it play smoothly on your Mac",
+                         "\(Int(job.convertProgress * 100))%", job.convertSummary]
+            if !job.convertETA.isEmpty { parts.append(job.convertETA) }
+            return parts.joined(separator: " · ")
+        }
         var parts: [String] = []
         if job.total > 0 {
             parts.append("\(fmtBytes(job.done)) of \(fmtBytes(job.total))")
@@ -165,7 +171,20 @@ struct ActiveJobRow: View {
                         Text(statusLine)
                             .font(.caption).monospacedDigit()
                             .foregroundColor(.secondary).lineLimit(1)
-                        ProgressBar(fraction: job.total > 0 ? job.percent / 100 : -1, color: tint)
+                        if job.converting {
+                            ProgressBar(fraction: job.convertProgress, color: .purple)
+                                .help(job.convertReasons.joined(separator: "\n"))
+                        } else {
+                            if job.total <= 0 && job.phase == .running {
+                                // size not known (yet): show that it is working
+                                ProgressView()
+                                    .progressViewStyle(.linear)
+                                    .controlSize(.small)
+                                    .tint(tint)
+                            } else {
+                                ProgressBar(fraction: job.total > 0 ? job.percent / 100 : -1, color: tint)
+                            }
+                        }
                     }
                     Spacer(minLength: 6)
                     controls
@@ -193,6 +212,16 @@ struct ActiveJobRow: View {
 
     @ViewBuilder
     private var stateIcon: some View {
+        if job.converting {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 19)).foregroundColor(.purple)
+        } else {
+            phaseIcon
+        }
+    }
+
+    @ViewBuilder
+    private var phaseIcon: some View {
         switch job.phase {
         case .running:
             if job.total > 0 {
@@ -212,7 +241,16 @@ struct ActiveJobRow: View {
 
     private var controls: some View {
         HStack(spacing: 4) {
-            if job.phase == .paused {
+            if job.converting {
+                Button {
+                    store.pause(job)          // stops the conversion; the download is kept
+                } label: {
+                    Label("Skip Conversion", systemImage: "forward.end")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Keep the file exactly as downloaded")
+            } else if job.phase == .paused {
                 Button {
                     store.resume(job)
                 } label: {
@@ -231,15 +269,17 @@ struct ActiveJobRow: View {
                 .controlSize(.small)
                 .help("Pause and keep what is downloaded so far")
             }
-            Button {
-                askCancel()
-            } label: {
-                Image(systemName: "xmark")
+            if !job.converting {
+                Button {
+                    askCancel()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Cancel and delete the partial file")
+                .accessibilityLabel("Cancel download")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Cancel and delete the partial file")
-            .accessibilityLabel("Cancel download")
             Button {
                 job.showLog.toggle()
             } label: {
@@ -373,6 +413,9 @@ struct FinishedJobRow: View {
             } else {
                 Button("Open") { store.open(job) }
                 Button("Show in Finder") { store.reveal(job) }
+                if store.isVideoFile(job) {
+                    Button("Make Mac-Ready") { store.makeMacReady([job]) }
+                }
             }
             Button("Copy Link") { copyToClipboard(job.url) }
             Divider()
@@ -437,6 +480,10 @@ struct FinishedJobRow: View {
                 if !failed {
                     Button("Open") { store.open(job) }
                     Button("Show in Finder") { store.reveal(job) }
+                    if store.isVideoFile(job) {
+                        Button("Make Mac-Ready") { store.makeMacReady([job]) }
+                            .help("Convert it so it plays smoothly in QuickTime (only if needed)")
+                    }
                     Divider()
                 }
                 Button("Copy Link") { copyToClipboard(job.url) }

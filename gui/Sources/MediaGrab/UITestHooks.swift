@@ -160,6 +160,15 @@ enum UITestHooks {
             }
         case "sheet": openSheet(arg(1))
         case "updateytdlp": _ = await store.updateYtdlp()
+        case "macmode": store.setMacReadyMode(arg(1)); await sleep(1.0)
+        case "macready": if let j = job(arg(1)) { store.makeMacReady([j]) }
+        case "feed":
+            // hand an engine output line to a download (progress parsing checks)
+            job(arg(1))?.ingest(arg(2))
+        case "waitconverting":
+            let deadline = Date().addingTimeInterval(max(1, num(2)))
+            while Date() < deadline, job(arg(1))?.converting != true { await sleep(0.05) }
+            log("  \(arg(1)) converting -> \(job(arg(1))?.converting ?? false)")
         case "clipwatch": store.watchClipboard = arg(1) == "on"
         case "clipauto": store.autoDownloadClipboard = arg(1) == "on"
         case "clipcopy":
@@ -382,6 +391,8 @@ enum UITestHooks {
              "error": j.errorMessage ?? "", "adopted": j.adopted,
              "owned": j.process != nil, "args": j.args,
              "errorKind": j.errorKind ?? "",
+             "converting": j.converting, "convertProgress": j.convertProgress,
+             "convertAction": j.convertAction ?? "",
              "retryIn": j.retryAt.map { $0.timeIntervalSinceNow } ?? -1,
              "autoRetries": j.autoRetries]
         }

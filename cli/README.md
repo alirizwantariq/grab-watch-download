@@ -62,6 +62,9 @@ mgd pause 1 / mgd resume 1 / mgd cancel 1   # by the number mgd jobs prints…
 mgd pause d3fa9c01b2e              # …or by the stable id shown next to it
 mgd grab "https://site/video.m3u8" # HLS/DASH streams: assembled with yt-dlp
 mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)
+mgd convert <file|folder>          # make videos play smoothly on a Mac (only if needed)
+mgd convert <folder> --check       # just report what each file needs
+mgd set-default mac-ready convert  # after every download: convert | fix | off
 mgd doctor                         # engines + config readiness
 mgd doctor --json --check-updates  # + yt-dlp version, age, install type, newest release
 mgd update-tool yt-dlp             # update it the way it was installed
@@ -104,6 +107,24 @@ untouched. A download that fails part-way saves its exact position first.
 Error events carry a `kind` the app acts on: `link_expired`,
 `link_mismatch`, `network` (connection dropped / host unreachable),
 `server` (5xx, 429) and `disk_full`.
+
+### Mac-ready videos
+
+On macOS every finished video is checked with ffprobe and fixed only when it
+would not open in QuickTime or would play choppy (no hardware decoding):
+
+| what the file has | what happens |
+| --- | --- |
+| H.264 / HEVC 4:2:0 + AAC/MP3/AC-3/ALAC in .mp4/.mov | nothing |
+| right codecs in .mkv/.webm/.ts, or HEVC tagged `hev1` | rewrapped into .mp4 (`hvc1`), no re-encoding |
+| Opus / Vorbis / FLAC / DTS audio | audio converted to AAC, video copied |
+| VP9, AV1, 10-bit or 4:4:4 H.264, WMV, MPEG-2/4, interlaced | re-encoded with the Mac's hardware encoder: H.264 up to 1440p, HEVC for 4K, HDR and 10-bit; bitrate matched to the source |
+
+The result is checked (plays, same length) before it replaces the original;
+if anything fails, or the conversion is stopped, the original stays.
+`--json-progress` reports `{"type":"convert","stage":"start|done|failed|stopped"}`
+and `{"type":"convert","progress":0.42}` before the final `done` event.
+`mac-ready fix` never re-encodes video; `off` keeps downloads as they arrive.
 
 ### What a link turns into
 

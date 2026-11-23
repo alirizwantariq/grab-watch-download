@@ -16,8 +16,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="2.1.0"
-BUILD="12"
+VERSION="2.2.0"
+BUILD="13"
 CONFIG="${CONFIG:-release}"
 OUT_DIR="${OUT_DIR:-dist}"
 BUNDLE_ID="${BUNDLE_ID:-com.alirizwantariq.mediagrab}"

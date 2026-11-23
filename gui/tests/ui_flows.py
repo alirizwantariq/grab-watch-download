@@ -38,6 +38,7 @@ def blob(name: str, size: int) -> bytes:
     return (seed * (size // len(seed) + 1))[:size]
 
 
+FILES: dict[str, pathlib.Path] = {}   # /files/<name> serves these real files
 FLAKY = {"down": False}
 YTDLP_LATEST = {"tag": "2000.01.01"}    # what the test site says the newest yt-dlp is       # /flaky/… drops every connection while True
 EXP_TOKENS: dict[str, int] = {}
@@ -122,15 +123,20 @@ class Site(http.server.BaseHTTPRequestHandler):
             path = "/fast/" + path.rsplit("/", 1)[-1]
         parts = path.strip("/").split("/")
         rate = None
-        if parts[0] == "slow" and len(parts) == 3:
+        if parts[0] == "files" and len(parts) == 2 and parts[1] in FILES:
+            name = parts[1]
+            body = FILES[name].read_bytes()
+            size = len(body)
+        elif parts[0] == "slow" and len(parts) == 3:
             rate, name, size = int(parts[1]) * 1024, parts[2], SLOW_SIZE
+            body = blob(name, size)
         elif parts[0] in ("fast", "gated") and len(parts) == 2:
             name, size = parts[1], FAST_SIZE
             if parts[0] == "gated" and "/page-one" not in (self.headers.get("Referer") or ""):
                 return self._empty(403)
+            body = blob(name, size)
         else:
             return self._empty(404)
-        body = blob(name, size)
         rng = self.headers.get("Range", "")
         if rng.startswith("bytes="):
             first, _, last = rng[6:].split(",")[0].partition("-")
@@ -538,6 +544,62 @@ exec "{sys.executable}" "{MGD}" "$@"
     assert "self-heal" in (run.out / "uitest.log").read_text()
 
 
+def _video_info(path) -> dict:
+    out = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams",
+                          "-show_format", str(path)], capture_output=True, text=True)
+    return json.loads(out.stdout or "{}")
+
+
+def _mac_ready(path) -> bool:
+    sys.path.insert(0, str(REPO / "cli"))
+    from mgd import macready
+    return macready.plan_for(macready.probe(path)).action == "ok"
+
+
+def flow_mac_ready(run: Run, base: str):
+    """A finished download that would play choppy on a Mac (1080p VP9 +
+    Opus .webm) is converted right away with a progress bar on its row;
+    with it switched off the file stays as it came and Make Mac-Ready
+    converts it later; Skip Conversion keeps the download as it is."""
+    if not shutil.which("ffmpeg"):
+        return
+    src = run.box / "src" / "sample.webm"
+    src.parent.mkdir(parents=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc2=size=1920x1080:rate=30:duration=40", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=40", "-c:v", "libvpx-vp9", "-deadline", "realtime",
+                    "-cpu-used", "8", "-b:v", "3M", "-c:a", "libopus", "-shortest", str(src)], check=True)
+    for name in ("clip.webm", "raw.webm", "skip.webm"):
+        FILES[name] = src
+    run.play([["ask", "off"], ["submit", f"{base}/files/clip.webm"],
+              ["waitconverting", "clip", 60], ["wait", 1.2], ["snap", "converting"], ["dump", "converting"],
+              ["waitphase", "clip", "done", 180], ["wait", 0.5], ["dump", "converted"], ["snap", "converted"],
+              ["macmode", "off"], ["submit", f"{base}/files/raw.webm"],
+              ["waitphase", "raw", "done", 60], ["wait", 0.5], ["dump", "raw"],
+              ["macready", "raw"], ["waitconverting", "raw", 30], ["waitphase", "raw", "done", 180],
+              ["wait", 0.5], ["dump", "later"],
+              ["macmode", "convert"], ["submit", f"{base}/files/skip.webm"],
+              ["waitconverting", "skip", 60], ["wait", 1], ["pause", "skip"],
+              ["waitphase", "skip", "done", 30], ["wait", 0.5], ["dump", "skipped"], ["quit"]])
+    conv = run.jobs("converting")["clip.webm"]
+    assert conv["converting"] is True and conv["phase"] == "running", conv
+    assert conv["convertAction"] == "video"
+    done = run.jobs("converted")["clip.mp4"]           # the row follows the new name
+    assert done["phase"] == "done" and done["finishedPath"].endswith("/clip.mp4"), done
+    assert _mac_ready(done["finishedPath"]) and not done["converting"]
+    info = _video_info(done["finishedPath"])
+    assert abs(float(info["format"]["duration"]) - 40) < 1, info["format"]["duration"]
+    raw = run.jobs("raw")["raw.webm"]
+    assert raw["phase"] == "done" and raw["finishedPath"].endswith("/raw.webm"), "mode off: kept as it came"
+    later = run.jobs("later")["raw.mp4"]
+    assert later["phase"] == "done" and later["finishedPath"].endswith("/raw.mp4"), later
+    assert _mac_ready(later["finishedPath"])
+    skipped = run.jobs("skipped")["skip.webm"]
+    assert skipped["phase"] == "done" and skipped["finishedPath"].endswith("/skip.webm"), skipped
+    files = run.files()
+    assert sorted(files) == ["video/clip.mp4", "video/raw.mp4", "video/skip.webm"], files
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -592,7 +654,10 @@ def flow_relaunch(run: Run, base: str):
 
 def flow_snapshots(run: Run, base: str):
     """Every sheet and list state renders (snapshots for visual review)."""
-    steps = [["seed"], ["snap", "list"], ["select", "Family"], ["select", "Mountain"],
+    # the progress from the bug report: 13.9 MB done, a "total" of 1 KB
+    bad = '{"type": "progress", "done": 13900000, "total": 1024}'
+    steps = [["seed"], ["feed", "Summer trip", bad], ["wait", 0.3], ["dump", "fed"],
+             ["snap", "list"], ["select", "Family"], ["select", "Mountain"],
              ["details", "Members"], ["snap", "selection"],
              ["search", "zzz-no-match"], ["snap", "no-match"], ["search", ""],
              ["sheet", "missingtools"], ["snap", "warning"]]
@@ -605,6 +670,8 @@ def flow_snapshots(run: Run, base: str):
               ["wait", 0.6]]
     steps += [["settingsview"], ["snap", "settings"], ["quit"]]
     run.play(steps)
+    fed = {j["title"]: j for j in run.dump("fed")["jobs"]}["Summer trip 2026 — beach day 1080p.mp4"]
+    assert fed["done"] == 13900000 and fed["total"] == 0, fed      # unknown, not "100% of 1 KB"
     shots = sorted(p.name for p in run.out.glob("*.png"))
     assert len(shots) >= 14, shots
     assert run.dump("after-quality")["sheet"] == "rename"
@@ -617,6 +684,7 @@ def flow_snapshots(run: Run, base: str):
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
          flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop, flow_many_links,
          flow_clipboard_watch, flow_ytdlp_update, flow_missed_end,
+         flow_mac_ready,
          flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 
