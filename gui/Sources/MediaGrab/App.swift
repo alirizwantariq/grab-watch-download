@@ -24,6 +24,8 @@ struct MediaGrabApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Paste Link and Download") { session.pasteAndGrab() }
                     .keyboardShortcut("v", modifiers: [.command, .shift])
+                Button("Import Links from File…") { session.chooseLinkFile() }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
                 Divider()
                 Button("Open Downloads Folder") {
                     NSWorkspace.shared.open(URL(fileURLWithPath: store.downloadRoot))

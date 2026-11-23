@@ -429,6 +429,34 @@ def flow_connection_drop(run: Run, base: str):
     assert after["keepingAwake"] is False
 
 
+def flow_many_links(run: Run, base: str):
+    """Several links pasted at once (with words around them and a repeat),
+    a links.txt file, and the same with name confirmation off."""
+    text = (f"Here: {base}/fast/one.mp4 and {base}/fast/two.mp4, also see "
+            f"{base}/page-one - and once more {base}/fast/one.mp4.")
+    links_file = run.box / "links.txt"
+    links_file.write_text(f"{base}/fast/three.mp4\n# comment\n{base}/fast/four.mp4\n")
+    run.play([["submit", text], ["waitsheet", "handoff", 10], ["dump", "sheet"], ["snap", "sheet"],
+              ["renameitem", "two.mp4", "Second"], ["confirm"],
+              ["waitphase", "one.mp4", "done", 30], ["waitphase", "Second", "done", 30],
+              ["waitphase", "single_clip", "done", 30],
+              ["importfile", str(links_file)], ["waitsheet", "handoff", 10], ["dump", "file"],
+              ["confirm"], ["waitphase", "four.mp4", "done", 30], ["waitphase", "three.mp4", "done", 30],
+              ["ask", "off"], ["submit", f"{base}/fast/five.mp4 {base}/fast/six.mp4"],
+              ["waitphase", "six.mp4", "done", 30], ["waitphase", "five.mp4", "done", 30],
+              ["wait", 0.5], ["dump", "done"], ["quit"]])
+    items = run.dump("sheet")["handoffItems"]
+    assert [i["url"].rsplit("/", 1)[-1] for i in items] == ["one.mp4", "two.mp4", "page-one"], items
+    assert [i["name"] for i in items] == ["one.mp4", "two.mp4", ""], items
+    assert [i["kind"] for i in items] == ["file", "file", "page"], items
+    assert len(run.dump("file")["handoffItems"]) == 2
+    done = run.jobs("done")
+    assert all(j["phase"] == "done" for j in done.values()), done
+    assert sorted(run.files()) == sorted(["video/one.mp4", "video/Second.mp4",
+                                          "video/single_clip_720p.mp4", "video/three.mp4",
+                                          "video/four.mp4", "video/five.mp4", "video/six.mp4"]), run.files()
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -506,7 +534,7 @@ def flow_snapshots(run: Run, base: str):
 
 
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
-         flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop,
+         flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop, flow_many_links,
          flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 

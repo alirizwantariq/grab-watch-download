@@ -153,6 +153,7 @@ enum UITestHooks {
                 probe.items.first { $0.url.contains(arg(1)) }?.name = arg(2)
             }
         case "sheet": openSheet(arg(1))
+        case "importfile": session.importLinks(from: URL(fileURLWithPath: arg(1)))
         case "netdown": store.networkChanged(false)
         case "netup": store.networkChanged(true)
         case "fetch":

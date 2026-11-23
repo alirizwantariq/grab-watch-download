@@ -62,6 +62,10 @@ missing and the command that installs each.
   offers: a quality picker for YouTube/X, a batch picker for pages with
   several videos, a file picker for torrents, then a name + folder sheet
   (can be switched off in Settings).
+- **Several links at once.** Paste or drop text with several links (repeats
+  and surrounding words are ignored), drop a `.txt` list, or use File ▸
+  Import Links from File… (⇧⌘I): one sheet lists them all; file links keep
+  their file name, pages are named after their video unless a name is typed.
 - **Pause / resume / retry.** Pause signals the engine, which saves exact
   byte positions. Resume continues from them; a failed download keeps its
   partial data and offers *Try Again*. yt-dlp-backed downloads resume by

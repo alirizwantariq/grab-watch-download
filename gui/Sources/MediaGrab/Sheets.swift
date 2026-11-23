@@ -367,10 +367,14 @@ struct HandoffRow: View {
                 .toggleStyle(.checkbox)
                 .help("Download this one")
             Image(systemName: item.kind == "stream" ? "dot.radiowaves.left.and.right"
-                  : item.kind == "page" ? "globe" : fileSymbol(forPath: Naming.fileName(fromURL: item.url)))
+                  : item.kind == "page" ? "globe"
+                  : item.kind == "torrent" ? "arrow.down.circle.dotted"
+                  : fileSymbol(forPath: Naming.fileName(fromURL: item.url)))
                 .foregroundColor(.accentColor).frame(width: 22)
             VStack(alignment: .leading, spacing: 3) {
-                TextField("File name", text: $item.name)
+                TextField(item.kind == "page" ? "Automatic name (from the page)"
+                          : item.kind == "torrent" ? "Automatic name (from the torrent)" : "File name",
+                          text: $item.name)
                     .textFieldStyle(.roundedBorder)
                     .disabled(!item.included)
                 HStack(spacing: 6) {
@@ -388,8 +392,8 @@ struct HandoffRow: View {
                     Text(item.url)
                         .font(.caption2).foregroundColor(.secondary)
                         .lineLimit(1).truncationMode(.middle)
-                    if item.included && !Naming.isValid(item.name) {
-                        Text(item.name.contains("/") ? "no “/” in names" : "needs a name")
+                    if item.included && !item.name.isEmpty && !Naming.isValid(item.name) {
+                        Text("no “/” in names")
                             .font(.caption2).foregroundColor(.red)
                     }
                 }
@@ -406,9 +410,8 @@ struct HandoffSheet: View {
     var body: some View {
         let ready = probe.chosen.count
         VStack(spacing: 0) {
-            SheetHeader(symbol: "puzzlepiece.extension",
-                        title: probe.items.count == 1 ? "Download from your browser"
-                               : "\(probe.items.count) downloads from your browser",
+            SheetHeader(symbol: probe.origin == nil ? "puzzlepiece.extension" : "list.bullet.rectangle",
+                        title: probe.title,
                         subtitle: probe.source)
                 .padding(14)
             Divider()
@@ -425,7 +428,8 @@ struct HandoffSheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 DestinationLine()
                 HStack {
-                    Text("The file extension is added for you.")
+                    Text(probe.origin == nil ? "The file extension is added for you."
+                         : "Leave a name empty to name it after its page.")
                         .font(.caption).foregroundColor(.secondary)
                     Spacer()
                     Button("Cancel") { session.sheet = nil }

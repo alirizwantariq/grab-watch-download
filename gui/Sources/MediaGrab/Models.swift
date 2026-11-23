@@ -391,17 +391,44 @@ enum Naming {
 
     /// First http(s)/magnet link inside a piece of text (clipboard, drops).
     static func firstLink(in text: String) -> String? {
-        for raw in text.split(whereSeparator: { $0 == "\n" || $0 == " " || $0 == "\t" || $0 == "\r" }) {
-            let token = String(raw).trimmingCharacters(in: CharacterSet(charactersIn: "<>\"'()[],"))
+        allLinks(in: text, limit: 1).first
+    }
+
+    /// Every http(s)/magnet link in a piece of text, in order, without
+    /// repeats (a pasted list, a links.txt file, an email).
+    static func allLinks(in text: String, limit: Int = 200) -> [String] {
+        var out: [String] = []
+        var seen = Set<String>()
+        let separators: (Character) -> Bool = { " \n\t\r\"'<>()[],;|".contains($0) }
+        for raw in text.split(whereSeparator: separators) {
+            var token = String(raw)
+            while let last = token.last, ".!?".contains(last) { token.removeLast() }
             let lower = token.lowercased()
-            if lower.hasPrefix("magnet:?") { return token }
-            if (lower.hasPrefix("http://") || lower.hasPrefix("https://")),
-               let comps = URLComponents(string: token), let host = comps.host, host.contains(".")
-                || comps.host == "localhost" {
-                return token
+            let ok: Bool
+            if lower.hasPrefix("magnet:?") {
+                ok = true
+            } else if lower.hasPrefix("http://") || lower.hasPrefix("https://"),
+                      let comps = URLComponents(string: token), let host = comps.host {
+                ok = host.contains(".") || host == "localhost"
+            } else {
+                ok = false
             }
+            guard ok, seen.insert(token).inserted else { continue }
+            out.append(token)
+            if out.count >= limit { break }
         }
-        return nil
+        return out
+    }
+
+    /// A link that names a file itself (…/clip.mp4, …/setup.dmg) rather
+    /// than a page that has to be looked at.
+    static func looksLikeFile(_ link: String) -> Bool {
+        let ext = (fileName(fromURL: link) as NSString).pathExtension.lowercased()
+        guard !ext.isEmpty, !["html", "htm", "php", "asp", "aspx", "jsp"].contains(ext) else {
+            return false
+        }
+        return MediaGrabCategory.category(forPath: "x." + ext) != "Other"
+            || ["bin", "exe", "msi", "apk", "srt", "vtt", "m3u8", "mpd"].contains(ext)
     }
 }
 

@@ -132,12 +132,24 @@ final class HandoffProbe: ObservableObject, Identifiable {
         didSet { watchItems() }
     }
     let destination: String?
+    /// nil = sent from the browser; otherwise what the links came from
+    /// ("the clipboard", "links.txt")
+    let origin: String?
     private var watchers = Set<AnyCancellable>()
 
-    init(items: [HandoffItem], destination: String?) {
+    init(items: [HandoffItem], destination: String?, origin: String? = nil) {
         self.items = items
         self.destination = destination
+        self.origin = origin
         watchItems()
+    }
+
+    var title: String {
+        if let origin {
+            return items.count == 1 ? "1 link from \(origin)" : "\(items.count) links from \(origin)"
+        }
+        return items.count == 1 ? "Download from your browser"
+            : "\(items.count) downloads from your browser"
     }
 
     /// Ticking or renaming one item changes the sheet's "Download N" button.
@@ -150,11 +162,16 @@ final class HandoffProbe: ObservableObject, Identifiable {
         }
     }
 
+    /// Ticked items with a usable name (an empty name means "automatic").
     var chosen: [HandoffItem] {
-        items.filter { $0.included && Naming.isValid($0.name) }
+        items.filter { $0.included && ($0.name.isEmpty || Naming.isValid($0.name)) }
     }
 
     var source: String {
+        if origin != nil {
+            let hosts = Set(items.compactMap { URLComponents(string: $0.url)?.host })
+            return hosts.count == 1 ? hosts.first! : "\(hosts.count) sites"
+        }
         let pages = Set(items.compactMap(\.referer))
         if pages.count == 1, let only = pages.first { return only }
         return pages.isEmpty ? "sent from the browser" : "\(pages.count) pages"
@@ -275,11 +292,16 @@ final class Session: ObservableObject {
             scanTorrent(trimmed)
             return
         }
-        guard let link = Naming.firstLink(in: trimmed) else {
+        let links = Naming.allLinks(in: trimmed)
+        guard let link = links.first else {
             store.flash("That does not look like a link — paste an http(s) or magnet link")
             return
         }
         urlString = ""
+        if links.count > 1 {
+            addLinks(links, from: "the clipboard")
+            return
+        }
         if Naming.isTorrent(link) {
             scanTorrent(link)
         } else {
@@ -353,15 +375,75 @@ final class Session: ObservableObject {
     func startHandoff(_ probe: HandoffProbe) {
         let chosen = probe.chosen
         for item in chosen.reversed() {
-            var request = DownloadRequest(url: item.url, title: item.name,
+            let name = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            var request = DownloadRequest(url: item.url,
+                                          title: name.isEmpty ? Naming.suggested(forURL: item.url) : name,
                                           referer: item.referer,
                                           destination: destination,
-                                          outName: item.name)
+                                          outName: name.isEmpty ? nil : name)
             request.cookies = item.cookies
+            request.isTorrent = Naming.isTorrent(item.url)
             store.start(request)
         }
         sheet = nil
         store.flash("Added \(chosen.count) download\(chosen.count == 1 ? "" : "s")")
+    }
+
+    // MARK: several links at once
+
+    /// A list of links (pasted, dropped, a links.txt): one sheet to name,
+    /// untick and send them all. File links keep their file name; pages are
+    /// named after their video automatically unless a name is typed.
+    func addLinks(_ links: [String], from origin: String) {
+        let items = links.map { link -> HandoffItem in
+            let file = Naming.looksLikeFile(link)
+            let kind = Naming.isTorrent(link) ? "torrent" : file ? "file" : "page"
+            return HandoffItem(url: link,
+                               name: file ? Naming.suggested(forURL: link) : "",
+                               referer: nil, kind: kind)
+        }
+        let probe = HandoffProbe(items: items, destination: nil, origin: origin)
+        if !store.askBeforeDownload {
+            startHandoff(probe)
+            return
+        }
+        sheet = .handoff(probe)
+    }
+
+    /// Links in a text file (links.txt, a saved list, an .m3u).
+    func importLinks(from file: URL) {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+              (attrs[.size] as? NSNumber)?.intValue ?? 0 <= 4_000_000,
+              let data = FileManager.default.contents(atPath: file.path) else {
+            store.flash("Could not read \(file.lastPathComponent)")
+            return
+        }
+        let text = String(decoding: data, as: UTF8.self)
+        let links = Naming.allLinks(in: text)
+        guard !links.isEmpty else {
+            store.flash("No links in \(file.lastPathComponent)")
+            return
+        }
+        if links.count == 1 {
+            submit(links[0])
+        } else {
+            addLinks(links, from: file.lastPathComponent)
+        }
+    }
+
+    func chooseLinkFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .text, .commaSeparatedText, .m3uPlaylist,
+                                     .init(filenameExtension: "torrent") ?? .data]
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Import"
+        panel.message = "Choose a text file with links (one per line, or anywhere in the text)"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if url.pathExtension.lowercased() == "torrent" {
+            scanTorrent(url.path)
+        } else {
+            importLinks(from: url)
+        }
     }
 
     // MARK: link → download
@@ -541,23 +623,46 @@ final class Session: ObservableObject {
     // MARK: drag & drop
 
     func dropped(_ providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        if provider.canLoadObject(ofClass: URL.self) {
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                guard let url else { return }
-                DispatchQueue.main.async {
-                    self.submit(url.isFileURL ? url.path : url.absoluteString)
+        guard !providers.isEmpty else { return false }
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var texts: [Int: String] = [:]
+        var files: [URL] = []
+        for (index, provider) in providers.enumerated() {
+            if provider.canLoadObject(ofClass: URL.self) {
+                group.enter()
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                    lock.lock()
+                    if let url {
+                        if url.isFileURL { files.append(url) } else { texts[index] = url.absoluteString }
+                    }
+                    lock.unlock()
+                    group.leave()
+                }
+            } else if provider.canLoadObject(ofClass: NSString.self) {
+                group.enter()
+                _ = provider.loadObject(ofClass: NSString.self) { obj, _ in
+                    lock.lock()
+                    if let text = obj as? String { texts[index] = text }
+                    lock.unlock()
+                    group.leave()
                 }
             }
-            return true
         }
-        if provider.canLoadObject(ofClass: NSString.self) {
-            _ = provider.loadObject(ofClass: NSString.self) { obj, _ in
-                guard let text = obj as? String else { return }
-                DispatchQueue.main.async { self.submit(text) }
+        group.notify(queue: .main) {
+            for file in files {
+                let ext = file.pathExtension.lowercased()
+                if ext == "torrent" {
+                    self.scanTorrent(file.path)
+                } else if ["txt", "text", "csv", "m3u", "list", "md", ""].contains(ext) {
+                    self.importLinks(from: file)
+                } else {
+                    self.store.flash("\(file.lastPathComponent) is not a link list — drop links or a .txt file")
+                }
             }
-            return true
+            let joined = texts.keys.sorted().compactMap { texts[$0] }.joined(separator: "\n")
+            if !joined.isEmpty { self.submit(joined) }
         }
-        return false
+        return true
     }
 }
