@@ -335,12 +335,15 @@ def _close_quietly(conn) -> None:
 # host/path/scheme, exactly like a browser: a redirect to a CDN on another
 # domain never receives the page's session cookies.
 _COOKIE_JAR: http.cookiejar.CookieJar | None = None
+_COOKIE_FILE: str | None = None        # where _COOKIE_JAR came from (for yt-dlp)
 COOKIE_FILE_MAGIC = "# Netscape HTTP Cookie File"
 
 
 def set_cookie_jar(jar: http.cookiejar.CookieJar | None) -> None:
-    global _COOKIE_JAR
+    global _COOKIE_JAR, _COOKIE_FILE
     _COOKIE_JAR = jar
+    if jar is None:
+        _COOKIE_FILE = None
 
 
 def load_cookie_file(path: str) -> http.cookiejar.CookieJar | None:

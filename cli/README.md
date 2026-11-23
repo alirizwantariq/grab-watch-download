@@ -69,6 +69,7 @@ mgd set-default root ~/Downloads   # default root (categories become subdirs)
 mgd defaults                       # show the current mapping
 mgd list                           # unfinished downloads + how to resume
 mgd resume <id> | resume all       # resume saved downloads
+mgd resume <id> --url <link|page>  # continue through a fresh link to the same file
 mgd list --json                    # machine-readable (id, state, done, size…)
 mgd defaults --json / doctor --json  # settings + tool readiness for GUIs
 ```
@@ -82,6 +83,20 @@ automated (the MediaGrab app, scripts) should use the id. `pause`, `resume`
 and `cancel` accept the id, the output file path, or the row number.
 `--json-progress` runs announce their id in the first event:
 `{"type":"start","url":…,"id":"d3fa9c01b2e","out_path":…}`.
+
+### Expired links
+
+Video sites often hand out signed links that stop working after a while
+(`?token=…`, `?secure=…,<expiry>`). When a download's link dies (401, 403,
+404 or 410) mgd re-reads the page it came from, picks the link that looks
+like the same file (same path, else same file name) and continues only when
+it provably is the same file: the same size, and the same bytes as a piece
+already on disk. This happens on resume and mid-download, as long as each
+fresh link makes progress. Without a recorded page, the error says so
+(`"kind": "link_expired"` in `--json-progress`) and
+`mgd resume <id> --url <new link or page>` continues it; a link to a
+different file is refused (`"kind": "link_mismatch"`) and the part is left
+untouched. A download that fails part-way saves its exact position first.
 
 ### What a link turns into
 

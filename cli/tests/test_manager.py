@@ -907,3 +907,237 @@ def test_extension_hands_over_the_login_with_the_download(tmp_path):
         assert target.read_bytes() == content
     finally:
         site.stop()
+
+
+# ── expired links ────────────────────────────────────────────────────────
+
+class _ExpiringSite:
+    """Signed links like the video CDNs hand out: every visit to
+    /watch/<name> issues /v/<name>?token=N with a new N, and only the newest
+    token works (older ones get 403). /fake/<name> is the same size as the
+    real file with different bytes; /watch-fake/<name> points at it."""
+
+    def __init__(self, size: int = 3 * 1024 * 1024, delay: float = 0.0,
+                 cut_after: int | None = None):
+        self.size, self.delay, self.cut_after = size, delay, cut_after
+        self.tokens: dict[str, int] = {}
+        self.ranges: list[tuple[str, int]] = []      # (name, first byte) per /v/ request
+        self.lock = threading.Lock()
+        site = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _plain(self, status, body=b"", ctype="text/html"):
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                path, _, query = self.path.partition("?")
+                parts = path.strip("/").split("/")
+                if len(parts) != 2:
+                    return self._plain(404)
+                kind, name = parts
+                if kind in ("watch", "watch-fake"):
+                    token = site.rotate(name)
+                    target = "v" if kind == "watch" else "fake"
+                    return self._plain(200, (f'<html><body><video src="/{target}/{name}?token={token}">'
+                                             f'</video></body></html>').encode())
+                if kind == "fake":
+                    return self._file(name, bytes(reversed(site.content(name))))
+                if kind != "v":
+                    return self._plain(404)
+                token = int(dict(x.split("=", 1) for x in query.split("&") if "=" in x).get("token", -1))
+                if token != site.tokens.get(name):
+                    return self._plain(403, b"expired")
+                return self._file(name, site.content(name), token)
+
+            def _file(self, name, body, token=None):
+                first, last = 0, len(body) - 1
+                rng = self.headers.get("Range", "")
+                if rng.startswith("bytes="):
+                    a, _, b = rng[6:].partition("-")
+                    first, last = int(a), (int(b) if b else len(body) - 1)
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {first}-{last}/{len(body)}")
+                else:
+                    self.send_response(200)
+                if token is not None:
+                    with site.lock:
+                        site.ranges.append((name, first))
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(last - first + 1))
+                self.end_headers()
+                sent = 0
+                try:
+                    for i in range(first, last + 1, 64 * 1024):
+                        chunk = body[i:min(i + 64 * 1024, last + 1)]
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        sent += len(chunk)
+                        if site.delay:
+                            time.sleep(site.delay)
+                        if token is not None and site.cut_after and sent >= site.cut_after:
+                            site.rotate(name)            # the link expires…
+                            self.close_connection = True
+                            return                       # …and the transfer is cut
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def content(self, name: str) -> bytes:
+        seed = (name * 8).encode()[:32].ljust(32, b"#")
+        return (bytes(range(256)) + seed) * (self.size // 288) + b"!" * (self.size % 288)
+
+    def rotate(self, name: str) -> int:
+        with self.lock:
+            self.tokens[name] = self.tokens.get(name, 0) + 1
+            return self.tokens[name]
+
+    def link(self, name: str) -> str:
+        return f"{self.base}/v/{name}?token={self.tokens.get(name, 0)}"
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _events(stdout: str) -> list[dict]:
+    return [json.loads(line) for line in stdout.splitlines() if line.startswith('{"type"')]
+
+
+def _start_and_pause(tmp_path, args) -> tuple[dict, pathlib.Path]:
+    proc = subprocess.Popen([sys.executable, "bin/mgd", "grab", *args, "-c", "1", "-q"],
+                            cwd=str(CLI_DIR), env=_env(tmp_path),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            items = _items(tmp_path)
+            if items and items[0]["done"] > 300_000:
+                break
+            time.sleep(0.2)
+        item = _items(tmp_path)[0]
+        assert _mgd(tmp_path, ["pause", item["id"]]).returncode == 0
+        proc.wait(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    return _items(tmp_path)[0], pathlib.Path(item["out_path"])
+
+
+def test_link_score_prefers_the_same_file():
+    old = ["https://cdn1.site/videos/-1/456/vid_720p.mp4?secure=OLD,111"]
+    assert m._link_score("https://cdn1.site/videos/-1/456/vid_720p.mp4?secure=NEW", old) == 4
+    assert m._link_score("https://cdn7.site/videos/-1/456/vid_720p.mp4?secure=NEW", old) == 3
+    assert m._link_score("https://x.site/get_file/3/abc/vid_720p.mp4/?t=1", old) == 2
+    assert m._link_score("https://cdn1.site/videos/-1/999/other_720p.mp4", old) == 1
+    assert m._link_score("https://cdn1.site/videos/-1/456/vid_480p.mp4", old) == 0
+
+
+def test_expired_link_is_refreshed_from_its_page_on_resume(tmp_path):
+    site = _ExpiringSite(delay=0.1)
+    try:
+        item, out = _start_and_pause(tmp_path, [site.base + "/watch/clip.mp4", "-d", str(tmp_path / "o")])
+        assert item["state"] == "paused" and 0 < item["done"] < site.size
+        site.rotate("clip.mp4")                       # time passes: the link expires
+        site.delay = 0
+        res = _mgd(tmp_path, ["resume", item["id"], "--json-progress"], timeout=120)
+        assert res.returncode == 0, res.stdout[-800:] + res.stderr[-800:]
+        notes = [e["message"] for e in _events(res.stdout) if e["type"] == "note"]
+        assert any("fresh link" in n for n in notes), notes
+        assert out.read_bytes() == site.content("clip.mp4")
+        # it continued from the saved part instead of starting over
+        assert max(first for _, first in site.ranges[1:]) >= item["done"] - 600_000
+        assert _items(tmp_path) == []
+    finally:
+        site.stop()
+
+
+def test_link_that_dies_mid_download_is_refreshed_automatically(tmp_path):
+    site = _ExpiringSite(cut_after=1024 * 1024)      # every link dies after 1 MB
+    try:
+        out = _mgd(tmp_path, ["grab", site.base + "/watch/long.mp4", "-d", str(tmp_path / "o"),
+                              "-c", "1", "--json-progress"], timeout=120)
+        assert out.returncode == 0, out.stdout[-800:] + out.stderr[-800:]
+        assert (tmp_path / "o" / "long.mp4").read_bytes() == site.content("long.mp4")
+        assert sum(1 for e in _events(out.stdout) if e["type"] == "note"
+                   and "fresh link" in e["message"]) == 2      # 3 MB = 2 refreshes
+        assert [e for e in _events(out.stdout) if e["type"] == "done"]
+    finally:
+        site.stop()
+
+
+def test_refresh_never_accepts_a_different_file(tmp_path):
+    """Same size, different bytes: refused, and the part is left untouched."""
+    site = _ExpiringSite(delay=0.1)
+    try:
+        item, out = _start_and_pause(tmp_path, [site.base + "/watch/real.mp4", "-d", str(tmp_path / "o")])
+        part = pathlib.Path(str(out) + ".mgdpart")
+        before = part.read_bytes()
+        state = pathlib.Path(str(out) + ".mgdstate")
+        st = json.loads(state.read_text())
+        st["referer"] = site.base + "/watch-fake/real.mp4"      # the page now shows another file
+        state.write_text(json.dumps(st))
+        site.rotate("real.mp4")
+        res = _mgd(tmp_path, ["resume", item["id"], "--json-progress"])
+        assert res.returncode == 1
+        err = [e for e in _events(res.stdout) if e["type"] == "error"][-1]
+        assert err["kind"] == "link_expired" and "different content" in err["message"], err
+        assert part.read_bytes() == before, "the downloaded part must not change"
+        assert _items(tmp_path)[0]["done"] == item["done"]
+    finally:
+        site.stop()
+
+
+def test_replacement_link_from_the_user(tmp_path):
+    site = _ExpiringSite(delay=0.1)
+    try:
+        site.rotate("direct.mp4")
+        item, out = _start_and_pause(tmp_path, [site.link("direct.mp4"), "-d", str(tmp_path / "o")])
+        site.rotate("direct.mp4")
+        site.delay = 0
+        # no page recorded: it cannot refresh by itself and says so
+        res = _mgd(tmp_path, ["resume", item["id"], "--json-progress"])
+        err = [e for e in _events(res.stdout) if e["type"] == "error"][-1]
+        assert res.returncode == 1 and err["kind"] == "link_expired", err
+        assert "no page was recorded" in err["message"]
+        # a link to another file is refused, nothing changes
+        site.rotate("other.mp4")
+        bad = _mgd(tmp_path, ["resume", item["id"], "--url", site.link("other.mp4"), "--json-progress"])
+        err = [e for e in _events(bad.stdout) if e["type"] == "error"][-1]
+        assert bad.returncode == 1 and err["kind"] == "link_mismatch", err
+        assert _items(tmp_path)[0]["done"] == item["done"]
+        # the user pastes the page it is on: found, checked, continued
+        ok = _mgd(tmp_path, ["resume", item["id"], "--url", site.base + "/watch/direct.mp4",
+                             "--json-progress"], timeout=120)
+        assert ok.returncode == 0, ok.stdout[-600:] + ok.stderr[-600:]
+        assert out.read_bytes() == site.content("direct.mp4")
+    finally:
+        site.stop()
+
+
+def test_link_from_a_page_that_expired_before_the_download_started(tmp_path):
+    site = _ExpiringSite()
+    try:
+        site.rotate("late.mp4")
+        handed_over = site.link("late.mp4")            # what the extension saw
+        site.rotate("late.mp4")                        # …and it expired since
+        out = _mgd(tmp_path, ["grab", handed_over, "--referer", site.base + "/watch/late.mp4",
+                              "-d", str(tmp_path / "o"), "--out-name", "Late clip", "--json-progress"])
+        assert out.returncode == 0, out.stdout[-600:] + out.stderr[-600:]
+        assert (tmp_path / "o" / "Late clip.mp4").read_bytes() == site.content("late.mp4")
+        assert not list((tmp_path / "o").glob("*.mgd*"))
+    finally:
+        site.stop()

@@ -324,7 +324,8 @@ class Downloader:
                  referer: str | None = None,
                  mirror_hosts: list[str] | None = None,
                  max_speed: int | None = None,
-                 cookies_file: str | None = None):
+                 cookies_file: str | None = None,
+                 relinked: bool = False):
         self.url = url
         # the link the user asked for; self.url moves to the redirect target
         # once probed (signed CDN urls differ per visit and expire)
@@ -345,6 +346,10 @@ class Downloader:
         # the site login (cookies.txt) this download was started with; the
         # requests themselves pick cookies from net's jar
         self.cookies_file = cookies_file
+        # resuming through a different link to the same file (an expired
+        # signed url replaced by a fresh one): the caller has already checked
+        # size and content, so the saved positions apply to the new url
+        self.relinked = relinked
         # traffic shaping (mgd set-default speed-limit / --max-speed)
         self._governor = _SpeedGovernor(own_limit=max_speed)
 
@@ -390,6 +395,12 @@ class Downloader:
                     raise DownloadError("remote file kept changing during the download") from None
             except Interrupted:
                 self.flush()
+                self.save_state()
+                self._close_part()
+                raise
+            except (DownloadError, HttpError, OSError):
+                # keep exact positions for a later resume: the periodic save
+                # can be up to half a second (megabytes) behind
                 self.save_state()
                 self._close_part()
                 raise
@@ -482,6 +493,15 @@ class Downloader:
             return None
         if state.get("kind") != "mgd-download-state":
             return None
+        if self.relinked:
+            # a fresh link to the same file: identity was verified by size +
+            # content sample before getting here; another CDN node may well
+            # report a different etag / last-modified for the same bytes
+            if pr.size is None or state.get("size") != pr.size:
+                return None
+            if not isinstance(state.get("segments"), list):
+                return None
+            return state
         # same file when either the final url matches, or the link the user
         # originally asked for does (it may redirect to a fresh signed url on
         # every visit - etag/last-modified/size below still guard identity)

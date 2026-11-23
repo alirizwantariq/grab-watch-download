@@ -118,6 +118,10 @@ def build_parser() -> argparse.ArgumentParser:
     rs = sub.add_parser("resume", aliases=["cont"],
                         help="resume a saved download")
     rs.add_argument("target", help="id from 'mgd list' or 'all'")
+    rs.add_argument("--url", dest="new_url", default=None,
+                    help="continue through a new link to the same file (when the "
+                         "old one expired): the file link itself, or the page "
+                         "it is on. Checked against the downloaded part first")
     rs.add_argument("--json-progress", action="store_true", dest="json_progress",
                     help="emit NDJSON progress events (for GUIs/scripts)")
     ps = sub.add_parser("pause", help="pause a running download (by id from 'mgd list')")
@@ -957,6 +961,17 @@ def cmd_grab(args) -> int:
     try:
         page_links = _page_media(args.url, headers, args.proxy)
     except HttpError as err:
+        if _link_dead(err) and args.referer and not getattr(args, "_fresh_tried", False):
+            # a link handed over from a page that has expired since
+            fresh = _fresh_link_before_start(args.url, args.referer)
+            if fresh:
+                _note(bool(getattr(args, "json_progress", False)),
+                      "the link from the page had expired - using a fresh one")
+                retry = argparse.Namespace(**vars(args))
+                retry.url, retry._fresh_tried = fresh, True
+                if not retry.out_name and not retry.out:
+                    retry.out_name = _url_filename_of(args.url)
+                return cmd_grab(retry)
         if err.status in (403, 429) and shutil.which("yt-dlp"):
             print(f"# plain fetch blocked by {err.status} - delegating to yt-dlp")
             return _grab_platform(args, cfg, args.url)
@@ -1079,6 +1094,7 @@ def cmd_grab(args) -> int:
                         cookies_file=cookies_file,
                         expected_sha256=args.sha256 if t["kind"] == "direct" else None)
         dl.pid = os.getpid()
+        page_of_link = dl.referer
         try:
             progress_cb = None
             if args.json_progress:
@@ -1102,11 +1118,44 @@ def cmd_grab(args) -> int:
                   file=sys.stderr)
             return 130
         except (DownloadError, HttpError, OSError) as err:
-            if getattr(args, "json_progress", False):
-                print(json.dumps(
-                    {"type": "error", "message": str(err)}), flush=True)
+            as_json = bool(getattr(args, "json_progress", False))
+            st_path = pathlib.Path(str(out_path) + STATE_SUFFIX)
+            if _link_dead(err) and page_of_link and st_path.exists():
+                # the link expired part-way: continue through a fresh one
+                code = _resume_one(st_path, as_json, link_dead=True, announce=False)
+                if code == 130:
+                    return 130
+                if code == 0:
+                    results.append(out_path)
+                else:
+                    failures += 1
+                continue
+            if _link_dead(err) and page_of_link and not st_path.exists() \
+                    and not getattr(args, "_fresh_tried", False):
+                fresh = _fresh_link_before_start(url_i, page_of_link)
+                if fresh:
+                    _note(as_json, "the link from the page had expired - using a fresh one")
+                    retry = argparse.Namespace(**vars(args))
+                    retry.url, retry.referer, retry._fresh_tried = fresh, page_of_link, True
+                    retry.out_name = out_path.name
+                    retry.dir, retry.out = str(out_path.parent), None
+                    for leftover in (pathlib.Path(str(out_path) + PART_SUFFIX),):
+                        try:
+                            leftover.unlink()
+                        except OSError:
+                            pass
+                    code = cmd_grab(retry)
+                    if code == 130:
+                        return 130
+                    if code == 0:
+                        results.append(out_path)
+                    else:
+                        failures += 1
+                    continue
+            if _link_dead(err):
+                _emit_error(as_json, f"{url_i}: {err}", kind="link_expired")
             else:
-                print(_fail(f"{url_i}: {err}"), file=sys.stderr)
+                _emit_error(as_json, f"{url_i}: {err}" if not as_json else str(err))
             failures += 1
     if results:
         print(f"{len(results)} downloaded, {failures} failed")
@@ -1491,6 +1540,7 @@ def _use_cookies(path) -> str | None:
         print(f"# cookies file not usable, continuing without it: {path}", file=sys.stderr)
         return None
     net.set_cookie_jar(jar)
+    net._COOKIE_FILE = path
     return path
 
 
@@ -2501,12 +2551,324 @@ def cmd_qualities(args) -> int:
     return 0
 
 
+# ── expired links: find the same file again ──────────────────────────────
+# Many video sites hand out signed links that stop working after a few hours
+# (?secure=…,<expiry>, ?token=…). A download that outlives its link gets
+# 401/403/404/410. The page it came from hands out a fresh link to the same
+# file: re-read it, pick the link that looks like ours, and accept it only
+# when it is provably the same file - same size, and the same bytes as the
+# part already downloaded.
+
+LINK_DEAD_STATUS = {401, 403, 404, 410}
+_QUALITY_TOKEN = re.compile(r"(\d{3,4})p(?=[._\-/]|$)", re.I)
+
+
+def _link_dead(err) -> bool:
+    return isinstance(err, HttpError) and getattr(err, "status", None) in LINK_DEAD_STATUS
+
+
+def _link_score(cand: str, olds) -> int:
+    """How much a link from the page looks like the dead one: 4 same host +
+    path, 3 same path (another cdn node), 2 same file name, 1 same quality
+    label, 0 nothing in common."""
+    c = u.urlsplit(cand)
+    c_name = c.path.rstrip("/").rsplit("/", 1)[-1]
+    best = 0
+    for old in olds:
+        if not old:
+            continue
+        o = u.urlsplit(old)
+        o_name = o.path.rstrip("/").rsplit("/", 1)[-1]
+        if c.path == o.path and c.path not in ("", "/"):
+            score = 4 if c.netloc == o.netloc else 3
+        elif c_name and c_name == o_name:
+            score = 2
+        else:
+            cq, oq = _QUALITY_TOKEN.search(c.path), _QUALITY_TOKEN.search(o.path)
+            score = 1 if cq and oq and cq.group(1) == oq.group(1) else 0
+        best = max(best, score)
+    return best
+
+
+def _proxy_from_config() -> str | None:
+    return _cfg().get("proxy") or os.environ.get("HTTPS_PROXY")
+
+
+def _links_on_page(page: str) -> list[str]:
+    """Media links on a page: the page's own html first, then yt-dlp's site
+    extractors (players that build their source in javascript)."""
+    found: list[str] = []
+    try:
+        html = _fetch_page(page, {"User-Agent": net.DEFAULT_UA}, _proxy_from_config())
+    except (HttpError, OSError):
+        html = None
+    if html:
+        found += [it["url"] for it in grab.extract_media_catalog(html, page)
+                  if not _is_stream_manifest(it["url"])]
+    ytdlp = shutil.which("yt-dlp")
+    if ytdlp and not found:
+        strategies = [("chrome UA", _ytdlp_base_args() + [
+            "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"])]
+        jar_file = getattr(net, "_COOKIE_FILE", None)
+        if jar_file:
+            strategies.insert(0, ("site login", _ytdlp_base_args() + ["--cookies", jar_file]))
+        info, _ = _probe_ytdlp_info(ytdlp, strategies, page, ["--no-playlist"])
+        if info:
+            for f in [info] + list(info.get("formats") or []) + list(info.get("requested_formats") or []):
+                link = f.get("url") if isinstance(f, dict) else None
+                proto = (f.get("protocol") or "") if isinstance(f, dict) else ""
+                if link and link.startswith("http") and "m3u8" not in proto \
+                        and not _is_stream_manifest(link):
+                    found.append(link)
+    seen, out = set(), []
+    for link in found:
+        if link not in seen:
+            seen.add(link)
+            out.append(link)
+    return out
+
+
+def _same_file(url: str, st: dict, st_path: pathlib.Path, referer: str | None) -> tuple[bool, str]:
+    """Is url the file this saved download is about? Same size, and the same
+    bytes as a piece already on disk."""
+    from .engine import probe as engine_probe, DEFAULT_HEADERS
+    headers = dict(DEFAULT_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+    want = st.get("size")
+    try:
+        pr = engine_probe(url, _proxy_from_config(), 15.0, headers=headers)
+    except (HttpError, OSError) as err:
+        return False, f"it does not open ({err})"
+    if want is None or pr.size is None:
+        return False, "its size cannot be compared"
+    if pr.size != want:
+        return False, f"it is a different file ({_size_str(pr.size)}, this download is {_size_str(want)})"
+    part = pathlib.Path(str(st_path)[:-len(STATE_SUFFIX)] + PART_SUFFIX)
+    piece = next((sg for sg in st.get("segments", [])
+                  if sg.get("end", -1) >= 0 and sg.get("pos", 0) >= 4096), None)
+    if piece is None or not part.exists():
+        return True, ""                  # nothing on disk to compare yet
+    start = int(piece["start"])
+    n = min(int(piece["pos"]), 64 * 1024)
+    with open(part, "rb") as fh:
+        fh.seek(start)
+        have = fh.read(n)
+    conn = None
+    try:
+        conn, resp = net.open_request(getattr(pr, "final_url", None) or url,
+                                      _proxy_from_config(), "GET", headers=headers,
+                                      timeout=15.0, range_start=start,
+                                      range_end=start + n - 1)
+        if resp.status == 206 or (resp.status == 200 and start == 0):
+            got = resp.read(n)
+        else:
+            return False, f"its content cannot be checked (HTTP {resp.status})"
+    except OSError as err:
+        return False, f"its content cannot be checked ({err})"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+    if got != have:
+        return False, "same size, but different content"
+    return True, ""
+
+
+def _find_fresh_link(st: dict, st_path: pathlib.Path,
+                     hint: str | None = None) -> tuple[str | None, str | None, str]:
+    """(new link, page it came from, why not). hint is what the user pasted:
+    the file link itself, or a page that has it."""
+    olds = [st.get("source_url"), st.get("url")]
+    page = None
+    if hint:
+        try:
+            html = _fetch_page(hint, {"User-Agent": net.DEFAULT_UA}, _proxy_from_config())
+        except (HttpError, OSError) as err:
+            return None, None, f"that link does not open ({err})"
+        if html is None:
+            ok, why = _same_file(hint, st, st_path, st.get("referer"))
+            return (hint, None, "") if ok else (None, None, f"that link is not this file: {why}")
+        page = hint
+        candidates = _links_on_page(page)
+    else:
+        page = st.get("referer")
+        if not page:
+            return None, None, "no page was recorded for it"
+        candidates = [c for c in _links_on_page(page) if c not in olds]
+    if not candidates:
+        return None, page, "the page has no video link any more (it may need you to be signed in)"
+    ranked = sorted(candidates, key=lambda c: -_link_score(c, olds))
+    last_why = ""
+    for cand in ranked[:10]:
+        ok, why = _same_file(cand, st, st_path, page)
+        if ok:
+            return cand, page, ""
+        last_why = why
+    return None, page, ("the page no longer offers this file"
+                        + (f" (closest match: {last_why})" if last_why else ""))
+
+
+def _note(as_json: bool, message: str) -> None:
+    if as_json:
+        print(json.dumps({"type": "note", "message": message}), flush=True)
+    else:
+        print(_arrow(message))
+
+
+def _emit_error(as_json: bool, message: str, kind: str | None = None) -> None:
+    if as_json:
+        ev = {"type": "error", "message": message}
+        if kind:
+            ev["kind"] = kind
+        print(json.dumps(ev), flush=True)
+    else:
+        print(_fail(message), file=sys.stderr)
+
+
+EXPIRED_HELP = ("Open the page in your browser and send the video to MediaGrab "
+                "again, or use Update Link with a fresh link - the part already "
+                "downloaded is kept.")
+
+
+def _resume_one(st_path: pathlib.Path, as_json: bool, new_url: str | None = None,
+                link_dead: bool = False, announce: bool = True) -> int:
+    """Continue one saved (non-torrent) download. 0 done, 130 paused, 1 failed.
+
+    new_url: a replacement link given by the user (checked first).
+    link_dead: the current link is known to be dead (look for a fresh one
+    before trying). A link that dies while downloading is refreshed from
+    the page automatically (at most twice per run)."""
+    st = _read_state(st_path)
+    if st is None:
+        _emit_error(as_json, f"cannot read {st_path}")
+        return 1
+    out_path = pathlib.Path(st.get("out_path") or "")
+    if not out_path.name:
+        out_path = st_path.parent / (st.get("filename") or "download")
+    net.set_cookie_jar(None)
+    cookies_file = _use_cookies(st.get("cookies"))
+    url = st.get("source_url") or st.get("url", "")
+    referer = st.get("referer")
+    relinked = False
+    if new_url:
+        fresh, page, why = _find_fresh_link(st, st_path, hint=new_url)
+        if not fresh:
+            _emit_error(as_json, f"The download was not changed: {why}.", kind="link_mismatch")
+            return 1
+        url, relinked = fresh, True
+        referer = page or referer
+        _note(as_json, "the new link is the same file - continuing from the saved part")
+    if announce:
+        if as_json:
+            print(json.dumps(_start_event(url, out_path)), flush=True)
+        else:
+            print(_arrow(f"resuming {out_path.name} ({st.get('size', '?')} bytes total)"))
+    plain_progress = None if as_json else _make_progress()
+
+    def _cb(done, total, _json=as_json, _plain=plain_progress):
+        if _json:
+            print(json.dumps({"type": "progress", "done": done,
+                              "total": total}), flush=True)
+        else:
+            _plain(done, total)
+
+    def saved_bytes() -> int:
+        now = _read_state(st_path)
+        return _state_done(now) if now else 0
+
+    # keep refreshing while each fresh link gets somewhere; two refreshes in
+    # a row without a byte of progress means the page is not helping
+    fruitless = 0
+    progress_at_refresh = -1
+    dead = link_dead
+    while True:
+        if dead:
+            done_now = saved_bytes()
+            fruitless = fruitless + 1 if done_now <= progress_at_refresh else 0
+            progress_at_refresh = done_now
+            if fruitless >= 2:
+                _emit_error(as_json, "The download link keeps expiring. " + EXPIRED_HELP,
+                            kind="link_expired")
+                return 1
+            _note(as_json, "the download link stopped working - looking for a fresh one on its page")
+            fresh, page, why = _find_fresh_link(_read_state(st_path) or st, st_path)
+            if not fresh:
+                _emit_error(as_json, f"The download link expired and {why}. " + EXPIRED_HELP,
+                            kind="link_expired")
+                return 1
+            url, relinked, dead = fresh, True, False
+            referer = page or referer
+            _note(as_json, "found a fresh link to the same file - continuing")
+        dl = Downloader(url, out_path, proxy=_proxy_from_config(), referer=referer,
+                        mirror_hosts=_mirror_hosts_for(st.get("url", "")),
+                        cookies_file=cookies_file, relinked=relinked,
+                        resume_state=st_path.read_bytes())
+        dl.pid = os.getpid()
+        try:
+            result = dl.run(on_progress=_cb)
+        except KeyboardInterrupt:
+            dl.abort()
+            if as_json:
+                print(json.dumps({"type": "paused"}), flush=True)
+            else:
+                print("\npaused again (state saved)")
+            return 130
+        except (DownloadError, HttpError, OSError) as err:
+            if _link_dead(err) and st_path.exists():
+                dead = True
+                continue
+            _emit_error(as_json, str(err))
+            return 1
+        if as_json:
+            print(json.dumps({"type": "done", "path": str(result.path),
+                              "size": result.size}), flush=True)
+        else:
+            print()
+            print(_ok(f"{result.path} {_size_str(result.size)}"
+                      + (" [was resumed]" if result.resumed else "")))
+        return 0
+
+
+def _url_filename_of(url: str) -> str:
+    from .engine import _url_filename
+    return _url_filename(url)
+
+
+def _fresh_link_before_start(url: str, page: str | None) -> str | None:
+    """A link handed over from a page expired before the download even
+    started (nothing on disk to compare): take the page's link that is
+    plainly the same one (same path or same file name) and that opens."""
+    if not page:
+        return None
+    from .engine import probe as engine_probe, DEFAULT_HEADERS
+    headers = dict(DEFAULT_HEADERS, Referer=page)
+    ranked = sorted((c for c in _links_on_page(page) if c != url),
+                    key=lambda c: -_link_score(c, [url]))
+    for cand in ranked[:5]:
+        if _link_score(cand, [url]) < 2:
+            break
+        try:
+            engine_probe(cand, _proxy_from_config(), 15.0, headers=headers)
+            return cand
+        except (HttpError, OSError):
+            continue
+    return None
+
+
 def cmd_resume(args) -> int:
     states = _find_states()
     if not states:
         print("no unfinished downloads to resume")
         return 0
+    new_url = getattr(args, "new_url", None)
     if args.target == "all":
+        if new_url:
+            print("error: --url needs a single download, not 'all'", file=sys.stderr)
+            return 2
         chosen = states
     else:
         one = _resolve_target(args.target, states, "resume")
@@ -2523,70 +2885,19 @@ def cmd_resume(args) -> int:
             continue
         if _state_pid_alive(st):
             # two processes writing one part file would corrupt it
-            msg = f"{st_path.name[:-len(STATE_SUFFIX)]} is already downloading"
-            if as_json:
-                print(json.dumps({"type": "error", "message": msg}), flush=True)
-            else:
-                print(f"error: {msg}", file=sys.stderr)
+            _emit_error(as_json, f"{st_path.name[:-len(STATE_SUFFIX)]} is already downloading")
             failures += 1
             continue
-        out_path = pathlib.Path(st.get("out_path") or "")
-        if not out_path.name:
-            out_path = st_path.parent / (st.get("filename") or "download")
         if st.get("kind") == TORRENT_STATE_KIND:
             code = _resume_torrent(st, st_path, as_json)
             if code == 130:
                 return 130
             failures += 1 if code else 0
             continue
-        # resume from the link the user asked for when we know it: signed
-        # CDN urls (the redirect target stored as "url") expire
-        resume_url = st.get("source_url") or st.get("url", "")
-        net.set_cookie_jar(None)
-        cookies_file = _use_cookies(st.get("cookies"))
-        dl = Downloader(resume_url, out_path,
-                        proxy=_cfg().get("proxy") or os.environ.get("HTTPS_PROXY"),
-                        referer=st.get("referer"),
-                        mirror_hosts=_mirror_hosts_for(st.get("url", "")),
-                        cookies_file=cookies_file,
-                        resume_state=st_path.read_bytes())
-        dl.pid = os.getpid()
-        if as_json:
-            print(json.dumps(_start_event(resume_url, out_path)), flush=True)
-        else:
-            print(_arrow(f"resuming {out_path.name} ({st.get('size', '?')} bytes total)"))
-
-        plain_progress = None if as_json else _make_progress()
-
-        def _cb(done, total, _json=as_json, _plain=plain_progress):
-            if _json:
-                print(json.dumps({"type": "progress", "done": done,
-                                  "total": total}), flush=True)
-            else:
-                _plain(done, total)
-
-        try:
-            result = dl.run(on_progress=_cb)
-            if as_json:
-                print(json.dumps({"type": "done", "path": str(result.path),
-                                  "size": result.size}), flush=True)
-            else:
-                print()
-                print(_ok(f"{result.path} {_size_str(result.size)}"
-                          + (" [was resumed]" if result.resumed else "")))
-        except KeyboardInterrupt:
-            dl.abort()
-            if as_json:
-                print(json.dumps({"type": "paused"}), flush=True)
-            else:
-                print("\npaused again (state saved)")
+        code = _resume_one(st_path, as_json, new_url=new_url)
+        if code == 130:
             return 130
-        except (DownloadError, HttpError, OSError) as err:
-            if as_json:
-                print(json.dumps({"type": "error", "message": str(err)}), flush=True)
-            else:
-                print(f"FAIL {st_path}: {err}", file=sys.stderr)
-            failures += 1
+        failures += 1 if code else 0
     return 0 if not failures else 1
 
 
