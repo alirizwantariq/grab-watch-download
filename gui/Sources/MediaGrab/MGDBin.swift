@@ -1,7 +1,8 @@
-// Baked at build time by script/build_app.sh.
 import Foundation
 
+/// Where an installed `mgd` may live when the app is not running from a
+/// bundle that carries its own engine (e.g. `swift run` during development).
+/// Engine.launcher checks MEDIAGRAB_MGD and the bundled copy first.
 enum MGD {
-    static let binary = "/opt/homebrew/bin/mgd"
-    static let fallback = "/Users/alirizwantariq/Desktop/code/Personal/media_grab_download/cli/bin/mgd"
+    static let candidates = ["/opt/homebrew/bin/mgd", "/usr/local/bin/mgd"]
 }
