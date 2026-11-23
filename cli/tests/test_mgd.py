@@ -36,6 +36,18 @@ def test_unique_path(tmp_path):
     assert p3.name == "a (2).bin"
 
 
+def test_claim_unique_path_never_reuses_a_finished_file(tmp_path):
+    # a finished file of the same name is kept: the new download gets "(1)"
+    (tmp_path / "clip.mp4").write_bytes(b"finished")
+    p = categorize.claim_unique_path(tmp_path, "clip.mp4")
+    assert p.name == "clip (1).mp4"
+    assert (tmp_path / "clip (1).mp4.mgdpart").exists()
+    # one still downloading (its part file claimed) is skipped as well
+    p2 = categorize.claim_unique_path(tmp_path, "clip.mp4")
+    assert p2.name == "clip (2).mp4"
+    assert (tmp_path / "clip.mp4").read_bytes() == b"finished"
+
+
 def test_extract_page_media():
     html = """<html><body>
       <video src="/media/big-video.mp4" poster="/p.jpg"></video>

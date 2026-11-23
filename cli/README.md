@@ -153,7 +153,9 @@ and `{"type":"convert","progress":0.42}` before the final `done` event.
 | `-q` | quiet progress |
 
 Files land in `root/<category>/` (auto-created), or in an explicitly set
-default path for that category, or `-o`/`-d` override. A direct file URL is
+default path for that category, or `-o`/`-d` override. A file of the same
+name already there is never overwritten: the new one is saved as
+`name (1).ext`, `name (2).ext`, … A direct file URL is
 detected automatically from `Content-Disposition`, `Content-Type`, or the URL;
 page URLs are scanned for `<video>`, `<audio>`, `<source>`, `og:video`,
 `twitter:player:stream`, and file links.

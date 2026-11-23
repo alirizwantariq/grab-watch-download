@@ -13,16 +13,19 @@ final class PendingDownload: ObservableObject, Identifiable {
     let referer: String?
     let poster: String?
     let cookies: String?
+    /// the same video/file finished before (the sheet warns about it)
+    let earlier: EarlierDownload?
     @Published var name: String
 
     init(url: String, quality: String, name: String, referer: String? = nil,
-         poster: String? = nil, cookies: String? = nil) {
+         poster: String? = nil, cookies: String? = nil, earlier: EarlierDownload? = nil) {
         self.url = url
         self.quality = quality
         self.name = name
         self.referer = referer
         self.poster = poster
         self.cookies = cookies
+        self.earlier = earlier
     }
 }
 
@@ -56,13 +59,18 @@ final class BatchProbe: ObservableObject, Identifiable {
     let url: String
     let items: [BatchItem]
     let cookies: String?
+    /// items whose video was downloaded before (they start unticked)
+    let earlier: [UUID: EarlierDownload]
     @Published var selected: Set<UUID>
 
-    init(url: String, items: [BatchItem], cookies: String? = nil) {
+    init(url: String, items: [BatchItem], cookies: String? = nil,
+         earlier: [UUID: EarlierDownload] = [:]) {
         self.url = url
         self.items = items
         self.cookies = cookies
-        selected = Set(items.map(\.id))   // everything ticked by default
+        self.earlier = earlier
+        // everything new ticked by default
+        selected = Set(items.map(\.id).filter { earlier[$0] == nil })
     }
 
     var chosen: [BatchItem] { items.filter { selected.contains($0.id) } }
@@ -115,6 +123,8 @@ final class HandoffItem: ObservableObject, Identifiable {
     let cookies: String?
     @Published var name: String
     @Published var included = true
+    /// the same video/file finished before (shown, and starts unticked)
+    var earlier: EarlierDownload?
 
     init(url: String, name: String, referer: String?, kind: String, cookies: String? = nil) {
         self.url = url
@@ -235,13 +245,41 @@ enum ActiveSheet: Identifiable {
     }
 }
 
-/// A destructive action waiting for the user's OK.
+/// An action waiting for the user's OK (deleting, stopping, downloading
+/// something a second time).
 struct Confirmation: Identifiable {
     let id = UUID()
     let title: String
     let message: String
     let actionLabel: String
+    var destructive = true
+    /// an optional third button ("Show in Finder")
+    var otherLabel: String?
+    var otherAction: (() -> Void)?
     let action: () -> Void
+}
+
+/// A finished download of the same video/file (the duplicate warning).
+struct EarlierDownload {
+    let title: String
+    let path: String
+    let finishedAt: Date?
+
+    init(_ job: DownloadJob) {
+        title = job.title
+        path = job.finishedPath ?? ""
+        finishedAt = job.finishedAt
+    }
+
+    var fileName: String { (path as NSString).lastPathComponent }
+    /// "2 days ago" / "" when unknown
+    var when: String { fmtWhen(finishedAt) }
+    /// "Already downloaded 2 days ago"
+    var summary: String { when.isEmpty ? "Already downloaded" : "Already downloaded \(when)" }
+
+    func reveal() {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
 }
 
 // MARK: - window state + the "add a download" flows
@@ -278,6 +316,9 @@ final class Session: ObservableObject {
     }()
 
     private var store: JobStore { JobStore.shared }
+    /// links (by identity) the user already said "Download Again" to while
+    /// adding the current link, so later steps do not ask a second time
+    private var downloadAgain = Set<String>()
     private init() {}
 
     // MARK: entry points
@@ -316,7 +357,68 @@ final class Session: ObservableObject {
         if Naming.isTorrent(link) {
             scanTorrent(link)
         } else {
-            probe(link, title: title, cookies: cookies)
+            downloadAgain.removeAll()
+            let go: () -> Void = { [weak self] in self?.probe(link, title: title, cookies: cookies) }
+            if let earlier = unconfirmedDuplicate(link) {
+                askDownloadAgain(earlier, link: link, then: go)
+            } else {
+                go()
+            }
+        }
+    }
+
+    // MARK: duplicates
+
+    /// The finished download of the same video/file, unless the user
+    /// already chose to download it again.
+    private func unconfirmedDuplicate(_ link: String) -> EarlierDownload? {
+        if let id = Naming.identity(of: link), downloadAgain.contains(id) { return nil }
+        return store.earlierDownload(of: link).map(EarlierDownload.init)
+    }
+
+    private func askDownloadAgain(_ earlier: EarlierDownload, link: String,
+                                  then proceed: @escaping () -> Void) {
+        let when = earlier.when.isEmpty ? "before" : earlier.when
+        confirmation = Confirmation(
+            title: "Download “\(earlier.title)” again?",
+            message: "You downloaded it \(when): \(earlier.fileName).",
+            actionLabel: "Download Again", destructive: false,
+            otherLabel: "Show in Finder", otherAction: { earlier.reveal() },
+            action: { [weak self] in
+                if let id = Naming.identity(of: link) { self?.downloadAgain.insert(id) }
+                proceed()
+            })
+    }
+
+    /// Marks (and unticks) the items of a list that were downloaded before.
+    /// Returns how many.
+    @discardableResult
+    private func markDuplicates(_ items: [HandoffItem]) -> Int {
+        var count = 0
+        for item in items where item.kind != "torrent" {
+            guard let job = store.earlierDownload(of: item.url) else { continue }
+            item.earlier = EarlierDownload(job)
+            item.included = false
+            count += 1
+        }
+        return count
+    }
+
+    /// Name confirmation is off: start a list straight away, unless some of
+    /// it is already on disk - then one item asks, several open the sheet.
+    private func startOrConfirm(_ probe: HandoffProbe) {
+        let dupes = probe.items.filter { $0.earlier != nil }
+        if dupes.isEmpty {
+            startHandoff(probe)
+        } else if probe.items.count == 1, let only = dupes.first, let earlier = only.earlier {
+            askDownloadAgain(earlier, link: only.url) { [weak self] in
+                only.included = true
+                self?.startHandoff(probe)
+            }
+        } else {
+            sheet = .handoff(probe)
+            store.flash(dupes.count == 1 ? "One of these was downloaded before — it is unticked"
+                        : "\(dupes.count) of these were downloaded before — they are unticked")
         }
     }
 
@@ -408,17 +510,20 @@ final class Session: ObservableObject {
             // the user is in the middle of renaming
             let known = Set(open.items.map(\.url))
             let fresh = incoming.items.filter { !known.contains($0.url) }
+            markDuplicates(fresh)
             open.items.append(contentsOf: fresh)
             store.flash("Added \(fresh.count) more from the browser")
             return
         }
+        let dupes = markDuplicates(incoming.items)
         if !store.askBeforeDownload {
-            startHandoff(incoming)
+            startOrConfirm(incoming)
             return
         }
         sheet = .handoff(incoming)
         let n = incoming.items.count
-        store.flash("Received \(n) download\(n == 1 ? "" : "s") from the browser — confirm the names")
+        store.flash("Received \(n) download\(n == 1 ? "" : "s") from the browser — "
+                    + (dupes > 0 ? "\(dupes) already downloaded, unticked" : "confirm the names"))
     }
 
     func startHandoff(_ probe: HandoffProbe) {
@@ -452,8 +557,9 @@ final class Session: ObservableObject {
                                referer: nil, kind: kind)
         }
         let probe = HandoffProbe(items: items, destination: nil, origin: origin)
+        markDuplicates(items)
         if !store.askBeforeDownload {
-            startHandoff(probe)
+            startOrConfirm(probe)
             return
         }
         sheet = .handoff(probe)
@@ -533,7 +639,14 @@ final class Session: ObservableObject {
                 let raw = answer?["items"] as? [[String: Any]] ?? []
                 let items = raw.compactMap { BatchItem(dict: $0) }
                 if items.count > 1 {
-                    self.sheet = .batch(BatchProbe(url: url, items: items, cookies: cookies))
+                    var earlier: [UUID: EarlierDownload] = [:]
+                    for item in items {
+                        if let job = self.store.earlierDownload(of: item.url) {
+                            earlier[item.id] = EarlierDownload(job)
+                        }
+                    }
+                    self.sheet = .batch(BatchProbe(url: url, items: items, cookies: cookies,
+                                                   earlier: earlier))
                 } else if let item = items.first, item.url != url {
                     self.begin(url: item.url, quality: "auto",
                                title: title ?? (item.title.isEmpty ? nil : item.title),
@@ -582,17 +695,29 @@ final class Session: ObservableObject {
     func begin(url: String, quality: String, title: String? = nil,
                referer: String? = nil, poster: String? = nil, cookies: String? = nil) {
         let name = Naming.suggested(forURL: url, title: title)
+        let earlier = unconfirmedDuplicate(url)
         if store.askBeforeDownload {
             sheet = .rename(PendingDownload(url: url, quality: quality, name: name,
-                                            referer: referer, poster: poster, cookies: cookies))
-        } else {
+                                            referer: referer, poster: poster, cookies: cookies,
+                                            earlier: earlier))
+            return
+        }
+        let go = { [weak self] in
+            guard let self else { return }
             var request = DownloadRequest(url: url, title: name, quality: quality,
-                                          referer: referer, destination: destination,
+                                          referer: referer, destination: self.destination,
                                           outName: title == nil ? nil : name,
                                           poster: poster)
             request.cookies = cookies
-            store.start(request)
-            store.flash("Added: \(name)")
+            let before = self.store.jobs.count
+            self.store.start(request)
+            // (continuing a saved part / already downloading flash their own message)
+            if self.store.jobs.count > before { self.store.flash("Added: \(name)") }
+        }
+        if let earlier {
+            askDownloadAgain(earlier, link: url, then: go)
+        } else {
+            go()
         }
     }
 

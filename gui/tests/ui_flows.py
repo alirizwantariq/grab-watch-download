@@ -600,6 +600,86 @@ def flow_mac_ready(run: Run, base: str):
     assert sorted(files) == ["video/clip.mp4", "video/raw.mp4", "video/skip.webm"], files
 
 
+def flow_duplicates(run: Run, base: str):
+    """Something already downloaded is not downloaded twice by accident: a
+    link (or a different-looking link to the same file) asks first, the
+    name sheet warns, pickers and lists untick it, and a link sent twice
+    while it downloads stays one row."""
+    port = base.rsplit(":", 1)[1]
+    links = ["https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s&si=abc",
+             "https://youtu.be/dQw4w9WgXcQ?si=xyz",
+             "https://m.youtube.com/shorts/dQw4w9WgXcQ",
+             "https://www.youtube.com/watch?v=OTHERvid123",
+             f"{base}/files/clip.mp4?token=1&expires=99",
+             f"{base}/files/clip.mp4?token=2",
+             "https://example.com/watch.php?id=5&utm_source=x&fbclid=1",
+             "https://example.com/watch.php?id=6"]
+    dupe = f"{base}/fast/dupe.mp4"
+    run.play([["identities", "ids"] + links,
+              ["ask", "off"], ["submit", dupe], ["waitphase", "dupe", "done", 30],
+              # the same file through a different-looking link
+              ["submit", dupe + "?utm_source=mail"], ["wait", 1], ["dump", "asked"],
+              ["alertcancel"], ["wait", 0.5], ["dump", "cancelled"],
+              ["submit", dupe], ["wait", 1], ["alertconfirm"], ["wait", 1],
+              ["waitphase", "dupe", "done", 30], ["wait", 0.5], ["dump", "again"],
+              # a page whose video was downloaded: the name sheet says so
+              ["submit", f"{base}/page-one"], ["waitphase", "single_clip", "done", 40],
+              ["ask", "on"], ["submit", f"{base}/page-one"], ["waitsheet", "rename", 30],
+              ["dump", "renamesheet"], ["snap", "rename"], ["closesheet"],
+              # one album video already here: the picker leaves it unticked
+              ["ask", "off"], ["submit", f"{base}/fast/album_1_720p.mp4"],
+              ["waitphase", "album_1", "done", 30],
+              ["ask", "on"], ["submit", f"{base}/album"], ["waitsheet", "batch", 30],
+              ["dump", "batch"], ["snap", "batch"], ["closesheet"],
+              # a pasted list: the repeat is marked and unticked...
+              ["submit", f"{dupe} {base}/fast/fresh.mp4"], ["waitsheet", "handoff", 10],
+              ["dump", "list"], ["snap", "list"], ["closesheet"],
+              # ...and with name confirmation off the list still asks
+              ["ask", "off"], ["submit", f"{dupe} {base}/fast/fresh.mp4"],
+              ["waitsheet", "handoff", 10], ["dump", "autolist"], ["closesheet"],
+              # sent twice while it downloads: one row
+              ["submit", f"{base}/slow/300/busy.mp4"], ["waitphase", "busy", "running", 15],
+              ["submit", f"{base}/slow/300/busy.mp4"], ["wait", 1], ["dump", "busy"],
+              ["cancel", "busy"], ["waitgone", "busy", 15], ["quit"]])
+
+    ids = json.loads((run.out / "ids.json").read_text())
+    assert ids[0] == ids[1] == ids[2] == "youtube:dQw4w9WgXcQ", ids
+    assert ids[3] == "youtube:OTHERvid123", ids
+    assert ids[4] == ids[5] == f"127.0.0.1:{port}/files/clip.mp4", ids
+    assert ids[6] == "example.com/watch.php?id=5" and ids[7] == "example.com/watch.php?id=6", ids
+
+    asked = run.dump("asked")
+    assert asked["confirmation"] == "Download “dupe.mp4” again?", asked["confirmation"]
+    assert asked["alertButtons"] == ["Download Again", "Show in Finder", "Cancel"], asked["alertButtons"]
+    assert sum(1 for j in asked["jobs"] if "dupe" in j["title"]) == 1, asked["jobs"]
+    cancelled = run.dump("cancelled")
+    assert cancelled["confirmation"] == ""
+    assert sum(1 for j in cancelled["jobs"] if "dupe" in j["title"]) == 1
+    again = [j for j in run.dump("again")["jobs"] if "dupe" in j["title"]]
+    assert len(again) == 2 and all(j["phase"] == "done" for j in again), again
+    assert {"video/dupe.mp4", "video/dupe (1).mp4"} <= set(run.files()), run.files()
+
+    rename = run.dump("renamesheet")
+    assert rename["sheet"] == "rename" and rename["pendingEarlier"] == "single_clip_720p.mp4", rename
+
+    batch = {i["url"].rsplit("/", 1)[-1]: i for i in run.dump("batch")["batchItems"]}
+    assert batch["album_1_720p.mp4"]["selected"] == "no", batch
+    assert batch["album_1_720p.mp4"]["earlier"] == "album_1_720p.mp4", batch
+    assert all(batch[f"album_{i}_720p.mp4"]["selected"] == "yes" for i in (2, 3, 4)), batch
+
+    for name in ("list", "autolist"):
+        state = run.dump(name)
+        items = {i["url"].rsplit("/", 1)[-1]: i for i in state["handoffItems"]}
+        assert state["sheet"] == "handoff", state["sheet"]
+        assert items["dupe.mp4"]["included"] == "no", items
+        assert items["dupe.mp4"]["earlier"].startswith("dupe"), items
+        assert items["fresh.mp4"]["included"] == "yes" and items["fresh.mp4"]["earlier"] == "", items
+
+    busy = [j for j in run.dump("busy")["jobs"] if "busy" in j["title"]]
+    assert len(busy) == 1, busy
+    assert "fresh.mp4" not in " ".join(run.files())
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -684,7 +764,7 @@ def flow_snapshots(run: Run, base: str):
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
          flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop, flow_many_links,
          flow_clipboard_watch, flow_ytdlp_update, flow_missed_end,
-         flow_mac_ready,
+         flow_mac_ready, flow_duplicates,
          flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 

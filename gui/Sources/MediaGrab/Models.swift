@@ -435,13 +435,67 @@ enum Naming {
         return base.isEmpty ? name : base
     }
 
-    /// Two links to the same file on the same site that differ only in their
-    /// query (signed links: ?token=…, ?secure=…,expiry).
-    static func sameFileLink(_ a: String, _ b: String) -> Bool {
-        guard let x = URLComponents(string: a), let y = URLComponents(string: b),
-              let hx = x.host?.lowercased(), let hy = y.host?.lowercased(),
-              hx == hy, x.path == y.path, x.path.count > 1 else { return false }
-        return a != b
+    /// Query parameters that only say where a link was shared from.
+    private static let trackingParams: Set<String> = [
+        "si", "feature", "fbclid", "gclid", "igshid", "igsh", "ref", "ref_src", "ref_url",
+        "pp", "share", "mibextid", "spm", "_ga", "mc_cid", "mc_eid",
+    ]
+    /// Query parameters of signed links that change every time a link is
+    /// handed out (the file stays the same).
+    private static let signatureParams: Set<String> = [
+        "token", "sig", "signature", "expires", "expiry", "exp", "e", "st", "hash",
+        "key", "policy", "key-pair-id", "auth", "hdnts", "hdnea", "validfrom", "validto",
+        "ip", "secure", "md5", "ttl", "nonce",
+    ]
+
+    /// What a link downloads, so two different-looking links to the same
+    /// video or file are recognised:
+    /// - YouTube: the video id (watch?v=, youtu.be/, shorts/, embed/, live/);
+    /// - file links (…/clip.mp4): site + path, so a freshly signed link
+    ///   (?token=…, ?expires=…) is still the same file;
+    /// - other pages: site + path + query, minus tracking and signature
+    ///   parameters.
+    /// nil for things without one (magnets, local paths, garbage).
+    static func identity(of link: String) -> String? {
+        guard let comps = URLComponents(string: link),
+              let scheme = comps.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              var host = comps.host?.lowercased(), !host.isEmpty else { return nil }
+        for prefix in ["www.", "m.", "music."] where host.hasPrefix(prefix) {
+            host.removeFirst(prefix.count)
+        }
+        let path = comps.path
+        let parts = path.split(separator: "/").map(String.init)
+        if host == "youtube.com" || host.hasSuffix(".youtube.com") || host == "youtube-nocookie.com" {
+            if let v = comps.queryItems?.first(where: { $0.name == "v" })?.value, !v.isEmpty {
+                return "youtube:" + v
+            }
+            if parts.count >= 2, ["shorts", "embed", "live", "v"].contains(parts[0]) {
+                return "youtube:" + parts[1]
+            }
+        }
+        if host == "youtu.be", let id = parts.first, !id.isEmpty {
+            return "youtube:" + id
+        }
+        var trimmedPath = path
+        while trimmedPath.count > 1 && trimmedPath.hasSuffix("/") { trimmedPath.removeLast() }
+        let base = host + (comps.port.map { ":\($0)" } ?? "") + trimmedPath
+        if looksLikeFile(link) && trimmedPath.count > 1 { return base }
+        let kept = (comps.queryItems ?? [])
+            .filter { item in
+                let name = item.name.lowercased()
+                return !name.hasPrefix("utm_") && !name.hasPrefix("x-amz-")
+                    && !trackingParams.contains(name) && !signatureParams.contains(name)
+            }
+            .map { "\($0.name)=\($0.value ?? "")" }
+            .sorted()
+        return kept.isEmpty ? base : base + "?" + kept.joined(separator: "&")
+    }
+
+    /// Two links that download the same thing (see identity(of:)).
+    static func sameFile(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        guard let x = identity(of: a), let y = identity(of: b) else { return false }
+        return x == y
     }
 
     static func isValid(_ name: String) -> Bool {

@@ -288,8 +288,7 @@ final class JobStore: ObservableObject {
         // continue the saved part instead of downloading it a second time
         if !request.isTorrent,
            let earlier = jobs.first(where: { $0.canUpdateLink && $0.process == nil
-                                             && ($0.url == request.url
-                                                 || Naming.sameFileLink($0.url, request.url)) }) {
+                                             && Naming.sameFile($0.url, request.url) }) {
             if earlier.url == request.url {
                 resume(earlier)
                 flash("“\(earlier.title)” was already started — continuing it")
@@ -300,7 +299,39 @@ final class JobStore: ObservableObject {
             }
             return earlier
         }
+        // sent twice while it is still on its way (same quality): one row
+        if !request.isTorrent, let current = activeDownload(of: request) {
+            flash("“\(current.title)” is already downloading")
+            return current
+        }
         return enqueue(request)
+    }
+
+    // MARK: duplicates
+
+    /// A finished download of the same video or file whose file is still
+    /// there (moved or deleted files do not count).
+    func earlierDownload(of link: String) -> DownloadJob? {
+        jobs.first { job in
+            guard job.phase == .done, !job.isTorrent, Naming.sameFile(job.url, link),
+                  let path = job.finishedPath, !path.isEmpty else { return false }
+            return FileManager.default.fileExists(atPath: path)
+        }
+    }
+
+    /// A queued or running download of the same thing in the same quality.
+    private func activeDownload(of request: DownloadRequest) -> DownloadJob? {
+        let quality = Self.qualityArgument(request.arguments)
+        return jobs.first { job in
+            (job.phase == .queued || job.phase == .running) && !job.isTorrent
+                && Naming.sameFile(job.url, request.url)
+                && Self.qualityArgument(job.args) == quality
+        }
+    }
+
+    private static func qualityArgument(_ args: [String]) -> String {
+        guard let i = args.firstIndex(of: "--quality"), i + 1 < args.count else { return "auto" }
+        return args[i + 1]
     }
 
     @discardableResult

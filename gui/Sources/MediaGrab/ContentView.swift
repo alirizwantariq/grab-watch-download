@@ -7,6 +7,11 @@ struct ContentView: View {
     @EnvironmentObject var session: Session
     @FocusState private var linkFieldFocused: Bool
 
+    private var confirmationShown: Binding<Bool> {
+        Binding(get: { session.confirmation != nil },
+                set: { if !$0 { session.confirmation = nil } })
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             sidebar
@@ -42,10 +47,15 @@ struct ContentView: View {
         .sheet(item: $session.sheet) { sheet in
             sheetView(sheet)
         }
-        .alert(item: $session.confirmation) { c in
-            Alert(title: Text(c.title), message: Text(c.message),
-                  primaryButton: .destructive(Text(c.actionLabel), action: c.action),
-                  secondaryButton: .cancel())
+        .alert(session.confirmation?.title ?? "", isPresented: confirmationShown,
+               presenting: session.confirmation) { c in
+            Button(c.actionLabel, role: c.destructive ? .destructive : nil, action: c.action)
+            if let label = c.otherLabel, let other = c.otherAction {
+                Button(label, action: other)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { c in
+            Text(c.message)
         }
         .toolbar { toolbarContent }
         .onAppear { linkFieldFocused = true }

@@ -25,6 +25,25 @@ struct DestinationLine: View {
     }
 }
 
+/// "Already downloaded 2 days ago: clip.mp4  [Show in Finder]"
+struct AlreadyDownloadedNote: View {
+    let earlier: EarlierDownload
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+            Text("\(earlier.summary): \(earlier.fileName)")
+                .lineLimit(1).truncationMode(.middle)
+            Button("Show in Finder") { earlier.reveal() }
+                .controlSize(.small)
+        }
+        .font(.caption)
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct SheetHeader: View {
     let symbol: String
     let title: String
@@ -134,6 +153,9 @@ struct RenameSheet: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             DestinationLine()
+            if let earlier = pending.earlier {
+                AlreadyDownloadedNote(earlier: earlier)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { session.sheet = nil }
@@ -141,7 +163,8 @@ struct RenameSheet: View {
                 Button {
                     session.confirmRename(pending)
                 } label: {
-                    Label("Download", systemImage: "arrow.down.circle.fill")
+                    Label(pending.earlier == nil ? "Download" : "Download Again",
+                          systemImage: "arrow.down.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
@@ -258,6 +281,11 @@ struct BatchSheet: View {
                                 .background(Capsule().fill(Color.accentColor.opacity(0.22)))
                         }
                         Text(item.sizeText).font(.caption).foregroundColor(.secondary)
+                        if let earlier = batch.earlier[item.id] {
+                            Text(earlier.summary)
+                                .font(.caption.weight(.medium)).foregroundColor(.orange)
+                                .help("Saved as \(earlier.fileName)")
+                        }
                         Text(URLComponents(string: item.url)?.host ?? "")
                             .font(.caption).foregroundColor(.secondary).lineLimit(1)
                     }
@@ -388,6 +416,12 @@ struct HandoffRow: View {
                             .font(.caption2).foregroundColor(.secondary)
                             .help("Uses your login for this site (from the browser)")
                             .accessibilityLabel("Uses your site login")
+                    }
+                    if let earlier = item.earlier {
+                        Text(earlier.summary)
+                            .font(.caption2.weight(.medium)).foregroundColor(.orange)
+                            .fixedSize()
+                            .help("Saved as \(earlier.fileName). Tick it to download it again.")
                     }
                     Text(item.url)
                         .font(.caption2).foregroundColor(.secondary)

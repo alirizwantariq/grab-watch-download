@@ -66,6 +66,13 @@ missing and the command that installs each.
   and surrounding words are ignored), drop a `.txt` list, or use File ▸
   Import Links from File… (⇧⌘I): one sheet lists them all; file links keep
   their file name, pages are named after their video unless a name is typed.
+- **Already downloaded?** Sending something whose file is still on disk
+  asks first (*Download Again* / *Show in Finder*), also when the link looks
+  different: YouTube links match by video id (watch, youtu.be, shorts),
+  file links ignore their signed query (`?token=…`), pages ignore tracking
+  parameters (`utm_*`, `si`, `fbclid`…). The name sheet says so too, and
+  lists and the multi-video picker show *Already downloaded* and leave those
+  unticked. The same link sent twice while it downloads stays one row.
 - **Clipboard watch** (opt-in: ⋯ menu or Settings). A video, file,
   platform or magnet link copied in another app is offered in a banner
   (the Dock icon bounces once), or downloaded straight away if chosen. On

@@ -140,6 +140,15 @@ enum UITestHooks {
         case "refresh": store.refresh()
         case "handoff": session.receiveHandoff()
         case "closesheet": session.sheet = nil
+        case "alertconfirm":
+            if let c = session.confirmation { session.confirmation = nil; c.action() }
+        case "alertcancel": session.confirmation = nil
+        case "identities":
+            let links = Array(step.dropFirst(2)).compactMap { $0 as? String }
+            let ids = links.map { Naming.identity(of: $0) ?? "" }
+            if let data = try? JSONSerialization.data(withJSONObject: ids) {
+                try? data.write(to: outDir.appendingPathComponent("\(arg(1)).json"))
+            }
         case "confirm":
             // press the default button of whatever sheet is up
             switch session.sheet {
@@ -378,7 +387,35 @@ enum UITestHooks {
     private static func handoffItems() -> [[String: String]] {
         guard case .handoff(let probe) = Session.shared.sheet else { return [] }
         return probe.items.map { ["url": $0.url, "name": $0.name, "kind": $0.kind,
-                                  "referer": $0.referer ?? ""] }
+                                  "referer": $0.referer ?? "",
+                                  "included": $0.included ? "yes" : "no",
+                                  "earlier": $0.earlier?.fileName ?? ""] }
+    }
+
+    /// Button titles of an alert on screen (alerts do not render into
+    /// snapshots, so their buttons are checked this way).
+    private static func alertButtons() -> [String] {
+        func buttons(in view: NSView) -> [String] {
+            var out: [String] = []
+            if let b = view as? NSButton, !b.title.isEmpty { out.append(b.title) }
+            for sub in view.subviews { out += buttons(in: sub) }
+            return out
+        }
+        return NSApp.windows
+            .filter { $0.isSheet || String(describing: type(of: $0)).contains("Alert") }
+            .flatMap { w in w.contentView.map(buttons(in:)) ?? [] }
+    }
+
+    private static func pendingEarlier() -> String {
+        guard case .rename(let pending) = Session.shared.sheet else { return "" }
+        return pending.earlier?.fileName ?? ""
+    }
+
+    private static func batchItems() -> [[String: String]] {
+        guard case .batch(let batch) = Session.shared.sheet else { return [] }
+        return batch.items.map { ["url": $0.url,
+                                  "selected": batch.selected.contains($0.id) ? "yes" : "no",
+                                  "earlier": batch.earlier[$0.id]?.fileName ?? ""] }
     }
 
     private static func dump(_ name: String) {
@@ -399,6 +436,10 @@ enum UITestHooks {
         let state: [String: Any] = [
             "jobs": jobs,
             "sheet": sheetName(Session.shared.sheet),
+            "confirmation": Session.shared.confirmation?.title ?? "",
+            "alertButtons": alertButtons(),
+            "pendingEarlier": pendingEarlier(),
+            "batchItems": batchItems(),
             "windows": NSApp.windows.filter { $0.canBecomeMain && !$0.isSheet }.count,
             "bundledEngine": Engine.bundledLauncher ?? "",
             "bundledExtension": Engine.bundledExtension?.path ?? "",
