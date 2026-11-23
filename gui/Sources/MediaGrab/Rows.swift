@@ -140,7 +140,11 @@ struct ActiveJobRow: View {
             if !job.etaText.isEmpty { parts.append(job.etaText) }
             if parts.isEmpty { parts.append("Starting…") }
         case .queued:
-            parts.append("Waiting for a free slot")
+            if let at = store.startAt, store.isHeld {
+                parts.append("Starts \(JobStore.whenText(at))")
+            } else {
+                parts.append("Waiting for a free slot")
+            }
         case .paused:
             parts.append("Paused")
         default:

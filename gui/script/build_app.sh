@@ -136,6 +136,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>MediaGrab shuts down your Mac when your downloads finish, if you choose that.</string>
     <key>NSHumanReadableCopyright</key>
     <string>MediaGrab $VERSION</string>
 </dict>

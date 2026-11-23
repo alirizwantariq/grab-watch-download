@@ -21,6 +21,12 @@ struct ContentView: View {
                 if let offer = session.clipboardOffer {
                     clipboardBanner(offer)
                 }
+                if let at = store.startAt {
+                    scheduleBanner(at)
+                }
+                if store.whenDone != .nothing {
+                    whenDoneBanner
+                }
                 if let warning = engineWarning {
                     warningBanner(warning)
                 } else if let report = store.report, report.ytdlpUpdateAvailable,
@@ -87,6 +93,8 @@ struct ContentView: View {
             UpdateLinkSheet(job: job)
         case .extensionSetup:
             ExtensionSheet()
+        case .schedule:
+            ScheduleSheet()
         }
     }
 
@@ -135,6 +143,15 @@ struct ContentView: View {
                 }
                 Divider()
                 Toggle("Watch Clipboard for Links", isOn: $store.watchClipboard)
+                Divider()
+                Button(store.startAt == nil ? "Schedule Downloads…" : "Change Schedule…") {
+                    session.sheet = .schedule
+                }
+                Picker("When Downloads Finish", selection: $store.whenDone) {
+                    ForEach(JobStore.WhenDone.allCases) { action in
+                        Text(action.label).tag(action)
+                    }
+                }
                 Divider()
                 Button("Browser Extension…") { session.sheet = .extensionSetup }
                 Button("Diagnostics…") { session.sheet = .diagnostics }
@@ -350,6 +367,73 @@ struct ContentView: View {
         }
         .padding(.horizontal, 14).padding(.vertical, 7)
         .background(Color.accentColor.opacity(0.10))
+    }
+
+    private func scheduleBanner(_ at: Date) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "clock").foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Downloads start \(JobStore.whenText(at))")
+                    .font(.callout.weight(.medium))
+                Text(scheduleDetail(at))
+                    .font(.caption).foregroundColor(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Button("Change…") { session.sheet = .schedule }
+                .controlSize(.small)
+            Button("Start Now") { store.startScheduledNow() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 7)
+        .background(Color.accentColor.opacity(0.10))
+    }
+
+    private func scheduleDetail(_ at: Date) -> String {
+        let waiting = store.jobs.filter { $0.phase == .queued }.count
+        let left = max(0, at.timeIntervalSinceNow)
+        let wait = left >= 3600 ? "\(Int(left / 3600)) h \(Int(left.truncatingRemainder(dividingBy: 3600) / 60)) min"
+            : "\(max(1, Int(left / 60))) min"
+        let what = waiting == 0 ? "New downloads wait" : "\(waiting) download\(waiting == 1 ? "" : "s") waiting"
+        return "\(what) · in \(wait)" + (store.keepAwake ? " · the Mac stays awake until then" : "")
+    }
+
+    @ViewBuilder
+    private var whenDoneBanner: some View {
+        if let left = store.whenDoneCountdown {
+            HStack(spacing: 8) {
+                Image(systemName: store.whenDone.symbol).foregroundColor(.orange)
+                Text("All downloads finished — \(store.whenDone.doing) in \(left) s")
+                    .font(.callout.weight(.medium))
+                    .monospacedDigit()
+                Spacer()
+                Button("Cancel") { store.whenDone = .nothing }
+                    .keyboardShortcut(.cancelAction)
+                    .controlSize(.small)
+                Button("\(store.whenDone.label) Now") { store.performWhenDone() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 7)
+            .background(Color.orange.opacity(0.15))
+        } else {
+            HStack(spacing: 8) {
+                Image(systemName: store.whenDone.symbol).foregroundColor(.secondary)
+                Text("When all downloads finish: \(store.whenDone.label)")
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Button {
+                    store.whenDone = .nothing
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Do nothing when the downloads finish")
+                .accessibilityLabel("Do nothing when the downloads finish")
+            }
+            .padding(.horizontal, 14).padding(.vertical, 4)
+            .background(Color.secondary.opacity(0.08))
+        }
     }
 
     private func ytdlpBanner(_ report: EngineReport) -> some View {

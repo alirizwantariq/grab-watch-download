@@ -296,6 +296,7 @@ enum ActiveSheet: Identifiable {
     case diagnostics
     case updateLink(DownloadJob)
     case extensionSetup
+    case schedule
 
     var id: String {
         switch self {
@@ -307,6 +308,7 @@ enum ActiveSheet: Identifiable {
         case .diagnostics: return "diagnostics"
         case .updateLink(let job): return "updatelink-\(job.id)"
         case .extensionSetup: return "extension"
+        case .schedule: return "schedule"
         }
     }
 }

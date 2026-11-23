@@ -99,6 +99,13 @@ missing and the command that installs each.
   smoothly on your Mac", percentage, time left, Skip Conversion). Settings
   choose Convert when needed / Only fix the format / Off; finished rows and
   the selection bar offer Make Mac-Ready for files downloaded earlier.
+- **Schedule and when done.** ⋯ ▸ Schedule Downloads… holds the queue
+  until a time (e.g. 02:00, optionally pausing what runs now); rows say
+  "Starts at 02:00" and a banner offers Start Now. ⋯ ▸ When Downloads
+  Finish: Quit MediaGrab, Sleep or Shut Down once everything (conversions
+  and planned retries included) is done, after a 60-second banner that can
+  cancel it. It is one-shot and never kept across launches. The first Shut
+  Down asks macOS for permission to control System Events.
 - **Pause / resume / retry.** Pause signals the engine, which saves exact
   byte positions. Resume continues from them; a failed download keeps its
   partial data and offers *Try Again*. yt-dlp-backed downloads resume by

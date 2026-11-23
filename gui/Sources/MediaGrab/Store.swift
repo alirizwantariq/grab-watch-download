@@ -148,6 +148,8 @@ final class JobStore: ObservableObject {
         let timer = Timer(timeInterval: 2.5, repeats: true) { [weak self] _ in
             self?.refresh()
             self?.retryDueDownloads()
+            self?.startScheduledIfDue()
+            self?.checkWhenDone()
         }
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
@@ -161,6 +163,7 @@ final class JobStore: ObservableObject {
             // connections rarely survive sleep: give the network a moment,
             // then pick up what was waiting
             self?.retrySoon(after: 5)
+            self?.startScheduledIfDue()
         }
     }
 
@@ -278,6 +281,171 @@ final class JobStore: ObservableObject {
         let n = jobs.filter { $0.phase == .running || $0.phase == .queued }.count
         NSApp?.dockTile.badgeLabel = n > 0 ? String(n) : nil
         updateAwake()
+        checkWhenDone()
+    }
+
+    // MARK: schedule: start later
+
+    /// Queued downloads wait until then (nil = they start as usual). Not
+    /// kept across launches.
+    @Published private(set) var startAt: Date?
+    /// running downloads the schedule paused; they continue when it starts
+    private var heldBySchedule = Set<UUID>()
+    private var scheduleTimer: Timer?
+
+    var isHeld: Bool { startAt.map { $0 > Date() } ?? false }
+
+    func schedule(at date: Date, pauseRunning: Bool) {
+        scheduleTimer?.invalidate()
+        startAt = date
+        if pauseRunning {
+            for job in jobs where job.phase == .running && !job.converting {
+                heldBySchedule.insert(job.id)
+                pause(job)
+            }
+        }
+        let timer = Timer(fire: date, interval: 0, repeats: false) { [weak self] _ in
+            self?.startScheduledIfDue()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        scheduleTimer = timer
+        flash("Downloads start \(Self.whenText(date))")
+        updateDockBadge()
+    }
+
+    /// The banner's Start Now, and the scheduled time arriving.
+    func startScheduledNow() {
+        scheduleTimer?.invalidate()
+        scheduleTimer = nil
+        startAt = nil
+        let held = heldBySchedule
+        heldBySchedule.removeAll()
+        for job in jobs.reversed() where held.contains(job.id) && job.phase == .paused {
+            resume(job)
+        }
+        pump()
+    }
+
+    func startScheduledIfDue() {
+        guard let at = startAt, at <= Date() else { return }
+        startScheduledNow()
+        flash("Scheduled downloads started")
+    }
+
+    /// "at 02:00" today, "tomorrow at 02:00", or a date further away.
+    static func whenText(_ date: Date) -> String {
+        let time = DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short)
+        let cal = Calendar.current
+        if cal.isDateInToday(date) { return "at \(time)" }
+        if cal.isDateInTomorrow(date) { return "tomorrow at \(time)" }
+        return "on " + DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .short)
+    }
+
+    // MARK: when everything is done
+
+    enum WhenDone: String, CaseIterable, Identifiable {
+        case nothing, quit, sleep, shutDown
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .nothing: return "Do Nothing"
+            case .quit: return "Quit MediaGrab"
+            case .sleep: return "Sleep"
+            case .shutDown: return "Shut Down"
+            }
+        }
+        /// "… putting the Mac to sleep in 40 s"
+        var doing: String {
+            switch self {
+            case .nothing: return ""
+            case .quit: return "quitting MediaGrab"
+            case .sleep: return "putting the Mac to sleep"
+            case .shutDown: return "shutting down the Mac"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .nothing: return "circle"
+            case .quit: return "xmark.circle"
+            case .sleep: return "moon.zzz"
+            case .shutDown: return "power"
+            }
+        }
+    }
+
+    /// What happens once every download has finished. One-shot (back to
+    /// Do Nothing after it ran or was cancelled) and never kept across
+    /// launches, so a forgotten setting cannot shut the Mac down later.
+    @Published var whenDone: WhenDone = .nothing {
+        didSet {
+            guard whenDone != oldValue else { return }
+            cancelWhenDoneCountdown()
+            whenDoneSawWork = hasPendingWork
+            checkWhenDone()
+        }
+    }
+    /// seconds left before the when-done action (shown in a banner)
+    @Published private(set) var whenDoneCountdown: Int?
+    /// how long the banner gives to cancel (tests shorten it)
+    static var whenDoneDelay = 60
+    private var whenDoneSawWork = false
+    private var countdownTimer: Timer?
+
+    /// Anything that will still happen by itself: running, queued,
+    /// converting, or a connection retry that is planned.
+    var hasPendingWork: Bool {
+        !conversionQueue.isEmpty || runningConversion != nil
+            || jobs.contains { $0.phase == .running || $0.phase == .queued || $0.converting
+                               || ($0.phase == .failed && $0.retryAt != nil) }
+    }
+
+    func checkWhenDone() {
+        guard whenDone != .nothing else { return }
+        if hasPendingWork || isHeld {
+            whenDoneSawWork = whenDoneSawWork || hasPendingWork
+            if whenDoneCountdown != nil {
+                cancelWhenDoneCountdown()
+                flash("More to download — “\(whenDone.label)” waits for it")
+            }
+            return
+        }
+        guard whenDoneSawWork, whenDoneCountdown == nil else { return }
+        whenDoneCountdown = Self.whenDoneDelay
+        let doing = whenDone.doing
+        notify("All downloads finished",
+               doing.prefix(1).uppercased() + doing.dropFirst() + " in \(Self.whenDoneDelay) seconds")
+        NSApp?.requestUserAttention(.criticalRequest)
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tickWhenDone() }
+        RunLoop.main.add(timer, forMode: .common)
+        countdownTimer = timer
+    }
+
+    private func tickWhenDone() {
+        guard let left = whenDoneCountdown else { return }
+        if hasPendingWork {
+            checkWhenDone()
+        } else if left <= 1 {
+            performWhenDone()
+        } else {
+            whenDoneCountdown = left - 1
+        }
+    }
+
+    private func cancelWhenDoneCountdown() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        whenDoneCountdown = nil
+    }
+
+    /// The banner's "Do It Now" (and the countdown reaching zero).
+    func performWhenDone() {
+        let action = whenDone
+        whenDone = .nothing
+        guard action != .nothing else { return }
+        PowerAction.perform(action) { [weak self] problem in
+            self?.flash(problem, seconds: 15)
+        }
     }
 
     // MARK: starting
@@ -350,6 +518,10 @@ final class JobStore: ObservableObject {
     /// Launch queued downloads while there is room (oldest first).
     func pump() {
         guard !terminating else { return }
+        guard !isHeld else {          // scheduled for later
+            updateDockBadge()
+            return
+        }
         let limit = maxConcurrent <= 0 ? Int.max : maxConcurrent
         while ownedRunning < limit,
               let next = jobs.last(where: { $0.phase == .queued }) {

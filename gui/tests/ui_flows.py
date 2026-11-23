@@ -748,6 +748,57 @@ esac
     assert mix["confirmation"] == "", mix["confirmation"]
 
 
+def flow_schedule(run: Run, base: str):
+    """Scheduled downloads wait (running ones too, if asked) and start by
+    themselves; once everything is done the chosen action runs after a
+    countdown, which more downloads or Cancel stop. Power actions are
+    recorded, never run."""
+    power = run.box / "power.log"
+    run.env["MEDIAGRAB_POWER_LOG"] = str(power)
+    run.play([["ask", "off"],
+              ["submit", f"{base}/slow/1500/running.mp4"], ["waitphase", "running", "running", 15],
+              ["wait", 1], ["schedule", 7, "on"], ["waitphase", "running", "paused", 15],
+              ["submit", f"{base}/fast/later_a.mp4 {base}/fast/later_b.mp4"], ["wait", 1],
+              ["dump", "held"], ["snap", "held"],
+              ["whendone", "sleep", 3], ["wait", 0.3], ["snap", "armed"],
+              ["waitphase", "later_a", "done", 30], ["waitphase", "later_b", "done", 30],
+              ["waitphase", "running", "done", 60], ["wait", 0.5], ["dump", "countdown"],
+              ["snap", "countdown"], ["wait", 4], ["dump", "slept"],
+              # more work during the countdown postpones it; Cancel disarms it
+              ["whendone", "quit", 3], ["submit", f"{base}/fast/after.mp4"],
+              ["waitphase", "after", "done", 30], ["wait", 0.5], ["dump", "quitcountdown"],
+              ["whendonecancel"], ["wait", 4], ["dump", "cancelled"],
+              # Start Now ends the wait at once
+              ["schedule", 600, "off"], ["submit", f"{base}/fast/manual.mp4"], ["wait", 1],
+              ["dump", "waiting"], ["startnow"], ["waitphase", "manual", "done", 30], ["wait", 0.3],
+              ["dump", "started"], ["quit"]])
+
+    held = run.dump("held")
+    phases = {j["title"]: j["phase"] for j in held["jobs"]}
+    assert phases == {"running.mp4": "paused", "later_a.mp4": "queued", "later_b.mp4": "queued"}, phases
+    assert held["held"] is True and 3 < held["startAt"] < 7, held["startAt"]
+    countdown = run.dump("countdown")
+    assert all(j["phase"] == "done" for j in countdown["jobs"]), countdown["jobs"]
+    assert pathlib.Path(run.jobs("countdown")["running.mp4"]["finishedPath"]).read_bytes() \
+        == blob("running.mp4", SLOW_SIZE)
+    assert countdown["whenDone"] == "sleep" and 1 <= countdown["whenDoneCountdown"] <= 3, countdown
+    assert countdown["held"] is False and countdown["startAt"] == -1
+    slept = run.dump("slept")
+    assert slept["whenDone"] == "nothing" and slept["whenDoneCountdown"] == -1, slept
+    assert power.read_text() == "sleep /usr/bin/pmset sleepnow\n", power.read_text()
+
+    quitting = run.dump("quitcountdown")
+    assert quitting["whenDone"] == "quit" and quitting["whenDoneCountdown"] >= 1, quitting
+    cancelled = run.dump("cancelled")
+    assert cancelled["whenDone"] == "nothing" and cancelled["whenDoneCountdown"] == -1
+    assert power.read_text().count("\n") == 1, power.read_text()     # quit never ran
+
+    waiting = {j["title"]: j["phase"] for j in run.dump("waiting")["jobs"]}
+    assert waiting["manual.mp4"] == "queued", waiting
+    started = run.dump("started")
+    assert started["held"] is False and started["startAt"] == -1
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -810,7 +861,7 @@ def flow_snapshots(run: Run, base: str):
              ["search", "zzz-no-match"], ["snap", "no-match"], ["search", ""],
              ["sheet", "missingtools"], ["snap", "warning"]]
     for sheet in ("quality", "qualityerror", "rename", "batch", "torrent",
-                  "diagnostics", "extension"):
+                  "diagnostics", "extension", "schedule"):
         steps += [["sheet", sheet], ["snap", f"sheet-{sheet}"], ["closesheet"], ["wait", 0.6]]
     # picking a quality must swap the quality sheet for the name sheet
     steps += [["sheet", "quality"], ["wait", 0.8], ["confirm"], ["waitsheet", "rename", 5],
@@ -832,7 +883,7 @@ def flow_snapshots(run: Run, base: str):
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
          flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop, flow_many_links,
          flow_clipboard_watch, flow_ytdlp_update, flow_missed_end,
-         flow_mac_ready, flow_duplicates, flow_playlist,
+         flow_mac_ready, flow_duplicates, flow_playlist, flow_schedule,
          flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 

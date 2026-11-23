@@ -950,3 +950,115 @@ struct UpdateLinkSheet: View {
         session.sheet = nil
     }
 }
+
+// MARK: - schedule
+
+/// The Schedule sheet's edits, applied with Schedule.
+final class ScheduleDraft: ObservableObject {
+    @Published var time = Date()
+    @Published var pauseRunning = false
+    @Published var whenDone: JobStore.WhenDone = .nothing
+    private var loaded = false
+
+    func load(from store: JobStore) {
+        guard !loaded else { return }
+        loaded = true
+        if let at = store.startAt {
+            time = at
+        } else {
+            // a quiet hour by default: 02:00
+            var parts = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+            parts.hour = 2
+            parts.minute = 0
+            time = Calendar.current.date(from: parts) ?? Date()
+        }
+        whenDone = store.whenDone
+    }
+
+    /// The next time the clock shows the chosen time: today, or tomorrow
+    /// when that has passed.
+    var nextStart: Date {
+        let cal = Calendar.current
+        let hm = cal.dateComponents([.hour, .minute], from: time)
+        return cal.nextDate(after: Date(), matching: hm, matchingPolicy: .nextTime) ?? time
+    }
+}
+
+struct ScheduleSheet: View {
+    @EnvironmentObject var store: JobStore
+    @EnvironmentObject var session: Session
+    @StateObject private var draft = ScheduleDraft()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SheetHeader(symbol: "clock", title: "Schedule Downloads",
+                        subtitle: "Queued downloads wait and start by themselves")
+            HStack(spacing: 10) {
+                Text("Start")
+                DatePicker("Start", selection: $draft.time, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+                    .datePickerStyle(.field)
+                    .fixedSize()
+                Text(JobStore.whenText(draft.nextStart))
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            Toggle("Also pause the downloads running now until then",
+                   isOn: $draft.pauseRunning)
+                .toggleStyle(.checkbox)
+                .disabled(!store.jobs.contains { $0.phase == .running && !$0.converting })
+            HStack(spacing: 10) {
+                Text("When all downloads finish")
+                Picker("When all downloads finish", selection: $draft.whenDone) {
+                    ForEach(JobStore.WhenDone.allCases) { action in
+                        Text(action.label).tag(action)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 170)
+            }
+            Text(note)
+                .font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if store.startAt != nil {
+                    Button("Remove Schedule") {
+                        store.whenDone = draft.whenDone
+                        store.startScheduledNow()
+                        session.sheet = nil
+                    }
+                    .help("Start the waiting downloads now")
+                }
+                Spacer()
+                Button("Cancel") { session.sheet = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button {
+                    store.schedule(at: draft.nextStart, pauseRunning: draft.pauseRunning)
+                    store.whenDone = draft.whenDone
+                    session.sheet = nil
+                } label: {
+                    Label("Schedule", systemImage: "clock.badge.checkmark")
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(18)
+        .frame(width: 470)
+        .onAppear { draft.load(from: store) }
+    }
+
+    private var note: String {
+        var parts = ["Downloads you add until then wait in the queue."]
+        parts.append(store.keepAwake
+                     ? "The Mac is kept from sleeping while they wait (the display can still sleep); keep it plugged in."
+                     : "Keep the Mac awake until then: a sleeping Mac starts them only when it wakes.")
+        if draft.whenDone == .shutDown {
+            parts.append("The first time, macOS asks whether MediaGrab may shut down the Mac.")
+        }
+        if draft.whenDone != .nothing {
+            parts.append("You get \(JobStore.whenDoneDelay) seconds to cancel before it happens.")
+        }
+        return parts.joined(separator: " ")
+    }
+}

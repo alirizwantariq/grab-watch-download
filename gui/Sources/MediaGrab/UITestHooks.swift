@@ -143,6 +143,15 @@ enum UITestHooks {
         case "alertconfirm":
             if let c = session.confirmation { session.confirmation = nil; c.action() }
         case "alertcancel": session.confirmation = nil
+        case "schedule":
+            // ["schedule", seconds from now, pause running on/off]
+            store.schedule(at: Date().addingTimeInterval(num(1)), pauseRunning: arg(2) == "on")
+        case "startnow": store.startScheduledNow()
+        case "whendone":
+            // ["whendone", nothing|quit|sleep|shutDown, countdown seconds]
+            if num(2) > 0 { JobStore.whenDoneDelay = Int(num(2)) }
+            store.whenDone = JobStore.WhenDone(rawValue: arg(1)) ?? .nothing
+        case "whendonecancel": store.whenDone = .nothing
         case "alertother":
             if let c = session.confirmation, let other = c.otherAction {
                 session.confirmation = nil
@@ -268,6 +277,7 @@ enum UITestHooks {
         case .diagnostics: return "diagnostics"
         case .updateLink: return "updatelink"
         case .extensionSetup: return "extension"
+        case .schedule: return "schedule"
         }
     }
 
@@ -360,6 +370,7 @@ enum UITestHooks {
             session.sheet = .torrent(TorrentProbe(url: "magnet:?xt=urn:btih:abc", name: "Big Buck Bunny (2008) 1080p",
                                                   files: files.compactMap { TorrentFile(dict: $0) }))
         case "diagnostics": session.sheet = .diagnostics
+        case "schedule": session.sheet = .schedule
         case "extension": session.sheet = .extensionSetup
         case "missingtools":
             var report = JobStore.shared.report ?? EngineReport()
@@ -454,6 +465,10 @@ enum UITestHooks {
             "alertButtons": alertButtons(),
             "pendingEarlier": pendingEarlier(),
             "batchItems": batchItems(),
+            "startAt": store.startAt.map { $0.timeIntervalSinceNow } ?? -1,
+            "held": store.isHeld,
+            "whenDone": store.whenDone.rawValue,
+            "whenDoneCountdown": store.whenDoneCountdown ?? -1,
             "playlistTitle": { () -> String in
                 if case .batch(let b) = Session.shared.sheet { return b.playlist?.title ?? "" }
                 return ""
