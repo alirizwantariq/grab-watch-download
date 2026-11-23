@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>MediaGrab fetcher</title>
@@ -8,34 +8,45 @@
 <body>
 <header>
   <img src="icon32.png" alt="">
-  <div>
+  <div class="head-text">
     <b>MediaGrab fetcher</b>
-    <span id="hostStatus">checking native host…</span>
+    <span id="hostStatus" role="status">checking the MediaGrab engine…</span>
   </div>
-  <button id="openApp" title="Open the MediaGrab app">⤢</button>
+  <button id="openApp" title="Open the MediaGrab app">Open app</button>
 </header>
 
-<div id="interceptRow">
-  <label>
-    <input type="checkbox" id="intercept">
-    intercept browser downloads
-  </label>
-  <span id="activeInfo"></span>
-</div>
+<div id="notice" hidden></div>
 
-<div id="destRow">
-  <input id="dest" placeholder="save to ~/Downloads/mgd (leave empty) — or absolute folder path">
-</div>
-
-<div id="items">
+<main id="items" aria-live="polite">
   <div class="placeholder">Scanning this page…</div>
-</div>
+</main>
+
+<section id="pageRow" hidden>
+  <div class="page-text">
+    <b id="pageRowTitle">Download this page's video</b>
+    <span id="pageRowHint">MediaGrab resolves it with yt-dlp (YouTube, X, Vimeo and 1000+ sites)</span>
+  </div>
+  <button id="sendPage">Send page</button>
+</section>
 
 <footer>
-  <label><input type="checkbox" id="all" checked> all</label>
+  <label class="all"><input type="checkbox" id="all" checked> All</label>
   <span id="summary">0 selected</span>
-  <button id="download" disabled>Download selected</button>
+  <button id="download" disabled>Download</button>
 </footer>
+
+<div id="settings">
+  <label title="Downloads Chrome starts are handed to MediaGrab instead (files under 512 KB and web pages are left alone)">
+    <input type="checkbox" id="intercept">
+    Take over browser downloads
+  </label>
+  <span id="activeInfo"></span>
+  <details id="destBox">
+    <summary>Save to…</summary>
+    <input id="dest" spellcheck="false"
+           placeholder="Folder path — leave empty to choose in the app">
+  </details>
+</div>
 <script src="popup.js"></script>
 </body>
 </html>
