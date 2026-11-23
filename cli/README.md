@@ -62,6 +62,7 @@ mgd pause 1 / mgd resume 1 / mgd cancel 1   # by the number mgd jobs prints…
 mgd pause d3fa9c01b2e              # …or by the stable id shown next to it
 mgd grab "https://site/video.m3u8" # HLS/DASH streams: assembled with yt-dlp
 mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)
+mgd playlist "youtube.com/@chan"   # JSON list of a playlist's/channel's videos (no download)
 mgd convert <file|folder>          # make videos play smoothly on a Mac (only if needed)
 mgd convert <folder> --check       # just report what each file needs
 mgd set-default mac-ready convert  # after every download: convert | fix | off

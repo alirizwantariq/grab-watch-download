@@ -217,10 +217,16 @@ struct BatchSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                SheetHeader(symbol: "square.stack.3d.down.right",
-                            title: "\(batch.items.count) items on this page",
-                            subtitle: batch.url)
-                Button("All") { batch.selected = Set(batch.items.map(\.id)) }
+                if let playlist = batch.playlist {
+                    SheetHeader(symbol: "list.and.film",
+                                title: playlist.title.isEmpty ? "Playlist" : playlist.title,
+                                subtitle: playlistSubtitle(playlist))
+                } else {
+                    SheetHeader(symbol: "square.stack.3d.down.right",
+                                title: "\(batch.items.count) items on this page",
+                                subtitle: batch.url)
+                }
+                Button("All") { batch.selected = Set(batch.items.filter { !$0.live }.map(\.id)) }
                     .controlSize(.small)
                 Button("None") { batch.selected = [] }
                     .controlSize(.small)
@@ -237,10 +243,18 @@ struct BatchSheet: View {
             }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
+                if batch.playlist != nil {
+                    playlistOptions
+                }
                 DestinationLine()
+                if batch.playlist != nil, let folder = batch.playlistDestination(chosenFolder: session.destination),
+                   batch.ownFolder {
+                    Label("Saved in \(tildePath(folder))", systemImage: "arrow.turn.down.right")
+                        .font(.caption).foregroundColor(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
                 HStack {
-                    Text("\(batch.selected.count) of \(batch.items.count) selected"
-                         + (batch.totalSelectedBytes > 0 ? " · " + fmtBytes(batch.totalSelectedBytes) : ""))
+                    Text(selectionSummary)
                         .font(.caption).foregroundColor(.secondary)
                     Spacer()
                     Button("Cancel") { session.sheet = nil }
@@ -258,6 +272,55 @@ struct BatchSheet: View {
             .padding(14)
         }
         .frame(width: 680, height: 540)
+    }
+
+    private func playlistSubtitle(_ playlist: PlaylistInfo) -> String {
+        var parts: [String] = []
+        if !playlist.uploader.isEmpty, playlist.uploader != playlist.title { parts.append(playlist.uploader) }
+        if playlist.truncated {
+            parts.append("the first \(batch.items.count) videos")
+        } else {
+            let n = max(playlist.count, batch.items.count)
+            parts.append("\(n) video\(n == 1 ? "" : "s")")
+            if playlist.count > batch.items.count {
+                parts.append("\(playlist.count - batch.items.count) private or unavailable")
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var selectionSummary: String {
+        var text = "\(batch.selected.count) of \(batch.items.count) selected"
+        if batch.playlist != nil {
+            if batch.totalSelectedDuration > 0 { text += " · " + fmtDuration(batch.totalSelectedDuration) }
+        } else if batch.totalSelectedBytes > 0 {
+            text += " · " + fmtBytes(batch.totalSelectedBytes)
+        }
+        return text
+    }
+
+    /// One quality, an own folder and numbering for every chosen video.
+    private var playlistOptions: some View {
+        HStack(spacing: 16) {
+            Picker("Quality", selection: $batch.quality) {
+                Text("Best available").tag("best")
+                Text("1080p").tag("1080")
+                Text("720p").tag("720")
+                Text("480p").tag("480")
+                Text("Audio only (MP3)").tag("audio")
+            }
+            .pickerStyle(.menu)
+            .frame(width: 220)
+            .help("Each video in this quality, or the closest one below it")
+            Toggle("Own folder", isOn: $batch.ownFolder)
+                .toggleStyle(.checkbox)
+                .help("Save the videos together in a folder named after the playlist")
+            Toggle("Number the files", isOn: $batch.numbered)
+                .toggleStyle(.checkbox)
+                .help("01 - First video, 02 - Second video, … in playlist order")
+            Spacer()
+        }
+        .font(.callout)
     }
 
     private func row(_ item: BatchItem) -> some View {
@@ -280,14 +343,30 @@ struct BatchSheet: View {
                                 .padding(.horizontal, 5).padding(.vertical, 1)
                                 .background(Capsule().fill(Color.accentColor.opacity(0.22)))
                         }
-                        Text(item.sizeText).font(.caption).foregroundColor(.secondary)
+                        if item.live {
+                            Text("LIVE / UPCOMING")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Capsule().fill(Color.red.opacity(0.25)))
+                                .help("A live stream or premiere: it can be downloaded once it has ended")
+                        }
+                        if batch.playlist != nil {
+                            if let d = item.duration, d > 0 {
+                                Text(fmtDuration(d)).font(.caption.monospacedDigit())
+                                    .foregroundColor(.secondary)
+                            }
+                        } else {
+                            Text(item.sizeText).font(.caption).foregroundColor(.secondary)
+                        }
                         if let earlier = batch.earlier[item.id] {
                             Text(earlier.summary)
                                 .font(.caption.weight(.medium)).foregroundColor(.orange)
                                 .help("Saved as \(earlier.fileName)")
                         }
-                        Text(URLComponents(string: item.url)?.host ?? "")
-                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                        if batch.playlist == nil {
+                            Text(URLComponents(string: item.url)?.host ?? "")
+                                .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                        }
                     }
                 }
                 Spacer()

@@ -163,6 +163,16 @@ def build_parser() -> argparse.ArgumentParser:
     ql.add_argument("--cookies", default=None)
     ql.add_argument("--cookies-from-browser", default=None)
 
+    pl = sub.add_parser("playlist",
+                        help="list the videos of a playlist or channel (JSON; "
+                             "used by the GUI playlist picker)")
+    pl.add_argument("url")
+    pl.add_argument("--limit", type=int, default=500,
+                    help="at most this many videos (default 500)")
+    pl.add_argument("--proxy", default=None)
+    pl.add_argument("--cookies", default=None, help="Netscape cookies.txt")
+    pl.add_argument("--cookies-from-browser", default=None)
+
     pm = sub.add_parser("page-media", aliases=["catalog"],
                         help="list every media item on a page with quality/"
                              "thumbnail/size info (JSON; used by the GUI "
@@ -882,13 +892,15 @@ def _strip_impersonate(args_list: list[str]) -> list[str]:
 
 
 def _probe_ytdlp_info(ytdlp: str, strategies: list[tuple[str, list[str]]],
-                      url: str, extra: list[str]) -> tuple[dict | None, str | None]:
-    """Run 'yt-dlp -J' through each strategy; return (info, strategy name)."""
+                      url: str, extra: list[str], playlist: bool = False,
+                      timeout: int = 90) -> tuple[dict | None, str | None]:
+    """Run 'yt-dlp -J' through each strategy; return (info, strategy name).
+    playlist=True reads the whole list instead of the one video."""
     for name, base in strategies:
         base = _strip_impersonate(base)
-        cmd = [ytdlp, *base, "--no-playlist", "-J", *extra, url]
+        cmd = [ytdlp, *base, *([] if playlist else ["--no-playlist"]), "-J", *extra, url]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except (subprocess.TimeoutExpired, OSError):
             continue
         if proc.returncode != 0:
@@ -2859,6 +2871,170 @@ def cmd_watch(args) -> int:
                 print(f"error: could not start download: {err}", file=sys.stderr)
 
 
+def _ytdlp_probe_strategies(args, cfg: dict) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    """How the menus (qualities, playlist) ask yt-dlp: a browser user agent,
+    then impersonation, then a login (the caller's cookies file, or the
+    preferred browser's cookies). Returns (strategies, proxy args)."""
+    proxy_args = []
+    envp = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") \
+        or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+    if getattr(args, "proxy", None):
+        proxy_args = ["--proxy", args.proxy]
+    elif envp:
+        proxy_args = ["--proxy", envp]
+    cookies = []
+    if getattr(args, "cookies", None):
+        cookies = ["--cookies", args.cookies]
+    elif getattr(args, "cookies_from_browser", None):
+        cookies = ["--cookies-from-browser", args.cookies_from_browser]
+    else:
+        preferred = cfg.get("cookies_browser")
+        for b in [preferred, "chrome", "edge", "brave", "firefox", "safari"]:
+            if b:
+                cookies = ["--impersonate", "chrome",
+                           "--cookies-from-browser", b]
+                break
+    strategies = [
+        ("chrome UA", _ytdlp_base_args() + [
+            "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"]),
+        ("impersonate chrome", _ytdlp_base_args() + ["--impersonate", "chrome"]),
+        ("cookies", _ytdlp_base_args() + cookies) if cookies else None,
+    ]
+    return [st for st in strategies if st], proxy_args
+
+
+# ── playlists and channels ───────────────────────────────────────────────
+# `mgd playlist URL` lists a playlist's (or channel's) videos for the app's
+# picker, without downloading anything: yt-dlp --flat-playlist reads only
+# the list pages, not every video.
+
+_YT_CHANNEL_ROOT = re.compile(
+    r"^(https?://(?:www\.|m\.)?youtube\.com/(?:@[^/?#]+|channel/[^/?#]+|c/[^/?#]+|user/[^/?#]+))"
+    r"/?(?:[?#].*)?$", re.I)
+_UNAVAILABLE_TITLES = {"[private video]", "[deleted video]", "[unavailable video]"}
+
+
+def _playlist_url(url: str) -> str:
+    """A channel's main page lists its tabs (Videos, Shorts, Live); its
+    videos are what people mean."""
+    m = _YT_CHANNEL_ROOT.match(url)
+    return m.group(1) + "/videos" if m else url
+
+
+def _entry_url(entry: dict) -> str | None:
+    for key in ("webpage_url", "url"):
+        v = entry.get(key)
+        if isinstance(v, str) and v.startswith(("http://", "https://")):
+            return v
+    vid = entry.get("id")
+    if vid and str(entry.get("ie_key") or "").lower() == "youtube":
+        return f"https://www.youtube.com/watch?v={vid}"
+    return None
+
+
+def _entry_thumbnail(entry: dict) -> str:
+    """A small thumbnail (the picker shows ~120 px): the narrowest one at
+    least 240 px wide."""
+    thumbs = [t for t in entry.get("thumbnails") or []
+              if isinstance(t, dict) and isinstance(t.get("url"), str)]
+    sized = sorted((t for t in thumbs if isinstance(t.get("width"), (int, float))),
+                   key=lambda t: t["width"])
+    for t in sized:
+        if t["width"] >= 240:
+            return t["url"]
+    if sized:
+        return sized[-1]["url"]
+    if thumbs:
+        return thumbs[-1]["url"]
+    thumb = entry.get("thumbnail")
+    return thumb if isinstance(thumb, str) else ""
+
+
+def _playlist_entries(info: dict, limit: int) -> list[dict]:
+    """The videos of a flat playlist, in order: nested lists (a channel's
+    tabs) flattened, private/deleted entries and repeats left out."""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def walk(entries) -> None:
+        for e in entries or []:
+            if len(out) >= limit:
+                return
+            if not isinstance(e, dict):
+                continue
+            if e.get("_type") == "playlist" or isinstance(e.get("entries"), list):
+                walk(e.get("entries"))
+                continue
+            if str(e.get("ie_key") or "").endswith("Tab"):
+                continue          # a link to another tab, not a video
+            title = str(e.get("title") or "")
+            if title.lower() in _UNAVAILABLE_TITLES:
+                continue
+            url = _entry_url(e)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            dur = e.get("duration")
+            out.append({
+                "url": url,
+                "id": str(e.get("id") or ""),
+                "title": title,
+                "duration": float(dur) if isinstance(dur, (int, float)) and dur > 0 else None,
+                "thumbnail": _entry_thumbnail(e),
+                "uploader": str(e.get("uploader") or e.get("channel") or ""),
+                "live": e.get("live_status") in ("is_live", "is_upcoming"),
+            })
+
+    walk(info.get("entries"))
+    return out
+
+
+def cmd_playlist(args) -> int:
+    """The videos of a playlist or channel, for a picker (one JSON document):
+
+    {"url", "title", "uploader", "count", "truncated", "items": [{url, id,
+     title, duration, thumbnail, uploader, live}], "folders": {"video",
+     "audio"}, "error"}"""
+    cfg = _cfg()
+    url = _playlist_url(args.url)
+    limit = max(1, min(args.limit or 500, 5000))
+    out = {"url": url, "title": None, "uploader": None, "count": 0, "truncated": False,
+           "items": [], "error": None,
+           "folders": {"video": str(categorize.category_dir(cfg, "video")),
+                       "audio": str(categorize.category_dir(cfg, "audio"))}}
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp:
+        out["error"] = "yt-dlp not installed (brew install yt-dlp)"
+        print(json.dumps(out))
+        return 1
+    strategies, proxy_args = _ytdlp_probe_strategies(args, cfg)
+    # one more than shown, to know whether there are more
+    info, _ = _probe_ytdlp_info(ytdlp, strategies, url,
+                                ["--flat-playlist", "--yes-playlist",
+                                 "--playlist-end", str(limit + 1), *proxy_args],
+                                playlist=True, timeout=240)
+    if info is None:
+        out["error"] = ("yt-dlp could not read this playlist (private? a bot check? "
+                        "open it in your browser once, or pass --cookies)")
+        print(json.dumps(out))
+        return 1
+    items = _playlist_entries(info, limit + 1)
+    out["truncated"] = len(items) > limit
+    out["items"] = items[:limit]
+    out["title"] = info.get("title") or info.get("playlist_title") or ""
+    out["uploader"] = info.get("uploader") or info.get("channel") or ""
+    count = info.get("playlist_count")
+    out["count"] = count if isinstance(count, int) and count >= len(out["items"]) \
+        else len(out["items"])
+    if not out["items"]:
+        out["error"] = "no videos in this playlist (or all of them are private)"
+        print(json.dumps(out))
+        return 1
+    print(json.dumps(out))
+    return 0
+
+
 def cmd_qualities(args) -> int:
     """Machine-readable quality menu for a URL (NDJSON-ish single JSON line).
 
@@ -2893,33 +3069,7 @@ def cmd_qualities(args) -> int:
         out["error"] = "yt-dlp not installed (brew install yt-dlp)"
         print(json.dumps(out))
         return 1
-    proxy_args = []
-    envp = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") \
-        or os.environ.get("https_proxy") or os.environ.get("http_proxy")
-    if args.proxy:
-        proxy_args = ["--proxy", args.proxy]
-    elif envp:
-        proxy_args = ["--proxy", envp]
-    cookies = []
-    if getattr(args, "cookies", None):
-        cookies = ["--cookies", args.cookies]
-    elif getattr(args, "cookies_from_browser", None):
-        cookies = ["--cookies-from-browser", args.cookies_from_browser]
-    else:
-        preferred = cfg.get("cookies_browser")
-        for b in [preferred, "chrome", "edge", "brave", "firefox", "safari"]:
-            if b:
-                cookies = ["--impersonate", "chrome",
-                           "--cookies-from-browser", b]
-                break
-    strategies = [
-        ("chrome UA", _ytdlp_base_args() + [
-            "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"]),
-        ("impersonate chrome", _ytdlp_base_args() + ["--impersonate", "chrome"]),
-        ("cookies", _ytdlp_base_args() + cookies) if cookies else None,
-    ]
-    strategies = [s for s in strategies if s]
+    strategies, proxy_args = _ytdlp_probe_strategies(args, cfg)
     info, probe_strategy = _probe_ytdlp_info(ytdlp, strategies, url,
                                              ["--no-playlist", *proxy_args])
     if info is None:
@@ -3339,6 +3489,7 @@ def main(argv=None) -> int:
         "convert": cmd_convert, "mac-ready": cmd_convert,
         "qualities": cmd_qualities, "formats": cmd_qualities,
         "page-media": cmd_page_media, "catalog": cmd_page_media,
+        "playlist": cmd_playlist,
         "native-host": cmd_native_host,
         "watch": cmd_watch, "clipboard-watch": cmd_watch,
         "torrent-info": cmd_torrent_info, "torrent-files": cmd_torrent_info,

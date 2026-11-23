@@ -680,6 +680,74 @@ def flow_duplicates(run: Run, base: str):
     assert "fresh.mp4" not in " ".join(run.files())
 
 
+def flow_playlist(run: Run, base: str):
+    """A playlist link opens the picker (one quality, its own folder,
+    numbered files; already-downloaded and upcoming videos unticked); a
+    video opened from a playlist asks which is meant; a Mix list does not."""
+    bindir = run.box / "fakebin"
+    bindir.mkdir()
+    videos = [("Intro", 65), ("Setup: tools", 125), ("Wrap up", 3700)]
+    entries = [{"_type": "url", "ie_key": "Youtube", "id": f"pl{i}", "url": f"{base}/fast/pl_{i}.mp4",
+                "title": title, "duration": seconds} for i, (title, seconds) in enumerate(videos, 1)]
+    entries.append({"_type": "url", "ie_key": "Youtube", "id": "live1", "url": f"{base}/fast/live.mp4",
+                    "title": "Live Q&A", "live_status": "is_upcoming"})
+    fixture, calls = run.box / "flat.json", run.box / "ytdlp-calls.txt"
+    fixture.write_text(json.dumps({"_type": "playlist", "title": "My Course", "uploader": "Teacher",
+                                   "playlist_count": 5, "entries": entries}))
+    (bindir / "yt-dlp").write_text(f"""#!/bin/sh
+echo "$@" >> '{calls}'
+case "$*" in
+  *--version*) echo 2026.11.20 ;;
+  *--flat-playlist*) cat '{fixture}' ;;
+  *) exit 1 ;;
+esac
+""")
+    (bindir / "yt-dlp").chmod(0o755)
+    run.env["MEDIAGRAB_EXTRA_PATH"] = str(bindir)
+    playlist = "https://www.youtube.com/playlist?list=PLcourse"
+    run.play([["ask", "off"], ["submit", f"{base}/fast/pl_2.mp4"], ["waitphase", "pl_2", "done", 30],
+              ["submit", playlist], ["waitsheet", "batch", 30], ["dump", "sheet"], ["snap", "playlist"],
+              ["playlistopts", "720", "on", "on"], ["wait", 0.3], ["dump", "numbered"], ["snap", "options"],
+              ["confirm"], ["wait", 1], ["waitphase", "01 - Intro", "done", 30],
+              ["waitphase", "03 - Wrap up", "done", 30], ["wait", 0.5], ["dump", "done"],
+              ["submit", "https://www.youtube.com/watch?v=pl1xxxxxxxx&list=PLcourse&index=1"],
+              ["wait", 0.5], ["dump", "asked"],
+              ["alertother"], ["waitsheet", "batch", 30], ["dump", "fromvideo"], ["closesheet"],
+              ["submit", "https://www.youtube.com/watch?v=mixmixmix00&list=RDmixmixmix00"],
+              ["wait", 0.5], ["dump", "mix"], ["waitsheet", "quality", 60], ["closesheet"], ["quit"]])
+
+    sheet = run.dump("sheet")
+    assert sheet["playlistTitle"] == "My Course", sheet["playlistTitle"]
+    items = {i["title"]: i for i in sheet["batchItems"]}
+    assert list(items) == ["Intro", "Setup: tools", "Wrap up", "Live Q&A"], list(items)
+    assert items["Intro"]["selected"] == items["Wrap up"]["selected"] == "yes", items
+    assert items["Setup: tools"]["selected"] == "no" and items["Setup: tools"]["earlier"] == "pl_2.mp4", items
+    assert items["Live Q&A"]["selected"] == "no" and items["Live Q&A"]["live"] == "yes", items
+    assert items["Intro"]["fileName"] == "Intro"
+    numbered = {i["title"]: i["fileName"] for i in run.dump("numbered")["batchItems"]}
+    assert numbered["Intro"] == "01 - Intro" and numbered["Wrap up"] == "03 - Wrap up", numbered
+
+    files = run.files()
+    assert {"video/My Course/01 - Intro.mp4", "video/My Course/03 - Wrap up.mp4"} <= set(files), files
+    assert not [f for f in files if "live" in f or "02 -" in f], files
+    done = run.jobs("done")
+    intro = done["01 - Intro"]
+    assert intro["phase"] == "done", intro
+    args = intro["args"]
+    assert args[args.index("--quality") + 1] == "720", args
+    assert args[args.index("-d") + 1].endswith("/video/My Course"), args
+    ytdlp_calls = calls.read_text()
+    assert playlist in ytdlp_calls, ytdlp_calls
+
+    asked = run.dump("asked")
+    assert asked["confirmation"] == "This video is part of a playlist", asked["confirmation"]
+    assert asked["alertButtons"] == ["Just This Video", "Whole Playlist…", "Cancel"], asked["alertButtons"]
+    assert run.dump("fromvideo")["playlistTitle"] == "My Course"
+    assert ytdlp_calls.count("--flat-playlist") == 2, ytdlp_calls   # the playlist, then from the video
+    mix = run.dump("mix")
+    assert mix["confirmation"] == "", mix["confirmation"]
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -764,7 +832,7 @@ def flow_snapshots(run: Run, base: str):
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
          flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop, flow_many_links,
          flow_clipboard_watch, flow_ytdlp_update, flow_missed_end,
-         flow_mac_ready, flow_duplicates,
+         flow_mac_ready, flow_duplicates, flow_playlist,
          flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 

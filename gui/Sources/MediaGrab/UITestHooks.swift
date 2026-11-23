@@ -143,6 +143,18 @@ enum UITestHooks {
         case "alertconfirm":
             if let c = session.confirmation { session.confirmation = nil; c.action() }
         case "alertcancel": session.confirmation = nil
+        case "alertother":
+            if let c = session.confirmation, let other = c.otherAction {
+                session.confirmation = nil
+                other()
+            }
+        case "playlistopts":
+            // ["playlistopts", quality, ownFolder on/off, numbered on/off]
+            if case .batch(let batch) = session.sheet {
+                batch.quality = arg(1)
+                batch.ownFolder = arg(2) == "on"
+                batch.numbered = arg(3) == "on"
+            }
         case "identities":
             let links = Array(step.dropFirst(2)).compactMap { $0 as? String }
             let ids = links.map { Naming.identity(of: $0) ?? "" }
@@ -413,9 +425,11 @@ enum UITestHooks {
 
     private static func batchItems() -> [[String: String]] {
         guard case .batch(let batch) = Session.shared.sheet else { return [] }
-        return batch.items.map { ["url": $0.url,
+        return batch.items.map { ["url": $0.url, "title": $0.title,
                                   "selected": batch.selected.contains($0.id) ? "yes" : "no",
-                                  "earlier": batch.earlier[$0.id]?.fileName ?? ""] }
+                                  "earlier": batch.earlier[$0.id]?.fileName ?? "",
+                                  "live": $0.live ? "yes" : "no",
+                                  "fileName": batch.fileName(for: $0) ?? ""] }
     }
 
     private static func dump(_ name: String) {
@@ -440,6 +454,10 @@ enum UITestHooks {
             "alertButtons": alertButtons(),
             "pendingEarlier": pendingEarlier(),
             "batchItems": batchItems(),
+            "playlistTitle": { () -> String in
+                if case .batch(let b) = Session.shared.sheet { return b.playlist?.title ?? "" }
+                return ""
+            }(),
             "windows": NSApp.windows.filter { $0.canBecomeMain && !$0.isSheet }.count,
             "bundledEngine": Engine.bundledLauncher ?? "",
             "bundledExtension": Engine.bundledExtension?.path ?? "",

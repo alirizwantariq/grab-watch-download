@@ -66,6 +66,14 @@ missing and the command that installs each.
   and surrounding words are ignored), drop a `.txt` list, or use File ▸
   Import Links from File… (⇧⌘I): one sheet lists them all; file links keep
   their file name, pages are named after their video unless a name is typed.
+- **Playlists and channels.** A YouTube playlist or channel link (also a
+  SoundCloud set or Vimeo showcase) opens a picker with every video, its
+  length and thumbnail: one quality for all (best, 1080p, 720p, 480p or
+  MP3), saved together in a folder named after the playlist, optionally
+  numbered in playlist order (`01 - Intro.mp4`). Videos already downloaded
+  and live streams/premieres start unticked. A video opened from a playlist
+  (`watch?v=…&list=…`) asks: *Just This Video* or *Whole Playlist…*
+  (YouTube's endless Mix lists are not asked about).
 - **Already downloaded?** Sending something whose file is still on disk
   asks first (*Download Again* / *Show in Finder*), also when the link looks
   different: YouTube links match by video id (watch, youtu.be, shorts),

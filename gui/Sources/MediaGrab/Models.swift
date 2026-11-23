@@ -491,6 +491,58 @@ enum Naming {
         return kept.isEmpty ? base : base + "?" + kept.joined(separator: "&")
     }
 
+    private static func youtubeHost(_ comps: URLComponents) -> Bool {
+        guard let host = comps.host?.lowercased() else { return false }
+        return ["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"].contains(host)
+    }
+
+    /// A link to a whole playlist or channel (the picker lists its videos),
+    /// not to one video.
+    static func isPlaylistLink(_ link: String) -> Bool {
+        guard let comps = URLComponents(string: link), let host = comps.host?.lowercased() else {
+            return false
+        }
+        let parts = comps.path.split(separator: "/").map { String($0).lowercased() }
+        if youtubeHost(comps) {
+            if parts == ["playlist"] {
+                return comps.queryItems?.contains { $0.name == "list" && !($0.value ?? "").isEmpty } ?? false
+            }
+            guard let first = parts.first else { return false }
+            let channel: Int      // how many path parts name the channel
+            if first.hasPrefix("@") {
+                channel = 1
+            } else if ["channel", "c", "user"].contains(first), parts.count >= 2 {
+                channel = 2
+            } else {
+                return false
+            }
+            if parts.count == channel { return true }
+            return parts.count == channel + 1
+                && ["videos", "shorts", "streams", "featured"].contains(parts[channel])
+        }
+        if host == "soundcloud.com" || host.hasSuffix(".soundcloud.com") {
+            return parts.count >= 3 && parts[1] == "sets"
+        }
+        if host == "vimeo.com" || host.hasSuffix(".vimeo.com") {
+            return parts.first == "showcase" || parts.first == "album"
+        }
+        return false
+    }
+
+    /// "watch?v=…&list=PL…": the playlist the video was opened from, as a
+    /// playlist link. nil for single videos and for YouTube's endless Mix
+    /// lists (list=RD…).
+    static func playlistOfVideo(_ link: String) -> String? {
+        guard let comps = URLComponents(string: link), youtubeHost(comps),
+              comps.path == "/watch",
+              comps.queryItems?.contains(where: { $0.name == "v" && !($0.value ?? "").isEmpty }) == true,
+              let list = comps.queryItems?.first(where: { $0.name == "list" })?.value,
+              !list.isEmpty, !list.hasPrefix("RD") else { return nil }
+        var out = URLComponents(string: "https://www.youtube.com/playlist")!
+        out.queryItems = [URLQueryItem(name: "list", value: list)]
+        return out.string
+    }
+
     /// Two links that download the same thing (see identity(of:)).
     static func sameFile(_ a: String, _ b: String) -> Bool {
         if a == b { return true }

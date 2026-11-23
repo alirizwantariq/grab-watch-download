@@ -37,14 +37,20 @@ struct BatchItem: Identifiable {
     let quality: String
     let poster: String
     let size: Int64?
+    /// playlist videos: length in seconds, and live/upcoming (not downloadable yet)
+    let duration: Double?
+    let live: Bool
 
     init?(dict: [String: Any]) {
         guard let url = dict["url"] as? String, !url.isEmpty else { return nil }
         self.url = url
         self.title = (dict["title"] as? String) ?? ""
         self.quality = (dict["quality"] as? String) ?? ""
-        self.poster = (dict["poster"] as? String) ?? ""
+        let poster = (dict["poster"] as? String) ?? ""
+        self.poster = poster.isEmpty ? ((dict["thumbnail"] as? String) ?? "") : poster
         self.size = (dict["size"] as? NSNumber)?.int64Value
+        self.duration = (dict["duration"] as? NSNumber)?.doubleValue
+        self.live = (dict["live"] as? Bool) ?? false
     }
 
     var sizeText: String {
@@ -53,7 +59,36 @@ struct BatchItem: Identifiable {
     }
 }
 
-/// Selection state of the multi-video picker.
+/// A YouTube playlist or channel as `mgd playlist` describes it.
+struct PlaylistInfo {
+    let title: String
+    let uploader: String
+    /// videos in the whole list (more than listed when truncated)
+    let count: Int
+    let truncated: Bool
+    /// the engine's Video and Audio folders (the "own folder" goes inside)
+    let videoFolder: String
+    let audioFolder: String
+
+    init(dict: [String: Any]) {
+        title = (dict["title"] as? String) ?? ""
+        uploader = (dict["uploader"] as? String) ?? ""
+        count = (dict["count"] as? NSNumber)?.intValue ?? 0
+        truncated = (dict["truncated"] as? Bool) ?? false
+        let folders = dict["folders"] as? [String: Any] ?? [:]
+        videoFolder = (folders["video"] as? String) ?? ""
+        audioFolder = (folders["audio"] as? String) ?? ""
+    }
+
+    /// "My Mix" / "Channel - Videos" made usable as a folder name
+    var folderName: String {
+        let name = Naming.sanitize(title)
+        return name.isEmpty ? "Playlist" : name
+    }
+}
+
+/// Selection state of the multi-video picker (a page's videos, or a
+/// playlist's).
 final class BatchProbe: ObservableObject, Identifiable {
     let id = UUID()
     let url: String
@@ -61,20 +96,51 @@ final class BatchProbe: ObservableObject, Identifiable {
     let cookies: String?
     /// items whose video was downloaded before (they start unticked)
     let earlier: [UUID: EarlierDownload]
+    /// set for a playlist or channel: quality, folder and numbering apply
+    /// to every video chosen
+    let playlist: PlaylistInfo?
     @Published var selected: Set<UUID>
+    @Published var quality = "best"
+    @Published var ownFolder = true
+    @Published var numbered = false
 
     init(url: String, items: [BatchItem], cookies: String? = nil,
-         earlier: [UUID: EarlierDownload] = [:]) {
+         earlier: [UUID: EarlierDownload] = [:], playlist: PlaylistInfo? = nil) {
         self.url = url
         self.items = items
         self.cookies = cookies
         self.earlier = earlier
-        // everything new ticked by default
-        selected = Set(items.map(\.id).filter { earlier[$0] == nil })
+        self.playlist = playlist
+        // everything new ticked by default (not live streams / premieres)
+        selected = Set(items.filter { earlier[$0.id] == nil && !$0.live }.map(\.id))
     }
 
     var chosen: [BatchItem] { items.filter { selected.contains($0.id) } }
     var totalSelectedBytes: Int64 { chosen.reduce(0) { $0 + ($1.size ?? 0) } }
+    var totalSelectedDuration: Double { chosen.reduce(0) { $0 + ($1.duration ?? 0) } }
+
+    /// Where a playlist's videos go: its own folder inside the chosen
+    /// folder (or the Video/Audio folder), or nil for the usual place.
+    func playlistDestination(chosenFolder: String?) -> String? {
+        guard let playlist else { return chosenFolder }
+        guard ownFolder else { return chosenFolder }
+        let base = chosenFolder ?? (quality == "audio" ? playlist.audioFolder : playlist.videoFolder)
+        guard !base.isEmpty else { return chosenFolder }
+        return (base as NSString).appendingPathComponent(playlist.folderName)
+    }
+
+    /// "01 - Title" when numbering (position in the whole list)
+    func fileName(for item: BatchItem) -> String? {
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard playlist != nil, numbered,
+              let index = items.firstIndex(where: { $0.id == item.id }) else {
+            return title.isEmpty ? nil : title
+        }
+        let width = max(2, String(items.count).count)
+        let number = String(repeating: "0", count: max(0, width - String(index + 1).count))
+            + String(index + 1)
+        return title.isEmpty ? number : "\(number) - \(title)"
+    }
 }
 
 /// One file inside a torrent (from `mgd torrent-info`).
@@ -356,14 +422,30 @@ final class Session: ObservableObject {
         }
         if Naming.isTorrent(link) {
             scanTorrent(link)
+        } else if Naming.isPlaylistLink(link) {
+            scanPlaylist(link, cookies: cookies)
+        } else if let list = Naming.playlistOfVideo(link) {
+            confirmation = Confirmation(
+                title: "This video is part of a playlist",
+                message: "Download just this video, or choose videos from the whole playlist?",
+                actionLabel: "Just This Video", destructive: false,
+                otherLabel: "Whole Playlist…",
+                otherAction: { [weak self] in self?.scanPlaylist(list, cookies: cookies) },
+                action: { [weak self] in self?.addSingle(link, title: title, cookies: cookies) })
         } else {
-            downloadAgain.removeAll()
-            let go: () -> Void = { [weak self] in self?.probe(link, title: title, cookies: cookies) }
-            if let earlier = unconfirmedDuplicate(link) {
-                askDownloadAgain(earlier, link: link, then: go)
-            } else {
-                go()
-            }
+            addSingle(link, title: title, cookies: cookies)
+        }
+    }
+
+    /// One video or file: asks first when it was downloaded before, then
+    /// looks at what the link offers.
+    private func addSingle(_ link: String, title: String?, cookies: String?) {
+        downloadAgain.removeAll()
+        let go: () -> Void = { [weak self] in self?.probe(link, title: title, cookies: cookies) }
+        if let earlier = unconfirmedDuplicate(link) {
+            askDownloadAgain(earlier, link: link, then: go)
+        } else {
+            go()
         }
     }
 
@@ -661,6 +743,39 @@ final class Session: ObservableObject {
         }
     }
 
+    /// A playlist or channel: its videos in the picker, with one quality,
+    /// an own folder and optional numbering for all of them.
+    func scanPlaylist(_ url: String, cookies: String? = nil) {
+        guard !probing else {
+            store.flash("Still checking the previous link…")
+            return
+        }
+        probing = true
+        probingLabel = "Reading the playlist…"
+        Task {
+            let answer = await Engine.runJSON(["playlist", url] + cookieArgs(cookies))
+            await MainActor.run {
+                self.probing = false
+                let raw = answer?["items"] as? [[String: Any]] ?? []
+                let items = raw.compactMap { BatchItem(dict: $0) }
+                guard let answer, !items.isEmpty else {
+                    let reason = (answer?["error"] as? String) ?? "no answer from the engine"
+                    self.store.flash("Could not read this playlist: \(reason)", seconds: 10)
+                    return
+                }
+                var earlier: [UUID: EarlierDownload] = [:]
+                for item in items {
+                    if let job = self.store.earlierDownload(of: item.url) {
+                        earlier[item.id] = EarlierDownload(job)
+                    }
+                }
+                self.sheet = .batch(BatchProbe(url: url, items: items, cookies: cookies,
+                                               earlier: earlier,
+                                               playlist: PlaylistInfo(dict: answer)))
+            }
+        }
+    }
+
     func scanTorrent(_ url: String) {
         guard !probing else { return }
         probing = true
@@ -734,6 +849,23 @@ final class Session: ObservableObject {
 
     func startBatch(_ batch: BatchProbe) {
         let chosen = batch.chosen
+        if batch.playlist != nil {
+            let folder = batch.playlistDestination(chosenFolder: destination)
+            for item in chosen.reversed() {
+                let name = batch.fileName(for: item)
+                var request = DownloadRequest(url: item.url,
+                                              title: name ?? Naming.suggested(forURL: item.url),
+                                              quality: batch.quality, destination: folder,
+                                              outName: name,
+                                              poster: item.poster.isEmpty ? nil : item.poster)
+                request.cookies = batch.cookies
+                store.start(request)
+            }
+            sheet = nil
+            store.flash("Added \(chosen.count) video\(chosen.count == 1 ? "" : "s")"
+                        + (folder.map { " to \((($0 as NSString).lastPathComponent))" } ?? ""))
+            return
+        }
         for item in chosen.reversed() {
             let title = item.title.isEmpty ? Naming.suggested(forURL: item.url) : item.title
             var request = DownloadRequest(url: item.url, title: title,
