@@ -13,6 +13,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import pathlib
@@ -1155,7 +1156,8 @@ def cmd_grab(args) -> int:
             if _link_dead(err):
                 _emit_error(as_json, f"{url_i}: {err}", kind="link_expired")
             else:
-                _emit_error(as_json, f"{url_i}: {err}" if not as_json else str(err))
+                _emit_error(as_json, f"{url_i}: {_error_message(err)}" if not as_json
+                            else _error_message(err), kind=_error_kind(err))
             failures += 1
     if results:
         print(f"{len(results)} downloaded, {failures} failed")
@@ -2712,6 +2714,35 @@ def _find_fresh_link(st: dict, st_path: pathlib.Path,
                         + (f" (closest match: {last_why})" if last_why else ""))
 
 
+def _error_kind(err) -> str | None:
+    """What kind of failure, for the app: link_expired, network (connection
+    dropped / host unreachable - worth retrying later), server (5xx/429),
+    disk_full."""
+    if _link_dead(err):
+        return "link_expired"
+    if isinstance(err, OSError) and getattr(err, "errno", None) in (errno.ENOSPC, errno.EDQUOT):
+        return "disk_full"
+    if isinstance(err, HttpError):
+        status = getattr(err, "status", 0) or 0
+        return "server" if status >= 500 or status == 429 else None
+    if isinstance(err, OSError):
+        return "network"
+    text = str(err)
+    if "server unreachable" in text:
+        return "server"
+    if "could not reach the server" in text or "failed after" in text \
+            or "connection ended early" in text:
+        return "network"
+    return None
+
+
+def _error_message(err) -> str:
+    if _error_kind(err) == "disk_full":
+        return ("The disk is full. Free some space, then resume - the part "
+                "already downloaded is kept.")
+    return str(err)
+
+
 def _note(as_json: bool, message: str) -> None:
     if as_json:
         print(json.dumps({"type": "note", "message": message}), flush=True)
@@ -2821,7 +2852,7 @@ def _resume_one(st_path: pathlib.Path, as_json: bool, new_url: str | None = None
             if _link_dead(err) and st_path.exists():
                 dead = True
                 continue
-            _emit_error(as_json, str(err))
+            _emit_error(as_json, _error_message(err), kind=_error_kind(err))
             return 1
         if as_json:
             print(json.dumps({"type": "done", "path": str(result.path),

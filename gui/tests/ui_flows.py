@@ -38,6 +38,17 @@ def blob(name: str, size: int) -> bytes:
     return (seed * (size // len(seed) + 1))[:size]
 
 
+FLAKY = {"down": False}       # /flaky/… drops every connection while True
+EXP_TOKENS: dict[str, int] = {}
+EXP_LOCK = threading.Lock()
+
+
+def exp_rotate(name: str) -> int:
+    with EXP_LOCK:
+        EXP_TOKENS[name] = EXP_TOKENS.get(name, 0) + 1
+        return EXP_TOKENS[name]
+
+
 class Site(http.server.BaseHTTPRequestHandler):
     """/slow/<kbps>/<name>, /fast/<name>, /gated/<name> (needs the page as
     Referer), /page-one, /album, anything else 404."""
@@ -68,6 +79,30 @@ class Site(http.server.BaseHTTPRequestHandler):
             vids = "".join(f'<video><source src="/fast/album_{i}_720p.mp4"></video>'
                            for i in range(1, 5))
             return self._html(f"<html><head><title>Album</title></head><body>{vids}</body></html>")
+        if path.startswith("/flaky-control/"):
+            FLAKY["down"] = path.endswith("/down")
+            return self._html("ok")
+        if path.startswith("/flaky/"):
+            if FLAKY["down"]:
+                self.close_connection = True
+                return                       # no answer at all: connection dropped
+            path = "/slow/800/" + path.rsplit("/", 1)[-1]
+            flaky = True
+        else:
+            flaky = False
+        # signed links like video CDNs: each visit to /exp/watch/<name> hands
+        # out /exp/v/<name>?token=N with a new N; only the newest N works
+        if path.startswith("/exp/watch/"):
+            name = path.rsplit("/", 1)[-1]
+            token = exp_rotate(name)
+            return self._html(f'<html><body><video src="/exp/v/{name}?token={token}">'
+                              '</video></body></html>')
+        if path.startswith("/exp/v/"):
+            name = path.rsplit("/", 1)[-1]
+            token = self.path.partition("token=")[2]
+            if not token.isdigit() or int(token) != EXP_TOKENS.get(name):
+                return self._empty(403)
+            path = "/slow/1000/" + name
         logged_in = "session=letmein" in (self.headers.get("Cookie") or "")
         if path.startswith("/members/"):
             if not logged_in:
@@ -108,6 +143,9 @@ class Site(http.server.BaseHTTPRequestHandler):
                 return
             step = max(1024, rate // 10)
             for i in range(0, len(chunk), step):
+                if flaky and FLAKY["down"]:
+                    self.close_connection = True
+                    return                   # the connection drops mid-transfer
                 self.wfile.write(chunk[i:i + step])
                 self.wfile.flush()
                 time.sleep(0.1)
@@ -309,6 +347,88 @@ def flow_site_login(run: Run, base: str):
     assert "letmein" not in history, "cookie values must never reach the history file"
 
 
+def flow_expired_link(run: Run, base: str):
+    """A video link that expires while paused is refreshed from its page by
+    itself; one with no page fails with Update Link, and a fresh link
+    pasted there continues it - both end byte-identical."""
+    page = f"{base}/exp/watch/auto.mp4"
+    run.play([["ask", "off"], ["submit", page], ["waitphase", "auto", "running", 20],
+              ["wait", 2], ["pause", "auto"], ["waitphase", "auto", "paused", 15],
+              ["fetch", page],                                    # the link expires
+              ["resume", "auto"], ["waitphase", "auto", "done", 60], ["wait", 0.5],
+              ["dump", "auto"], ["quit"]])
+    auto = run.dump("auto")["jobs"][0]
+    assert auto["phase"] == "done", auto
+    assert pathlib.Path(auto["finishedPath"]).read_bytes() == blob("auto.mp4", SLOW_SIZE)
+
+    exp_rotate("manual.mp4")
+    direct = f"{base}/exp/v/manual.mp4?token={EXP_TOKENS['manual.mp4']}"
+    run.play([["ask", "off"], ["submit", direct], ["waitphase", "manual", "running", 20],
+              ["wait", 2], ["pause", "manual"], ["waitphase", "manual", "paused", 15],
+              ["fetch", f"{base}/exp/watch/manual.mp4"],          # the link expires
+              ["resume", "manual"], ["waitphase", "manual", "failed", 30], ["wait", 0.5],
+              ["dump", "expired"], ["snap", "expired"],
+              ["updatelinksheet", "manual"], ["wait", 0.6], ["snap", "sheet"], ["closesheet"],
+              ["wait", 0.5],
+              ["relink", "manual", f"{base}/exp/watch/manual.mp4"],   # the page link
+              ["waitphase", "manual", "done", 60], ["wait", 0.5], ["dump", "manual"], ["quit"]])
+    # sent again from the browser with a fresh signed link: the saved part
+    # continues (one row, not a second download)
+    exp_rotate("again.mp4")
+    first = f"{base}/exp/v/again.mp4?token={EXP_TOKENS['again.mp4']}"
+    run.play([["ask", "off"], ["submit", first], ["waitphase", "again", "running", 20],
+              ["wait", 2], ["pause", "again"], ["waitphase", "again", "paused", 15], ["quit"]])
+    fresh_token = exp_rotate("again.mp4")
+    run.play([["ask", "off"], ["wait", 3],
+              ["submit", f"{base}/exp/v/again.mp4?token={fresh_token}"],
+              ["waitphase", "again", "done", 60], ["wait", 0.5], ["dump", "again"], ["quit"]])
+    rows = [j for j in run.dump("again")["jobs"] if "again" in j["title"]]
+    assert len(rows) == 1 and rows[0]["phase"] == "done", rows
+    assert pathlib.Path(rows[0]["finishedPath"]).read_bytes() == blob("again.mp4", SLOW_SIZE)
+    assert "again (1).mp4" not in " ".join(run.files())
+
+    expired = run.jobs("expired")["manual.mp4"]
+    assert expired["phase"] == "failed" and "expired" in expired["error"], expired
+    done = run.jobs("manual")["manual.mp4"]
+    assert done["phase"] == "done", done
+    assert pathlib.Path(done["finishedPath"]).read_bytes() == blob("manual.mp4", SLOW_SIZE)
+    assert not [f for f in run.files() if ".mgd" in f], run.files()
+
+
+def flow_connection_drop(run: Run, base: str):
+    """The connection drops mid-download: it fails as a connection problem,
+    waits while offline, continues by itself when the network is back and
+    ends byte-identical. The Mac is kept awake only while downloading."""
+    FLAKY["down"] = False
+    run.env["MGD_BACKOFF_SCALE"] = "0.01"        # engine gives up retrying quickly
+    assertions: list[str] = []
+
+    def watch_power():
+        time.sleep(3.5)
+        out = subprocess.run(["pmset", "-g", "assertions"], capture_output=True, text=True).stdout
+        assertions.extend(line.strip() for line in out.splitlines() if "MediaGrab" in line)
+
+    threading.Thread(target=watch_power, daemon=True).start()
+    run.play([["ask", "off"], ["submit", f"{base}/flaky/dropped.mp4"],
+              ["waitphase", "dropped", "running", 20], ["wait", 2], ["dump", "busy"],
+              ["fetch", f"{base}/flaky-control/down"], ["netdown"],
+              ["waitphase", "dropped", "failed", 60], ["wait", 0.5],
+              ["dump", "down"], ["snap", "down"],
+              ["fetch", f"{base}/flaky-control/up"], ["netup"], ["wait", 0.3], ["snap", "back"],
+              ["waitphase", "dropped", "done", 60], ["wait", 0.5], ["dump", "after"], ["quit"]])
+    assert run.dump("busy")["keepingAwake"] is True
+    assert any("PreventUserIdleSystemSleep" in a and "Downloading files" in a for a in assertions), assertions
+    down = run.jobs("down")["dropped.mp4"]
+    assert down["phase"] == "failed" and down["errorKind"] == "network", down
+    assert down["retryIn"] > 0 and down["autoRetries"] == 1, down
+    assert run.dump("down")["keepingAwake"] is False, "nothing running: the Mac may sleep"
+    after = run.dump("after")
+    done = {j["title"]: j for j in after["jobs"]}["dropped.mp4"]
+    assert done["phase"] == "done", done
+    assert pathlib.Path(done["finishedPath"]).read_bytes() == blob("dropped.mp4", SLOW_SIZE)
+    assert after["keepingAwake"] is False
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -386,7 +506,8 @@ def flow_snapshots(run: Run, base: str):
 
 
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
-         flow_browser_handoff, flow_site_login, flow_failure_and_retry, flow_pages, flow_relaunch,
+         flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop,
+         flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 
 

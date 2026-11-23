@@ -98,6 +98,10 @@ fresh link makes progress. Without a recorded page, the error says so
 different file is refused (`"kind": "link_mismatch"`) and the part is left
 untouched. A download that fails part-way saves its exact position first.
 
+Error events carry a `kind` the app acts on: `link_expired`,
+`link_mismatch`, `network` (connection dropped / host unreachable),
+`server` (5xx, 429) and `disk_full`.
+
 ### What a link turns into
 
 | Link | Handled by |

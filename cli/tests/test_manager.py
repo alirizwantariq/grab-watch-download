@@ -1141,3 +1141,85 @@ def test_link_from_a_page_that_expired_before_the_download_started(tmp_path):
         assert not list((tmp_path / "o").glob("*.mgd*"))
     finally:
         site.stop()
+
+
+# ── failure kinds (the app retries connection problems by itself) ────────
+
+def test_error_kinds():
+    from mgd.engine import DownloadError
+    from mgd.net import HttpError
+    assert m._error_kind(HttpError(403)) == "link_expired"
+    assert m._error_kind(HttpError(503)) == "server"
+    assert m._error_kind(HttpError(429)) == "server"
+    assert m._error_kind(HttpError(400)) is None
+    assert m._error_kind(ConnectionResetError(54, "reset")) == "network"
+    assert m._error_kind(OSError(28, "No space left on device")) == "disk_full"
+    assert "disk is full" in m._error_message(OSError(28, "No space left on device"))
+    assert m._error_kind(DownloadError("range 0..9 failed after 8 attempts")) == "network"
+    assert m._error_kind(DownloadError("server unreachable after 8 probes: HTTP 502")) == "server"
+    assert m._error_kind(DownloadError("SHA-256 mismatch")) is None
+
+
+def test_dropped_connection_is_reported_as_a_network_problem_and_resumes(tmp_path):
+    """The connection dies part-way and stays dead: the engine gives up with
+    kind "network", keeps the part, and a later resume finishes the file."""
+    content = bytes(range(256)) * 8000                  # ~2 MB
+    state = {"down": False}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if state["down"]:
+                self.close_connection = True
+                return                                   # no answer at all
+            first, last = 0, len(content) - 1
+            rng = self.headers.get("Range", "")
+            if rng.startswith("bytes="):
+                a, _, b = rng[6:].partition("-")
+                first, last = int(a), (int(b) if b else len(content) - 1)
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {first}-{last}/{len(content)}")
+            else:
+                self.send_response(200)
+            self.send_header("Content-Length", str(last - first + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            for i in range(first, last + 1, 32 * 1024):
+                if state["down"]:
+                    self.close_connection = True
+                    return
+                try:
+                    self.wfile.write(content[i:min(i + 32 * 1024, last + 1)])
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                time.sleep(0.05)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/drop.bin"
+    try:
+        proc = subprocess.Popen([sys.executable, "bin/mgd", "grab", url, "-d", str(tmp_path / "o"),
+                                 "-c", "1", "--json-progress"], cwd=str(CLI_DIR),
+                                env=_env(tmp_path, MGD_BACKOFF_SCALE="0.01"),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        time.sleep(1.5)
+        state["down"] = True
+        stdout, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 1, stdout[-500:]
+        err = [e for e in _events(stdout) if e["type"] == "error"][-1]
+        assert err["kind"] == "network", err
+        item = _items(tmp_path)[0]
+        assert 0 < item["done"] < len(content) and item["state"] == "paused"
+        state["down"] = False
+        res = _mgd(tmp_path, ["resume", item["id"]], timeout=60)
+        assert res.returncode == 0, res.stdout[-400:] + res.stderr[-400:]
+        assert (tmp_path / "o" / "drop.bin").read_bytes() == content
+    finally:
+        srv.shutdown()
+        srv.server_close()

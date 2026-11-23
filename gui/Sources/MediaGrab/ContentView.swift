@@ -67,6 +67,8 @@ struct ContentView: View {
             HandoffSheet(probe: probe)
         case .diagnostics:
             DiagnosticsSheet()
+        case .updateLink(let job):
+            UpdateLinkSheet(job: job)
         case .extensionSetup:
             ExtensionSheet()
         }
@@ -446,9 +448,14 @@ struct ContentView: View {
 
     private func listRows(_ visible: [DownloadJob]) -> [ListRow] {
         var rows: [ListRow] = []
+        // a download waiting to retry by itself is still in progress
+        let waiting = { (j: DownloadJob) in
+            j.phase == .failed && j.connectionProblem
+                && (j.retryAt != nil || !store.networkAvailable)
+        }
         let sections: [(String, [DownloadJob])] = [
-            ("In Progress", visible.filter { $0.phase.isActive }),
-            ("Failed", visible.filter { $0.phase == .failed }),
+            ("In Progress", visible.filter { $0.phase.isActive || waiting($0) }),
+            ("Failed", visible.filter { $0.phase == .failed && !waiting($0) }),
             ("Completed", visible.filter { $0.phase == .done }),
         ]
         for (title, jobs) in sections where !jobs.isEmpty {

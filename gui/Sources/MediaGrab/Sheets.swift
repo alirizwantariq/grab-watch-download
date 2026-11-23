@@ -722,3 +722,89 @@ struct ExtensionSheet: View {
         }
     }
 }
+
+// MARK: - update an expired download link
+
+final class UpdateLinkModel: ObservableObject {
+    @Published var link: String
+
+    init() {
+        let clip = NSPasteboard.general.string(forType: .string) ?? ""
+        link = Naming.firstLink(in: clip) ?? ""
+    }
+}
+
+struct UpdateLinkSheet: View {
+    @ObservedObject var job: DownloadJob
+    @EnvironmentObject var store: JobStore
+    @EnvironmentObject var session: Session
+    @StateObject private var model = UpdateLinkModel()
+
+    private var link: String { model.link.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var valid: Bool {
+        guard let comps = URLComponents(string: link), let scheme = comps.scheme?.lowercased()
+        else { return false }
+        return (scheme == "http" || scheme == "https") && comps.host?.isEmpty == false
+    }
+
+    private var progressText: String {
+        guard job.total > 0 else { return "the part already downloaded" }
+        return "\(fmtBytes(job.done)) of \(fmtBytes(job.total)) (\(Int(max(0, job.percent)))%)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SheetHeader(symbol: "link.badge.plus", title: "Update the download link",
+                        subtitle: job.title)
+            Text("Video sites hand out links that stop working after a while. Open the page "
+                 + "in your browser, copy the video's link — or just the page's address — and "
+                 + "paste it here. MediaGrab checks it is the same file and continues from "
+                 + "\(progressText).")
+                .font(.callout).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                TextField("New link or page address", text: $model.link)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(start)
+                Button {
+                    if let text = NSPasteboard.general.string(forType: .string),
+                       let found = Naming.firstLink(in: text) {
+                        model.link = found
+                    }
+                } label: {
+                    Image(systemName: "doc.on.clipboard")
+                }
+                .help("Paste the link from the clipboard")
+                .accessibilityLabel("Paste link")
+            }
+            if let message = job.errorMessage, job.linkExpired {
+                Label(message, systemImage: "info.circle")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Text("A link to a different file is refused — nothing already downloaded is lost.")
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Button("Cancel") { session.sheet = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button {
+                    start()
+                } label: {
+                    Label("Continue", systemImage: "arrow.down.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!valid)
+            }
+        }
+        .padding(18)
+        .frame(width: 540)
+    }
+
+    private func start() {
+        guard valid else { return }
+        store.updateLink(job, to: link)
+        session.sheet = nil
+    }
+}

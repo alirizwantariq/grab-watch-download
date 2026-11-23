@@ -160,6 +160,10 @@ struct SettingsView: View {
             Section {
                 Toggle("Ask for the file name before each download", isOn: $store.askBeforeDownload)
                 Toggle("Notify when a download finishes", isOn: $store.notifyOnFinish)
+                Toggle("Keep the Mac awake while downloading", isOn: $store.keepAwake)
+                    .help("The display can still sleep; the Mac does not go to sleep until downloads are done")
+                Toggle("Retry by itself after connection problems", isOn: $store.autoRetry)
+                    .help("Downloads that fail because the connection dropped continue on their own: a few times over the next minutes, and as soon as the Mac is back online or wakes up")
             }
         }
         .formStyle(.grouped)

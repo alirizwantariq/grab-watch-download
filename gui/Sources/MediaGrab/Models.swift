@@ -24,6 +24,8 @@ final class DownloadJob: ObservableObject, Identifiable {
     @Published var showLog = false
     /// the reason shown on a failed row (last engine error)
     @Published var errorMessage: String?
+    /// what kind of failure: "link_expired" / "link_mismatch" offer Update Link
+    @Published var errorKind: String?
 
     /// the engine's stable id for this download (`mgd pause|resume|cancel
     /// <id>`); nil for yt-dlp-backed downloads, which have no state file
@@ -49,6 +51,28 @@ final class DownloadJob: ObservableObject, Identifiable {
     /// set when the user cancelled: once the engine has stopped, its partial
     /// data is deleted and the row removed
     var cancelRequested = false
+    /// a replacement link the user gave for an expired one; used by the
+    /// next launch (`mgd resume <id> --url <link>`)
+    var relinkURL: String?
+    /// automatic retry after a connection problem: when (nil = none planned)
+    @Published var retryAt: Date?
+    /// automatic retries made since the download last made it through
+    var autoRetries = 0
+
+    var connectionProblem: Bool { errorKind == "network" || errorKind == "server" }
+    /// what to start instead when a link sent for this download turns out
+    /// to be a different file
+    var fallbackRequest: DownloadRequest?
+
+    /// The engine still has this download's saved part, so a new link to the
+    /// same file can continue it.
+    var canUpdateLink: Bool {
+        guard engineID != nil, !isTorrent, phase == .paused || phase == .failed,
+              let out = outPath, !out.isEmpty else { return false }
+        return FileManager.default.fileExists(atPath: out + ".mgdstate")
+    }
+
+    var linkExpired: Bool { errorKind == "link_expired" || errorKind == "link_mismatch" }
     /// fallback path parsed from yt-dlp's "[download] Destination: …" output
     var candidatePath: String?
     private var lastTick = Date()
@@ -92,6 +116,7 @@ final class DownloadJob: ObservableObject, Identifiable {
             case "start":
                 phase = .running
                 errorMessage = nil
+                errorKind = nil
                 if let id = obj["id"] as? String, !id.isEmpty { engineID = id }
                 if let path = obj["out_path"] as? String, !path.isEmpty { outPath = path }
             case "done":
@@ -102,11 +127,15 @@ final class DownloadJob: ObservableObject, Identifiable {
                 done = total
                 finishedAt = Date()
                 errorMessage = nil
+                errorKind = nil
                 phase = .done
             case "error":
                 let message = obj["message"] as? String ?? "download failed"
                 errorMessage = message
+                errorKind = obj["kind"] as? String
                 appendLog("✗ \(message)")
+            case "note":
+                if let message = obj["message"] as? String { appendLog("• \(message)") }
             case "paused":
                 phase = .paused
             default:
@@ -339,6 +368,15 @@ enum Naming {
         return base.isEmpty ? name : base
     }
 
+    /// Two links to the same file on the same site that differ only in their
+    /// query (signed links: ?token=…, ?secure=…,expiry).
+    static func sameFileLink(_ a: String, _ b: String) -> Bool {
+        guard let x = URLComponents(string: a), let y = URLComponents(string: b),
+              let hx = x.host?.lowercased(), let hy = y.host?.lowercased(),
+              hx == hy, x.path == y.path, x.path.count > 1 else { return false }
+        return a != b
+    }
+
     static func isValid(_ name: String) -> Bool {
         let t = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return !t.isEmpty && !t.contains("/") && t != "." && t != ".."
@@ -389,6 +427,7 @@ struct HistoryEntry: Codable {
     /// engine id + target path of a download that can still be resumed
     var engineID: String?
     var outPath: String?
+    var errorKind: String?
 }
 
 extension HistoryEntry {

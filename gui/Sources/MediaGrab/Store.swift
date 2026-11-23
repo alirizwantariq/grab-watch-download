@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import Network
 import UserNotifications
 
 /// What the UI asks the store to download.
@@ -74,6 +75,22 @@ final class JobStore: ObservableObject {
     @Published var notifyOnFinish: Bool {
         didSet { Prefs.defaults.set(notifyOnFinish, forKey: "notifyOnFinish") }
     }
+    @Published var keepAwake: Bool {
+        didSet { Prefs.defaults.set(keepAwake, forKey: "keepAwake"); updateDockBadge() }
+    }
+    @Published var autoRetry: Bool {
+        didSet {
+            Prefs.defaults.set(autoRetry, forKey: "autoRetry")
+            if !autoRetry { for job in jobs { job.retryAt = nil } }
+        }
+    }
+    /// false while macOS reports no usable network connection
+    @Published var networkAvailable = true
+    /// the "keep the Mac awake" assertion, while held
+    private(set) var awakeActivity: NSObjectProtocol?
+    private let pathMonitor = NWPathMonitor()
+    /// automatic retry delays after a connection problem (seconds)
+    static let retryDelays: [Double] = [15, 30, 60, 120, 300]
 
     private var phaseWatchers = Set<AnyCancellable>()
     private var pollTimer: Timer?
@@ -85,10 +102,12 @@ final class JobStore: ObservableObject {
     private init() {
         let d = Prefs.defaults
         d.register(defaults: ["maxConcurrent": 3, "askBeforeDownload": true,
-                              "notifyOnFinish": true])
+                              "notifyOnFinish": true, "keepAwake": true, "autoRetry": true])
         maxConcurrent = d.integer(forKey: "maxConcurrent")
         askBeforeDownload = d.bool(forKey: "askBeforeDownload")
         notifyOnFinish = d.bool(forKey: "notifyOnFinish")
+        keepAwake = d.bool(forKey: "keepAwake")
+        autoRetry = d.bool(forKey: "autoRetry")
         loadHistory()
     }
 
@@ -100,7 +119,10 @@ final class JobStore: ObservableObject {
         for job in jobs {
             job.$phase.dropFirst().removeDuplicates()
                 .sink { [weak self] _ in
-                    DispatchQueue.main.async { self?.objectWillChange.send() }
+                    DispatchQueue.main.async {
+                        self?.objectWillChange.send()
+                        self?.updateDockBadge()
+                    }
                 }
                 .store(in: &phaseWatchers)
         }
@@ -113,9 +135,76 @@ final class JobStore: ObservableObject {
         loadEngineSettings()
         let timer = Timer(timeInterval: 2.5, repeats: true) { [weak self] _ in
             self?.refresh()
+            self?.retryDueDownloads()
         }
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let up = path.status == .satisfied
+            DispatchQueue.main.async { self?.networkChanged(up) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "mediagrab.network"))
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            // connections rarely survive sleep: give the network a moment,
+            // then pick up what was waiting
+            self?.retrySoon(after: 5)
+        }
+    }
+
+    // MARK: connection problems: retry by themselves
+
+    func networkChanged(_ up: Bool) {
+        let cameBack = up && !networkAvailable
+        networkAvailable = up
+        if cameBack {
+            retrySoon(after: 2)
+            flash("Back online — resuming downloads")
+        }
+    }
+
+    /// Bring every planned automatic retry forward.
+    func retrySoon(after seconds: Double) {
+        let at = Date().addingTimeInterval(seconds)
+        for job in jobs where job.retryAt != nil && job.phase == .failed {
+            job.retryAt = min(job.retryAt ?? at, at)
+        }
+    }
+
+    func retryDueDownloads() {
+        guard autoRetry, networkAvailable else { return }
+        let now = Date()
+        for job in jobs where job.phase == .failed {
+            guard let at = job.retryAt, at <= now else { continue }
+            job.retryAt = nil
+            job.appendLog("retrying automatically (attempt \(job.autoRetries))")
+            resume(job)
+        }
+    }
+
+    private func planRetry(_ job: DownloadJob) {
+        guard autoRetry, job.connectionProblem, canRestart(job),
+              job.autoRetries < Self.retryDelays.count else {
+            job.retryAt = nil
+            return
+        }
+        let delay = Self.retryDelays[job.autoRetries]
+        job.autoRetries += 1
+        job.retryAt = Date().addingTimeInterval(delay)
+    }
+
+    // MARK: keep the Mac awake while downloading
+
+    private func updateAwake() {
+        let busy = keepAwake && jobs.contains { $0.phase == .running || $0.phase == .queued }
+        if busy, awakeActivity == nil {
+            awakeActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .idleSystemSleepDisabled],
+                reason: "Downloading files")
+        } else if !busy, let activity = awakeActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            awakeActivity = nil
+        }
     }
 
     // MARK: derived state
@@ -176,12 +265,34 @@ final class JobStore: ObservableObject {
     func updateDockBadge() {
         let n = jobs.filter { $0.phase == .running || $0.phase == .queued }.count
         NSApp?.dockTile.badgeLabel = n > 0 ? String(n) : nil
+        updateAwake()
     }
 
     // MARK: starting
 
     @discardableResult
     func start(_ request: DownloadRequest) -> DownloadJob {
+        // the same file again (a paused download, or one whose link expired):
+        // continue the saved part instead of downloading it a second time
+        if !request.isTorrent,
+           let earlier = jobs.first(where: { $0.canUpdateLink && $0.process == nil
+                                             && ($0.url == request.url
+                                                 || Naming.sameFileLink($0.url, request.url)) }) {
+            if earlier.url == request.url {
+                resume(earlier)
+                flash("“\(earlier.title)” was already started — continuing it")
+            } else {
+                earlier.fallbackRequest = request
+                updateLink(earlier, to: request.url)
+                flash("Continuing “\(earlier.title)” through the new link")
+            }
+            return earlier
+        }
+        return enqueue(request)
+    }
+
+    @discardableResult
+    private func enqueue(_ request: DownloadRequest) -> DownloadJob {
         let job = DownloadJob(url: request.url, title: request.title, poster: request.poster)
         job.args = request.arguments
         job.isTorrent = request.isTorrent
@@ -215,7 +326,10 @@ final class JobStore: ObservableObject {
 
     private func launch(_ job: DownloadJob) {
         let args: [String]
-        if let id = job.engineID, hasEngineState(job) {
+        if let id = job.engineID, hasEngineState(job), let link = job.relinkURL {
+            args = ["resume", id, "--url", link, "--json-progress"]
+            job.appendLog("continuing through the new link…")
+        } else if let id = job.engineID, hasEngineState(job) {
             args = ["resume", id, "--json-progress"]
             job.appendLog("resuming…")
         } else if !job.args.isEmpty {
@@ -227,6 +341,7 @@ final class JobStore: ObservableObject {
             scheduleSave()
             return
         }
+        job.relinkURL = nil
         job.phase = .running
         job.stopRequested = false
         job.cancelRequested = false
@@ -264,12 +379,28 @@ final class JobStore: ObservableObject {
                 if job.errorMessage == nil { job.errorMessage = job.failureSummary }
             }
         }
+        if job.phase == .failed {
+            planRetry(job)
+        } else {
+            job.retryAt = nil
+            if job.phase == .done { job.autoRetries = 0 }
+        }
+        if job.phase == .failed, job.errorKind == "link_mismatch",
+           let fallback = job.fallbackRequest {
+            // the link sent for it was a different file: download that one
+            // as it was asked for; the saved part stays where it was
+            job.fallbackRequest = nil
+            enqueue(fallback)
+        }
+        if job.phase != .failed { job.fallbackRequest = nil }
         if job.phase == .done {
             if job.finishedAt == nil { job.finishedAt = Date() }
             job.adopted = false
             let name = job.finishedPath.map { ($0 as NSString).lastPathComponent } ?? job.title
             notify(job.isTorrent ? "Torrent complete" : "Download complete", name)
             flash("Finished: \(name)")
+        } else if job.phase == .failed, job.retryAt != nil {
+            flash("Connection problem with “\(job.title)” — it will retry by itself")
         } else if job.phase == .failed {
             notify("Download failed", job.title)
             flash("Failed: \(job.title)")
@@ -282,6 +413,7 @@ final class JobStore: ObservableObject {
     // MARK: pause / resume / cancel
 
     func pause(_ job: DownloadJob) {
+        job.retryAt = nil
         switch job.phase {
         case .queued:
             job.phase = .paused
@@ -310,7 +442,25 @@ final class JobStore: ObservableObject {
         }
         job.phase = .queued
         job.errorMessage = nil
+        job.retryAt = nil
         // move to the front of the queue order (jobs.last is launched first)
+        pump()
+        scheduleSave()
+    }
+
+    /// Continue a download whose link expired through a new link (the file
+    /// link itself, or the page it is on). The engine checks it is the same
+    /// file before touching the saved part.
+    func updateLink(_ job: DownloadJob, to link: String) {
+        guard job.canUpdateLink else {
+            flash("“\(job.title)” has no saved part to continue")
+            return
+        }
+        job.relinkURL = link
+        job.url = link
+        job.errorMessage = nil
+        job.errorKind = nil
+        job.phase = .queued
         pump()
         scheduleSave()
     }
@@ -332,6 +482,12 @@ final class JobStore: ObservableObject {
     }
 
     /// Stop a download and delete its partial data, then drop the row.
+    /// "Try Again" from the user: a fresh set of automatic retries too.
+    func retryNow(_ job: DownloadJob) {
+        job.autoRetries = 0
+        resume(job)
+    }
+
     func cancel(_ job: DownloadJob) {
         guard job.phase.isActive || job.phase == .failed else { return }
         job.cancelRequested = true
@@ -701,7 +857,8 @@ final class JobStore: ObservableObject {
                 error: job.errorMessage,
                 torrent: job.isTorrent ? true : nil,
                 engineID: job.phase == .failed ? job.engineID : nil,
-                outPath: job.outPath))
+                outPath: job.outPath,
+                errorKind: job.errorKind))
             if entries.count >= 300 { break }
         }
         guard let data = try? JSONEncoder().encode(entries) else { return }
@@ -732,6 +889,7 @@ final class JobStore: ObservableObject {
             job.finishedAt = e.finishedDate
             job.args = e.args ?? []
             job.errorMessage = e.error
+            job.errorKind = e.errorKind
             job.isTorrent = e.torrent ?? false
             job.engineID = e.engineID
             job.outPath = e.outPath

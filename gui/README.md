@@ -66,6 +66,17 @@ missing and the command that installs each.
   byte positions. Resume continues from them; a failed download keeps its
   partial data and offers *Try Again*. yt-dlp-backed downloads resume by
   re-running (yt-dlp continues its own partial files).
+- **Expired links.** The engine refreshes a dead signed link from the
+  video's page by itself. When it cannot, the row offers *Update Link…*:
+  paste a fresh link or the page's address and it continues from the saved
+  part after checking it is the same file. Sending the same video again from
+  the browser does the same automatically (one row, no second download).
+- **Connection drops and sleep.** While anything downloads, the Mac is kept
+  from idle sleep (the display may still sleep; Settings can turn this
+  off). A download that fails because the connection dropped (the engine
+  reports `"kind": "network"` or `"server"`) is retried by itself after 15 s,
+  30 s, 1, 2 and 5 minutes, straight away when the Mac is back online, and
+  a few seconds after it wakes. The row shows the countdown.
 - **Downloads started elsewhere** (a terminal, the extension's headless
   mode, a previous app session) are picked up through `mgd list` every few
   seconds and can be paused, resumed and cancelled like the others.

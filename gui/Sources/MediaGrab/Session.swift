@@ -201,6 +201,7 @@ enum ActiveSheet: Identifiable {
     case torrent(TorrentProbe)
     case handoff(HandoffProbe)
     case diagnostics
+    case updateLink(DownloadJob)
     case extensionSetup
 
     var id: String {
@@ -211,6 +212,7 @@ enum ActiveSheet: Identifiable {
         case .torrent(let p): return "torrent-\(p.id)"
         case .handoff(let p): return "handoff-\(p.id)"
         case .diagnostics: return "diagnostics"
+        case .updateLink(let job): return "updatelink-\(job.id)"
         case .extensionSetup: return "extension"
         }
     }

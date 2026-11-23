@@ -177,6 +177,9 @@ struct ActiveJobRow: View {
         .contextMenu {
             if job.phase == .paused {
                 Button("Resume") { store.resume(job) }
+                if job.canUpdateLink {
+                    Button("Update Link…") { session.sheet = .updateLink(job) }
+                }
             } else {
                 Button("Pause") { store.pause(job) }
             }
@@ -308,6 +311,9 @@ struct FinishedJobRow: View {
     @EnvironmentObject var session: Session
 
     private var failed: Bool { job.phase == .failed }
+    private var waitingToRetry: Bool {
+        failed && job.connectionProblem && (job.retryAt != nil || !store.networkAvailable)
+    }
 
     private var subtitle: String {
         if failed { return job.failureSummary }
@@ -327,17 +333,22 @@ struct FinishedJobRow: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .center, spacing: 10) {
                     SelectDot(on: isSelected) { store.toggleSelection(job) }
-                    Image(systemName: failed ? "exclamationmark.triangle.fill" : job.symbol)
+                    Image(systemName: waitingToRetry ? "arrow.triangle.2.circlepath"
+                          : failed ? "exclamationmark.triangle.fill" : job.symbol)
                         .font(.system(size: 20))
-                        .foregroundColor(failed ? .red : .accentColor)
+                        .foregroundColor(waitingToRetry ? .orange : failed ? .red : .accentColor)
                         .frame(width: 28)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(job.title).lineLimit(1).truncationMode(.middle)
                             .font(.body.weight(.medium))
-                        Text(subtitle)
-                            .font(.caption)
-                            .foregroundColor(failed ? .red.opacity(0.85) : .secondary)
-                            .lineLimit(1).truncationMode(.middle)
+                        if failed && job.connectionProblem && (job.retryAt != nil || !store.networkAvailable) {
+                            RetryLine(job: job, online: store.networkAvailable)
+                        } else {
+                            Text(subtitle)
+                                .font(.caption)
+                                .foregroundColor(failed ? .red.opacity(0.85) : .secondary)
+                                .lineLimit(1).truncationMode(.middle)
+                        }
                     }
                     Spacer(minLength: 6)
                     buttons
@@ -353,7 +364,10 @@ struct FinishedJobRow: View {
         .contextMenu {
             if failed {
                 if store.canRestart(job) {
-                    Button("Try Again") { store.resume(job) }
+                    Button("Try Again") { store.retryNow(job) }
+                }
+                if job.canUpdateLink {
+                    Button("Update Link…") { session.sheet = .updateLink(job) }
                 }
             } else {
                 Button("Open") { store.open(job) }
@@ -371,11 +385,20 @@ struct FinishedJobRow: View {
     private var buttons: some View {
         HStack(spacing: 4) {
             if failed {
-                if store.canRestart(job) {
+                if job.linkExpired && job.canUpdateLink {
                     Button {
-                        store.resume(job)
+                        session.sheet = .updateLink(job)
                     } label: {
-                        Label("Try Again", systemImage: "arrow.clockwise")
+                        Label("Update Link…", systemImage: "link.badge.plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("Paste a fresh link to this video (or its page): MediaGrab checks it is the same file and continues")
+                } else if store.canRestart(job) {
+                    Button {
+                        store.retryNow(job)
+                    } label: {
+                        Label(job.retryAt != nil ? "Try Now" : "Try Again", systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
@@ -431,5 +454,31 @@ struct FinishedJobRow: View {
             .help("More actions")
             .accessibilityLabel("More actions")
         }
+    }
+}
+
+/// "Connection problem — retrying in 0:25" with a live countdown.
+struct RetryLine: View {
+    @ObservedObject var job: DownloadJob
+    let online: Bool
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Label(text(at: context.date), systemImage: online ? "arrow.triangle.2.circlepath" : "wifi.slash")
+                .font(.caption)
+                .foregroundColor(.orange)
+                .lineLimit(1)
+        }
+    }
+
+    private func text(at now: Date) -> String {
+        let attempt = "attempt \(job.autoRetries) of \(JobStore.retryDelays.count)"
+        guard online else {
+            return "No internet connection — continues when it is back"
+        }
+        guard let at = job.retryAt else { return "Connection problem" }
+        let left = max(0, Int(at.timeIntervalSince(now).rounded()))
+        return left == 0 ? "Connection problem — retrying now (\(attempt))"
+            : "Connection problem — retrying in \(fmtDuration(Double(left))) (\(attempt))"
     }
 }

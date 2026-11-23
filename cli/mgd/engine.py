@@ -49,6 +49,15 @@ MAX_CONNS = 16                       # aria2's --max-connection-per-server cap
 STATE_SAVE_INTERVAL = 0.5
 RETRY_BACKOFF_BASE = 0.5
 RETRY_BACKOFF_CAP = 30.0
+
+
+def _backoff_scale() -> float:
+    """MGD_BACKOFF_SCALE shrinks retry waits (automated tests simulate a
+    dropped connection without waiting a minute and a half)."""
+    try:
+        return max(0.0, float(os.environ.get("MGD_BACKOFF_SCALE", "1")))
+    except ValueError:
+        return 1.0
 DEFAULT_HEADERS = {"Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
 RETRYABLE_STATUS = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
@@ -764,7 +773,8 @@ class Downloader:
 
     def _backoff_sleep(self, attempt: int) -> None:
         delay = min(RETRY_BACKOFF_CAP, RETRY_BACKOFF_BASE * (2 ** (attempt - 1)))
-        deadline = time.monotonic() + delay + random.uniform(0, 0.2)
+        scale = _backoff_scale()
+        deadline = time.monotonic() + (delay + random.uniform(0, 0.2)) * scale
         while time.monotonic() < deadline:
             self.stopper.check()
             time.sleep(min(0.25, max(0.01, deadline - time.monotonic())))

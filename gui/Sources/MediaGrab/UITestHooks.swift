@@ -153,6 +153,15 @@ enum UITestHooks {
                 probe.items.first { $0.url.contains(arg(1)) }?.name = arg(2)
             }
         case "sheet": openSheet(arg(1))
+        case "netdown": store.networkChanged(false)
+        case "netup": store.networkChanged(true)
+        case "fetch":
+            // visit a url (e.g. a page that hands out a new signed link)
+            if let url = URL(string: arg(1)) { _ = try? await URLSession.shared.data(from: url) }
+        case "relink":
+            if let j = job(arg(1)) { store.updateLink(j, to: arg(2)) }
+        case "updatelinksheet":
+            if let j = job(arg(1)) { session.sheet = .updateLink(j) }
         case "settingsview":
             // the Settings scene's content, hosted in a plain off-screen window
             let host = NSHostingController(rootView: SettingsView().environmentObject(store))
@@ -198,6 +207,7 @@ enum UITestHooks {
         case .torrent: return "torrent"
         case .handoff: return "handoff"
         case .diagnostics: return "diagnostics"
+        case .updateLink: return "updatelink"
         case .extensionSetup: return "extension"
         }
     }
@@ -341,7 +351,10 @@ enum UITestHooks {
              "engineID": j.engineID ?? "", "outPath": j.outPath ?? "",
              "finishedPath": j.finishedPath ?? "", "finishedSize": j.finishedSize,
              "error": j.errorMessage ?? "", "adopted": j.adopted,
-             "owned": j.process != nil, "args": j.args]
+             "owned": j.process != nil, "args": j.args,
+             "errorKind": j.errorKind ?? "",
+             "retryIn": j.retryAt.map { $0.timeIntervalSinceNow } ?? -1,
+             "autoRetries": j.autoRetries]
         }
         let state: [String: Any] = [
             "jobs": jobs,
@@ -351,6 +364,8 @@ enum UITestHooks {
             "bundledExtension": Engine.bundledExtension?.path ?? "",
             "handoffItems": handoffItems(),
             "status": store.status,
+            "keepingAwake": store.awakeActivity != nil,
+            "networkAvailable": store.networkAvailable,
             "engineReachable": store.engineReachable,
             "downloadRoot": store.downloadRoot,
             "launcher": Engine.launcher,
