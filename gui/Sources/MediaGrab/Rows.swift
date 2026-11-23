@@ -84,6 +84,7 @@ struct ProgressBar: View {
 func copyToClipboard(_ text: String) {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(text, forType: .string)
+    Session.shared.clipboard.noteOwnCopy()
 }
 
 // MARK: - one download: the layout follows its state

@@ -13,6 +13,9 @@ struct ContentView: View {
             Divider()
             VStack(spacing: 0) {
                 addBar
+                if let offer = session.clipboardOffer {
+                    clipboardBanner(offer)
+                }
                 if let warning = engineWarning {
                     warningBanner(warning)
                 }
@@ -117,6 +120,8 @@ struct ContentView: View {
                 Button("Open Downloads Folder") {
                     NSWorkspace.shared.open(URL(fileURLWithPath: store.downloadRoot))
                 }
+                Divider()
+                Toggle("Watch Clipboard for Links", isOn: $store.watchClipboard)
                 Divider()
                 Button("Browser Extension…") { session.sheet = .extensionSetup }
                 Button("Diagnostics…") { session.sheet = .diagnostics }
@@ -305,6 +310,33 @@ struct ContentView: View {
                     "exclamationmark.triangle.fill")
         }
         return nil
+    }
+
+    private func clipboardBanner(_ offer: ClipboardOffer) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "doc.on.clipboard").foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(offer.sourceApp.map { "Link copied in \($0)" } ?? "Link copied")
+                    .font(.callout.weight(.medium))
+                Text(offer.link ?? "Download it with MediaGrab?")
+                    .font(.caption).foregroundColor(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Spacer()
+            Button("Download") { session.acceptClipboardOffer() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            Button {
+                session.clipboardOffer = nil
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(.horizontal, 14).padding(.vertical, 7)
+        .background(Color.accentColor.opacity(0.10))
     }
 
     private func warningBanner(_ warning: (text: String, symbol: String)) -> some View {

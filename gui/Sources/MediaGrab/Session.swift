@@ -265,6 +265,17 @@ final class Session: ObservableObject {
     @Published var dropActive = false
     @Published var sheet: ActiveSheet?
     @Published var confirmation: Confirmation?
+    /// a link copied in another app, offered in a banner
+    @Published var clipboardOffer: ClipboardOffer?
+
+    lazy var clipboard: ClipboardWatcher = {
+        #if DEBUG
+        if UITestHooks.active {        // never touch the user's real clipboard
+            return ClipboardWatcher(pasteboard: NSPasteboard(name: .init("mediagrab.uitest.clipboard")))
+        }
+        #endif
+        return ClipboardWatcher()
+    }()
 
     private var store: JobStore { JobStore.shared }
     private init() {}
@@ -307,6 +318,44 @@ final class Session: ObservableObject {
         } else {
             probe(link, title: title, cookies: cookies)
         }
+    }
+
+    // MARK: clipboard watch
+
+    func updateClipboardWatch() {
+        if store.watchClipboard {
+            clipboard.onOffer = { [weak self] offer in self?.offer(offer) }
+            clipboard.start()
+        } else {
+            clipboard.stop()
+            clipboardOffer = nil
+        }
+    }
+
+    private func offer(_ offer: ClipboardOffer) {
+        if store.autoDownloadClipboard, let link = offer.link, !probing {
+            submit(link)
+            store.flash("Downloading the copied link")
+            return
+        }
+        clipboardOffer = offer
+        NSApp.requestUserAttention(.informationalRequest)
+    }
+
+    func acceptClipboardOffer() {
+        guard let offer = clipboardOffer else { return }
+        clipboardOffer = nil
+        if let link = offer.link {
+            submit(link)
+            return
+        }
+        // reading now, at the user's request (macOS may ask once)
+        guard clipboard.pasteboard.changeCount == offer.changeCount,
+              let text = clipboard.readText(), Naming.firstLink(in: text) != nil else {
+            store.flash("The copied link could not be read (macOS did not allow it, or something else was copied since)")
+            return
+        }
+        submit(text)
     }
 
     func pasteAndGrab() {

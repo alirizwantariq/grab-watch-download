@@ -457,6 +457,26 @@ def flow_many_links(run: Run, base: str):
                                           "video/four.mp4", "video/five.mp4", "video/six.mp4"]), run.files()
 
 
+def flow_clipboard_watch(run: Run, base: str):
+    """Copied links are offered (media yes, an article no), accepted, or
+    downloaded straight away; nothing happens with the watch off. Uses a
+    private test clipboard, never the real one."""
+    run.play([["ask", "off"], ["clipwatch", "on"], ["wait", 1.5],
+              ["clipcopy", "Worth a read: https://news.example.com/2026/article"], ["wait", 1.8],
+              ["dump", "plain"],
+              ["clipcopy", f"{base}/fast/copied.mp4"], ["wait", 1.8], ["dump", "offer"],
+              ["snap", "offer"], ["clipaccept"], ["waitphase", "copied", "done", 30],
+              ["clipauto", "on"], ["clipcopy", f"{base}/fast/auto_copied.mp4"],
+              ["waitphase", "auto_copied", "done", 30],
+              ["clipwatch", "off"], ["clipcopy", f"{base}/fast/ignored.mp4"], ["wait", 2],
+              ["dump", "off"], ["quit"]])
+    assert run.dump("plain")["clipboardOffer"] == "", "an article link is not offered"
+    assert run.dump("offer")["clipboardOffer"] == f"{base}/fast/copied.mp4"
+    off = run.dump("off")
+    assert off["clipboardOffer"] == "" and "ignored.mp4" not in {j["title"] for j in off["jobs"]}
+    assert sorted(run.files()) == ["video/auto_copied.mp4", "video/copied.mp4"], run.files()
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -535,6 +555,7 @@ def flow_snapshots(run: Run, base: str):
 
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
          flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop, flow_many_links,
+         flow_clipboard_watch,
          flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 

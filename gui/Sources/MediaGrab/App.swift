@@ -63,6 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #if DEBUG
         if UITestHooks.active {          // scripted run: no prompts, no focus
             JobStore.shared.activate()
+            Session.shared.updateClipboardWatch()
             UITestHooks.run()
             return
         }
@@ -73,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
         }
         JobStore.shared.activate()
+        Session.shared.updateClipboardWatch()
         BrowserLink.repairIfMoved()
         BrowserLink.refreshExportedExtension()
     }
@@ -164,6 +166,17 @@ struct SettingsView: View {
                 Toggle("Notify when a download finishes", isOn: $store.notifyOnFinish)
                 Toggle("Keep the Mac awake while downloading", isOn: $store.keepAwake)
                     .help("The display can still sleep; the Mac does not go to sleep until downloads are done")
+                Toggle("Watch the clipboard for links", isOn: $store.watchClipboard)
+                    .help("When you copy a link in another app, MediaGrab offers to download it")
+                if store.watchClipboard {
+                    Toggle("Download copied links without asking", isOn: $store.autoDownloadClipboard)
+                        .padding(.leading, 16)
+                    Text("macOS asks once before MediaGrab may read what other apps copy. To skip "
+                         + "the question, allow MediaGrab in System Settings › Privacy & Security › "
+                         + "Paste from Other Apps.")
+                        .font(.caption).foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Toggle("Retry by itself after connection problems", isOn: $store.autoRetry)
                     .help("Downloads that fail because the connection dropped continue on their own: a few times over the next minutes, and as soon as the Mac is back online or wakes up")
             }

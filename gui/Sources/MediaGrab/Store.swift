@@ -84,6 +84,15 @@ final class JobStore: ObservableObject {
             if !autoRetry { for job in jobs { job.retryAt = nil } }
         }
     }
+    @Published var watchClipboard: Bool {
+        didSet {
+            Prefs.defaults.set(watchClipboard, forKey: "watchClipboard")
+            Session.shared.updateClipboardWatch()
+        }
+    }
+    @Published var autoDownloadClipboard: Bool {
+        didSet { Prefs.defaults.set(autoDownloadClipboard, forKey: "autoDownloadClipboard") }
+    }
     /// false while macOS reports no usable network connection
     @Published var networkAvailable = true
     /// the "keep the Mac awake" assertion, while held
@@ -102,12 +111,15 @@ final class JobStore: ObservableObject {
     private init() {
         let d = Prefs.defaults
         d.register(defaults: ["maxConcurrent": 3, "askBeforeDownload": true,
-                              "notifyOnFinish": true, "keepAwake": true, "autoRetry": true])
+                              "notifyOnFinish": true, "keepAwake": true, "autoRetry": true,
+                              "watchClipboard": false, "autoDownloadClipboard": false])
         maxConcurrent = d.integer(forKey: "maxConcurrent")
         askBeforeDownload = d.bool(forKey: "askBeforeDownload")
         notifyOnFinish = d.bool(forKey: "notifyOnFinish")
         keepAwake = d.bool(forKey: "keepAwake")
         autoRetry = d.bool(forKey: "autoRetry")
+        watchClipboard = d.bool(forKey: "watchClipboard")
+        autoDownloadClipboard = d.bool(forKey: "autoDownloadClipboard")
         loadHistory()
     }
 

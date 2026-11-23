@@ -66,6 +66,13 @@ missing and the command that installs each.
   and surrounding words are ignored), drop a `.txt` list, or use File ▸
   Import Links from File… (⇧⌘I): one sheet lists them all; file links keep
   their file name, pages are named after their video unless a name is typed.
+- **Clipboard watch** (opt-in: ⋯ menu or Settings). A video, file,
+  platform or magnet link copied in another app is offered in a banner
+  (the Dock icon bounces once), or downloaded straight away if chosen. On
+  macOS 15.4+ the app only checks *that* a link was copied and reads it
+  when Download is clicked, so macOS asks at most once; allowing MediaGrab
+  under Privacy & Security › Paste from Other Apps lets it show the link
+  and skip non-media links.
 - **Pause / resume / retry.** Pause signals the engine, which saves exact
   byte positions. Resume continues from them; a failed download keeps its
   partial data and offers *Try Again*. yt-dlp-backed downloads resume by

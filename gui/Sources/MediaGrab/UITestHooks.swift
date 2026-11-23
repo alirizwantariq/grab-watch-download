@@ -153,6 +153,13 @@ enum UITestHooks {
                 probe.items.first { $0.url.contains(arg(1)) }?.name = arg(2)
             }
         case "sheet": openSheet(arg(1))
+        case "clipwatch": store.watchClipboard = arg(1) == "on"
+        case "clipauto": store.autoDownloadClipboard = arg(1) == "on"
+        case "clipcopy":
+            let board = session.clipboard.pasteboard
+            board.clearContents()
+            board.setString(arg(1), forType: .string)
+        case "clipaccept": session.acceptClipboardOffer()
         case "importfile": session.importLinks(from: URL(fileURLWithPath: arg(1)))
         case "netdown": store.networkChanged(false)
         case "netup": store.networkChanged(true)
@@ -366,6 +373,7 @@ enum UITestHooks {
             "handoffItems": handoffItems(),
             "status": store.status,
             "keepingAwake": store.awakeActivity != nil,
+            "clipboardOffer": Session.shared.clipboardOffer?.link ?? (Session.shared.clipboardOffer == nil ? "" : "(unread)"),
             "networkAvailable": store.networkAvailable,
             "engineReachable": store.engineReachable,
             "downloadRoot": store.downloadRoot,
