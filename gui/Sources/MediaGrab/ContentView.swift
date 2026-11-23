@@ -18,6 +18,9 @@ struct ContentView: View {
                 }
                 if let warning = engineWarning {
                     warningBanner(warning)
+                } else if let report = store.report, report.ytdlpUpdateAvailable,
+                          !store.ytdlpBannerDismissed {
+                    ytdlpBanner(report)
                 }
                 Divider()
                 if store.selected.isEmpty {
@@ -334,6 +337,42 @@ struct ContentView: View {
             .buttonStyle(.borderless)
             .help("Dismiss")
             .accessibilityLabel("Dismiss")
+        }
+        .padding(.horizontal, 14).padding(.vertical, 7)
+        .background(Color.accentColor.opacity(0.10))
+    }
+
+    private func ytdlpBanner(_ report: EngineReport) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.down.app").foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("A newer yt-dlp is available"
+                     + (report.ytdlpLatest.map { " (\($0))" } ?? ""))
+                    .font(.callout.weight(.medium))
+                Text("You have \(report.ytdlpVersion ?? "an older one"). Video sites change often — "
+                     + "updating keeps YouTube & co. downloading.")
+                    .font(.caption).foregroundColor(.secondary).lineLimit(1)
+            }
+            Spacer()
+            if store.updatingTool {
+                ProgressView().controlSize(.small)
+                Text("Updating…").font(.caption).foregroundColor(.secondary)
+            } else {
+                Button("Update") { Task { await store.updateYtdlp() } }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help(report.ytdlpInstall == "brew" ? "Runs: brew upgrade yt-dlp"
+                          : report.ytdlpInstall == "pip" ? "Runs: pip install --upgrade yt-dlp"
+                          : "Runs: yt-dlp -U")
+                Button {
+                    store.ytdlpBannerDismissed = true
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Not now")
+                .accessibilityLabel("Dismiss")
+            }
         }
         .padding(.horizontal, 14).padding(.vertical, 7)
         .background(Color.accentColor.opacity(0.10))

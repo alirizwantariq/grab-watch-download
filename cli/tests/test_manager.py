@@ -1223,3 +1223,78 @@ def test_dropped_connection_is_reported_as_a_network_problem_and_resumes(tmp_pat
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+# ── keeping yt-dlp current ───────────────────────────────────────────────
+
+def _fake_tool_tree(tmp_path, kind: str, version: str = "2026.01.05"):
+    """A fake yt-dlp installed the given way (+ fake brew / python), whose
+    version lives in a file the fake updater rewrites."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    vfile = tmp_path / "ytdlp-version"
+    vfile.write_text(version)
+    log = tmp_path / "updater-calls.txt"
+    newer = "2026.11.20"
+
+    def exe(path: pathlib.Path, body: str):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        path.chmod(0o755)
+
+    if kind == "brew":
+        real = tmp_path / "Cellar" / "yt-dlp" / version / "bin" / "yt-dlp"
+        exe(real, f"#!/bin/sh\ncat {vfile}\n")
+        (bindir / "yt-dlp").symlink_to(real)
+        exe(bindir / "brew", f"#!/bin/sh\necho \"$@\" >> {log}\nprintf {newer} > {vfile}\n")
+    elif kind == "pip":
+        # like a pip install: a console script run by `env python3`
+        py = tmp_path / "py" / "python3"
+        exe(py, f"#!/bin/sh\nif [ \"$1\" = \"-m\" ]; then echo \"$@\" >> {log}; "
+                f"printf {newer} > {vfile}; exit 0; fi\ncat {vfile}\n")
+        exe(bindir / "yt-dlp", "#!/usr/bin/env python3\nfrom yt_dlp import main\nmain()\n")
+        return {"PATH": f"{py.parent}{os.pathsep}{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}, log
+    else:
+        exe(bindir / "yt-dlp", f"#!/bin/sh\nif [ \"$1\" = \"-U\" ]; then echo -U >> {log}; "
+                               f"printf {newer} > {vfile}; exit 0; fi\ncat {vfile}\n")
+    return {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}, log
+
+
+def test_ytdlp_version_age_and_ordering():
+    import datetime
+    today = datetime.date.today()
+    assert m._version_age_days(today.strftime("%Y.%m.%d")) == 0
+    ten = today - datetime.timedelta(days=10)
+    assert m._version_age_days(f"{ten.year}.{ten.month:02d}.{ten.day:02d}.1") == 10
+    assert m._version_age_days("nightly") is None
+    assert m._version_tuple("2026.11.20") > m._version_tuple("2026.10.21.232718")
+    assert m._version_tuple("2026.11.3") > m._version_tuple("2026.10.31")
+
+
+def test_update_ytdlp_the_way_it_was_installed(tmp_path):
+    for kind, expected in (("brew", "upgrade yt-dlp"),
+                           ("pip", "-m pip install --upgrade --disable-pip-version-check yt-dlp"),
+                           ("binary", "-U")):
+        box = tmp_path / kind
+        env, log = _fake_tool_tree(box, kind)
+        doc = json.loads(_mgd(box, ["doctor", "--json"], **env).stdout)
+        assert doc["ytdlp"]["install"] == kind and doc["ytdlp"]["version"] == "2026.01.05", doc
+        out = _mgd(box, ["update-tool", "yt-dlp", "--json"], **env)
+        result = json.loads(out.stdout)
+        assert result == {"ok": True, "method": kind, "before": "2026.01.05", "after": "2026.11.20",
+                          "message": "yt-dlp updated: 2026.01.05 → 2026.11.20"}, (kind, result)
+        assert log.read_text().strip() == expected, (kind, log.read_text())
+
+
+def test_doctor_checks_for_a_newer_ytdlp(tmp_path):
+    env, _ = _fake_tool_tree(tmp_path, "brew")
+    page = _Page('{"tag_name": "2026.11.20", "name": "yt-dlp 2026.11.20"}')
+    try:
+        doc = json.loads(_mgd(tmp_path, ["doctor", "--json", "--check-updates"],
+                              MGD_YTDLP_LATEST_URL=page.url, **env).stdout)
+        assert doc["ytdlp"]["latest"] == "2026.11.20" and doc["ytdlp"]["update_available"] is True
+        assert doc["ytdlp"]["age_days"] > 200
+        quiet = json.loads(_mgd(tmp_path, ["doctor", "--json"], **env).stdout)
+        assert "latest" not in quiet["ytdlp"], "no network check unless asked"
+    finally:
+        page.stop()

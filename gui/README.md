@@ -73,6 +73,10 @@ missing and the command that installs each.
   when Download is clicked, so macOS asks at most once; allowing MediaGrab
   under Privacy & Security › Paste from Other Apps lets it show the link
   and skip non-media links.
+- **yt-dlp stays current.** At launch the app asks GitHub for the newest
+  yt-dlp release; when yours is older, a banner offers to update it the way
+  it was installed (Homebrew, pip or yt-dlp's own updater). Diagnostics
+  shows the version, its age and an Update button.
 - **Pause / resume / retry.** Pause signals the engine, which saves exact
   byte positions. Resume continues from them; a failed download keeps its
   partial data and offers *Try Again*. yt-dlp-backed downloads resume by

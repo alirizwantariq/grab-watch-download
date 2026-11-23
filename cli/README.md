@@ -63,6 +63,9 @@ mgd pause d3fa9c01b2e              # …or by the stable id shown next to it
 mgd grab "https://site/video.m3u8" # HLS/DASH streams: assembled with yt-dlp
 mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)
 mgd doctor                         # engines + config readiness
+mgd doctor --json --check-updates  # + yt-dlp version, age, install type, newest release
+mgd update-tool yt-dlp             # update it the way it was installed
+                                   # (brew upgrade / pip install -U / yt-dlp -U)
 mgd grab-page <url> [--json]       # just list media links found on a page
 mgd set-default video ~/Movies     # per-category default directory
 mgd set-default root ~/Downloads   # default root (categories become subdirs)

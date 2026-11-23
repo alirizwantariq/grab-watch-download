@@ -38,7 +38,8 @@ def blob(name: str, size: int) -> bytes:
     return (seed * (size // len(seed) + 1))[:size]
 
 
-FLAKY = {"down": False}       # /flaky/… drops every connection while True
+FLAKY = {"down": False}
+YTDLP_LATEST = {"tag": "2000.01.01"}    # what the test site says the newest yt-dlp is       # /flaky/… drops every connection while True
 EXP_TOKENS: dict[str, int] = {}
 EXP_LOCK = threading.Lock()
 
@@ -79,6 +80,14 @@ class Site(http.server.BaseHTTPRequestHandler):
             vids = "".join(f'<video><source src="/fast/album_{i}_720p.mp4"></video>'
                            for i in range(1, 5))
             return self._html(f"<html><head><title>Album</title></head><body>{vids}</body></html>")
+        if path == "/ytdlp-latest":
+            body = json.dumps({"tag_name": YTDLP_LATEST["tag"]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path.startswith("/flaky-control/"):
             FLAKY["down"] = path.endswith("/down")
             return self._html("ok")
@@ -477,6 +486,58 @@ def flow_clipboard_watch(run: Run, base: str):
     assert sorted(run.files()) == ["video/auto_copied.mp4", "video/copied.mp4"], run.files()
 
 
+def flow_ytdlp_update(run: Run, base: str):
+    """An outdated yt-dlp (fake Homebrew install) is noticed at launch, shown
+    in a banner and Diagnostics, and updated with one click."""
+    bindir, cellar = run.box / "fakebin", run.box / "Cellar" / "yt-dlp" / "2026.01.05" / "bin"
+    bindir.mkdir(parents=True)
+    cellar.mkdir(parents=True)
+    vfile, log = run.box / "ytdlp-version", run.box / "brew-calls.txt"
+    vfile.write_text("2026.01.05")
+    (cellar / "yt-dlp").write_text(f"#!/bin/sh\ncat '{vfile}'\n")
+    (bindir / "brew").write_text(f"#!/bin/sh\necho \"$@\" >> '{log}'\nsleep 1\nprintf 2026.11.20 > '{vfile}'\n")
+    for f in (cellar / "yt-dlp", bindir / "brew"):
+        f.chmod(0o755)
+    (bindir / "yt-dlp").symlink_to(cellar / "yt-dlp")
+    run.env["MEDIAGRAB_EXTRA_PATH"] = str(bindir)
+    YTDLP_LATEST["tag"] = "2026.11.20"
+    try:
+        run.play([["wait", 4], ["dump", "before"], ["snap", "banner"],
+                  ["sheet", "diagnostics"], ["wait", 1], ["snap", "diag"], ["closesheet"], ["wait", 0.5],
+                  ["updateytdlp"], ["wait", 0.5], ["dump", "after"], ["snap", "after"], ["quit"]])
+    finally:
+        YTDLP_LATEST["tag"] = "2000.01.01"
+    before, after = run.dump("before"), run.dump("after")
+    assert before["ytdlpVersion"] == "2026.01.05" and before["ytdlpUpdateAvailable"] is True, before
+    assert log.read_text().strip() == "upgrade yt-dlp"
+    assert after["ytdlpVersion"] == "2026.11.20" and after["ytdlpUpdateAvailable"] is False, after
+    assert "2026.01.05 → 2026.11.20" in after["status"], after["status"]
+
+
+def flow_missed_end(run: Run, base: str):
+    """The engine finishes the file but its last lines never reach the app
+    and the process lingers (seen rarely in the wild): the app notices the
+    finished file by itself and marks the download done."""
+    wrapper = run.box / "mgd-wrapper"
+    wrapper.write_text(f"""#!/bin/sh
+if [ "$1" = grab ]; then
+  # let the "start" line through, swallow the rest, then linger
+  "{sys.executable}" "{MGD}" "$@" 2>&1 | (head -n 1; cat > /dev/null)
+  sleep 25
+  exit 0
+fi
+exec "{sys.executable}" "{MGD}" "$@"
+""")
+    wrapper.chmod(0o755)
+    run.env["MEDIAGRAB_MGD"] = str(wrapper)
+    run.play([["ask", "off"], ["submit", f"{base}/fast/heal.mp4"],
+              ["waitphase", "heal", "done", 30], ["wait", 0.5], ["dump", "done"], ["quit"]])
+    job = run.jobs("done")["heal.mp4"]
+    assert job["phase"] == "done" and job["finishedPath"].endswith("heal.mp4"), job
+    assert pathlib.Path(job["finishedPath"]).read_bytes() == blob("heal.mp4", FAST_SIZE)
+    assert "self-heal" in (run.out / "uitest.log").read_text()
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -555,7 +616,7 @@ def flow_snapshots(run: Run, base: str):
 
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
          flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop, flow_many_links,
-         flow_clipboard_watch,
+         flow_clipboard_watch, flow_ytdlp_update, flow_missed_end,
          flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 
@@ -594,7 +655,10 @@ def main() -> int:
             box.mkdir()
             t0 = time.monotonic()
             try:
-                flow(Run(app, box), base)
+                run = Run(app, box)
+                # the yt-dlp update check asks the test site, never GitHub
+                run.env["MGD_YTDLP_LATEST_URL"] = f"{base}/ytdlp-latest"
+                flow(run, base)
                 passed += 1
                 print(f"PASS {name}  ({time.monotonic() - t0:.0f}s)", flush=True)
             except Exception as err:  # noqa: BLE001

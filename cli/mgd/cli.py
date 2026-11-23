@@ -133,6 +133,13 @@ def build_parser() -> argparse.ArgumentParser:
     dr = sub.add_parser("doctor", help="show engines, config and readiness")
     dr.add_argument("--json", action="store_true", dest="as_json",
                     help="machine-readable readiness report (used by the GUI)")
+    dr.add_argument("--check-updates", action="store_true", dest="check_updates",
+                    help="also ask GitHub for the newest yt-dlp release")
+    ut = sub.add_parser("update-tool", aliases=["update"],
+                        help="update a helper tool the way it was installed "
+                             "(yt-dlp: Homebrew, pip or its own updater)")
+    ut.add_argument("tool", choices=["yt-dlp"])
+    ut.add_argument("--json", action="store_true", dest="as_json")
     ql = sub.add_parser("qualities", aliases=["formats"],
                         help="list downloadable qualities/resolutions for a "
                              "URL (JSON; used by the GUI and scripts)")
@@ -2071,10 +2078,139 @@ def cmd_cancel(args) -> int:
     return 0
 
 
+# ── keeping yt-dlp current ───────────────────────────────────────────────
+# Video sites change all the time and yt-dlp follows with frequent releases;
+# an old yt-dlp is the most common reason YouTube & co. stop downloading.
+
+YTDLP_RELEASES_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+
+
+def _tool_version(binary: str) -> str | None:
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True, text=True,
+                             timeout=20).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.splitlines()[0].strip() if out else None
+
+
+def _version_tuple(version: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", version or ""))
+
+
+def _version_age_days(version: str | None) -> int | None:
+    """yt-dlp versions are release dates: 2026.10.21 -> days since then."""
+    import datetime
+    m = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", version or "")
+    if not m:
+        return None
+    try:
+        released = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+    return max(0, (datetime.date.today() - released).days)
+
+
+def _ytdlp_install_method(path: str) -> tuple[str, str]:
+    """("brew", brew) | ("pip", python) | ("binary", yt-dlp) for this yt-dlp."""
+    real = os.path.realpath(path)
+    if "/Cellar/yt-dlp/" in real:
+        brew = shutil.which("brew") or next(
+            (b for b in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew") if os.path.exists(b)), "brew")
+        return "brew", brew
+    try:
+        with open(real, "rb") as fh:
+            first = fh.readline(400).decode("utf-8", "replace").strip()
+    except OSError:
+        first = ""
+    if first.startswith("#!") and "python" in first:
+        parts = first[2:].split()
+        interpreter = parts[-1] if parts and parts[0].endswith("/env") else (parts[0] if parts else "")
+        if parts and parts[0].endswith("/env"):
+            interpreter = shutil.which(interpreter) or interpreter
+        return "pip", interpreter
+    return "binary", real
+
+
+def _latest_ytdlp(timeout: float = 8.0) -> str | None:
+    url = os.environ.get("MGD_YTDLP_LATEST_URL") or YTDLP_RELEASES_API
+    conn = None
+    try:
+        conn, resp = net.open_request(url, _proxy_from_config(), "GET",
+                                      headers={"Accept": "application/vnd.github+json",
+                                               "User-Agent": "mgd-update-check"},
+                                      timeout=timeout)
+        if resp.status != 200:
+            return None
+        data = json.loads(resp.read(200_000).decode("utf-8", "replace"))
+        tag = str(data.get("tag_name") or "").strip()
+        return tag or None
+    except (OSError, ValueError, HttpError):
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def cmd_update_tool(args) -> int:
+    """Update yt-dlp the way it was installed, report before/after."""
+    as_json = getattr(args, "as_json", False)
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp:
+        msg = "yt-dlp is not installed (install it with: brew install yt-dlp)"
+        print(json.dumps({"ok": False, "message": msg}) if as_json else f"error: {msg}")
+        return 1
+    before = _tool_version(ytdlp)
+    method, how = _ytdlp_install_method(ytdlp)
+    if method == "brew":
+        cmd = [how, "upgrade", "yt-dlp"]
+    elif method == "pip":
+        cmd = [how, "-m", "pip", "install", "--upgrade", "--disable-pip-version-check", "yt-dlp"]
+    else:
+        cmd = [ytdlp, "-U"]
+    if not as_json:
+        print(_arrow(f"updating yt-dlp {before or '?'} ({method}): {' '.join(cmd)}"))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        code, output = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except (OSError, subprocess.SubprocessError) as err:
+        code, output = 1, str(err)
+    after = _tool_version(ytdlp) or before
+    if after and before and after != before:
+        ok, message = True, f"yt-dlp updated: {before} → {after}"
+    elif code == 0:
+        source = {"brew": "Homebrew", "pip": "pip"}.get(method, "yt-dlp's own updater")
+        ok, message = True, f"yt-dlp {after} is the newest version {source} offers right now"
+    else:
+        tail = " ".join(output.strip().splitlines()[-3:])[-300:]
+        ok, message = False, f"the update did not work ({method}): {tail}"
+    if as_json:
+        print(json.dumps({"ok": ok, "method": method, "before": before, "after": after,
+                          "message": message}))
+    else:
+        print(_ok(message) if ok else _fail(message))
+    return 0 if ok else 1
+
+
 def cmd_doctor(_args) -> int:
     """Show what engines and setup mgd can use right now."""
     cfg = _cfg()
     if getattr(_args, "as_json", False):
+        ytdlp = shutil.which("yt-dlp")
+        ytdlp_info = None
+        if ytdlp:
+            version = _tool_version(ytdlp)
+            method, _ = _ytdlp_install_method(ytdlp)
+            ytdlp_info = {"version": version, "age_days": _version_age_days(version),
+                          "install": method}
+            if getattr(_args, "check_updates", False):
+                latest = _latest_ytdlp()
+                ytdlp_info["latest"] = latest
+                ytdlp_info["update_available"] = bool(
+                    latest and version and _version_tuple(latest) > _version_tuple(version))
         print(json.dumps({
             "python": sys.version.split()[0],
             "config": str(categorize.config_path()),
@@ -2082,6 +2218,7 @@ def cmd_doctor(_args) -> int:
             "tools": {name: shutil.which(binary) for name, binary in (
                 ("yt-dlp", "yt-dlp"), ("ffmpeg", "ffmpeg"),
                 ("aria2c", "aria2c"), ("webtorrent", "webtorrent"))},
+            "ytdlp": ytdlp_info,
             "unfinished": len(_find_states()),
         }))
         return 0
@@ -2953,6 +3090,7 @@ def main(argv=None) -> int:
         "pause": cmd_pause,
         "cancel": cmd_cancel, "rm": cmd_cancel, "del": cmd_cancel,
         "doctor": cmd_doctor,
+        "update-tool": cmd_update_tool, "update": cmd_update_tool,
         "qualities": cmd_qualities, "formats": cmd_qualities,
         "page-media": cmd_page_media, "catalog": cmd_page_media,
         "native-host": cmd_native_host,

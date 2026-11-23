@@ -58,6 +58,11 @@ final class DownloadJob: ObservableObject, Identifiable {
     @Published var retryAt: Date?
     /// automatic retries made since the download last made it through
     var autoRetries = 0
+    /// since when the engine's state for this running download is gone
+    /// while the app has not heard it finish (self-healing, see apply())
+    var stateMissingSince: Date?
+    /// "Download complete" was already announced for this run
+    var completionAnnounced = false
 
     var connectionProblem: Bool { errorKind == "network" || errorKind == "server" }
     /// what to start instead when a link sent for this download turns out

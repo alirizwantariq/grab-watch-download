@@ -84,6 +84,12 @@ enum UITestHooks {
         }
     }
 
+    /// Diagnostic lines from app internals during scripted runs.
+    static func trace(_ text: String) {
+        guard active else { return }
+        DispatchQueue.main.async { log("  trace: " + text) }
+    }
+
     private static func log(_ text: String) {
         let line = text + "\n"
         let url = outDir.appendingPathComponent("uitest.log")
@@ -153,6 +159,7 @@ enum UITestHooks {
                 probe.items.first { $0.url.contains(arg(1)) }?.name = arg(2)
             }
         case "sheet": openSheet(arg(1))
+        case "updateytdlp": _ = await store.updateYtdlp()
         case "clipwatch": store.watchClipboard = arg(1) == "on"
         case "clipauto": store.autoDownloadClipboard = arg(1) == "on"
         case "clipcopy":
@@ -187,6 +194,20 @@ enum UITestHooks {
                 await sleep(0.1)
             }
             log("  \(arg(1)) -> \(job(arg(1))?.phase.rawValue ?? "missing")")
+            if let j = job(arg(1)), j.phase.rawValue != arg(2), let p = j.process {
+                // timed out: what is the engine process doing?
+                let pid = p.processIdentifier
+                let ps = Process()
+                ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+                ps.arguments = ["-o", "pid,stat,etime,command", "-p", "\(pid)"]
+                let out = Pipe()
+                ps.standardOutput = out
+                try? ps.run()
+                ps.waitUntilExit()
+                let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                log("  timeout: pid \(pid) isRunning=\(p.isRunning) ps=\(text.replacingOccurrences(of: "\n", with: " | "))")
+                log("  last log: " + j.log.suffix(400).replacingOccurrences(of: "\n", with: " | "))
+            }
         case "waitsheet":
             let deadline = Date().addingTimeInterval(max(1, num(2)))
             while Date() < deadline, sheetName(session.sheet) != arg(1) { await sleep(0.1) }
@@ -373,6 +394,8 @@ enum UITestHooks {
             "handoffItems": handoffItems(),
             "status": store.status,
             "keepingAwake": store.awakeActivity != nil,
+            "ytdlpVersion": store.report?.ytdlpVersion ?? "",
+            "ytdlpUpdateAvailable": store.report?.ytdlpUpdateAvailable ?? false,
             "clipboardOffer": Session.shared.clipboardOffer?.link ?? (Session.shared.clipboardOffer == nil ? "" : "(unread)"),
             "networkAvailable": store.networkAvailable,
             "engineReachable": store.engineReachable,

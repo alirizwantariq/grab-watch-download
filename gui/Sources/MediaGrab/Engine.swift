@@ -47,8 +47,10 @@ enum Engine {
         let usual = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
                      "/usr/sbin", "/sbin"]
         let inherited = (env["PATH"] ?? "").split(separator: ":").map(String.init)
+        // MEDIAGRAB_EXTRA_PATH goes first (automated tests: fake tools)
+        let extra = (env["MEDIAGRAB_EXTRA_PATH"] ?? "").split(separator: ":").map(String.init)
         var seen = Set<String>()
-        env["PATH"] = (usual + inherited).filter { seen.insert($0).inserted }
+        env["PATH"] = (extra + usual + inherited).filter { seen.insert($0).inserted }
             .joined(separator: ":")
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
@@ -116,86 +118,26 @@ enum Engine {
     }
 
     /// Long-running call: `onLine` gets every output line and `onEnd` the exit
-    /// status, both on the main queue, lines always before the end.
+    /// status, both on the main queue, every line before the end.
+    ///
+    /// stdout and stderr share one pipe (lines arrive in the order they were
+    /// written) and one reader thread does blocking-free reads with poll()
+    /// until the pipe closes. Nothing else is involved: no readability
+    /// callbacks to cancel, no shared queue that could hold the "ended"
+    /// signal behind something stuck. If a helper that outlives the engine
+    /// keeps the pipe open, the end is reported two quiet seconds after the
+    /// engine itself exited.
     @discardableResult
     static func spawn(_ args: [String],
                       onLine: @escaping (String) -> Void,
                       onEnd: @escaping (Int32) -> Void) -> Process? {
         let p = makeProcess(args)
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        p.standardOutput = outPipe
-        p.standardError = errPipe
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
         p.standardInput = FileHandle.nullDevice
-
-        // One serial queue orders the two pipes' chunks and the end of the
-        // process. The end is only reported once both pipes hit EOF, so the
-        // last lines (the "done" event with the file path!) can never be
-        // lost to a race between "process exited" and "pipe still has data".
-        let queue = DispatchQueue(label: "mediagrab.engine.lines")
-        final class Stream {
-            var bytes: [UInt8] = []
-            var eof = false
-        }
-        final class Ending {
-            var status: Int32?
-            var reported = false
-        }
-        let outBuf = Stream(), errBuf = Stream()
-        let ending = Ending()
-
-        func emitLines(_ stream: Stream, flush: Bool) {
-            while let nl = stream.bytes.firstIndex(of: 0x0A) {
-                let line = String(decoding: stream.bytes[..<nl], as: UTF8.self)
-                stream.bytes.removeSubrange(...nl)
-                DispatchQueue.main.async { onLine(line) }
-            }
-            if flush, !stream.bytes.isEmpty {
-                let line = String(decoding: stream.bytes, as: UTF8.self)
-                stream.bytes.removeAll()
-                DispatchQueue.main.async { onLine(line) }
-            }
-        }
-        func finishIfReady(force: Bool) {       // on `queue`
-            guard !ending.reported, let status = ending.status,
-                  force || (outBuf.eof && errBuf.eof) else { return }
-            ending.reported = true
-            outPipe.fileHandleForReading.readabilityHandler = nil
-            errPipe.fileHandleForReading.readabilityHandler = nil
-            emitLines(outBuf, flush: true)
-            emitLines(errBuf, flush: true)
-            DispatchQueue.main.async { onEnd(status) }
-        }
-        func drain(_ handle: FileHandle, into stream: Stream) {
-            handle.readabilityHandler = { fh in
-                let data = fh.availableData
-                queue.async {
-                    if data.isEmpty {
-                        stream.eof = true
-                        fh.readabilityHandler = nil
-                        finishIfReady(force: false)
-                    } else {
-                        stream.bytes += data
-                        emitLines(stream, flush: false)
-                    }
-                }
-            }
-        }
-        drain(outPipe.fileHandleForReading, into: outBuf)
-        drain(errPipe.fileHandleForReading, into: errBuf)
-
-        p.terminationHandler = { proc in
-            queue.async {
-                ending.status = proc.terminationStatus
-                finishIfReady(force: false)
-            }
-            // a helper that outlives the engine can keep a pipe open: do not
-            // wait for its EOF forever
-            queue.asyncAfter(deadline: .now() + 2.0) { finishIfReady(force: true) }
-        }
         do {
             try p.run()
-            return p
         } catch {
             DispatchQueue.main.async {
                 onLine("error: could not start the mgd engine (\(error.localizedDescription))")
@@ -203,6 +145,75 @@ enum Engine {
             }
             return nil
         }
+        let reader = pipe.fileHandleForReading
+        let fd = reader.fileDescriptor
+        let thread = Thread {
+            var pending: [UInt8] = []
+            var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+            var quietSince: Date?
+
+            func emit(flush: Bool) {
+                while let nl = pending.firstIndex(of: 0x0A) {
+                    let line = String(decoding: pending[..<nl], as: UTF8.self)
+                    pending.removeSubrange(...nl)
+                    DispatchQueue.main.async { onLine(line) }
+                }
+                if flush, !pending.isEmpty {
+                    let line = String(decoding: pending, as: UTF8.self)
+                    pending.removeAll()
+                    DispatchQueue.main.async { onLine(line) }
+                }
+            }
+
+            var lines = 0
+            var how = "eof"
+            #if DEBUG
+            UITestHooks.trace("reader start pid \(p.processIdentifier) args \(args.prefix(3).joined(separator: " "))")
+            #endif
+            reading: while true {
+                var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&pfd, 1, 250)
+                if ready > 0 {
+                    let n = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+                    if n > 0 {
+                        pending.append(contentsOf: chunk[0..<n])
+                        lines += chunk[0..<n].reduce(0) { $1 == 0x0A ? $0 + 1 : $0 }
+                        emit(flush: false)
+                        quietSince = nil
+                    } else if n == 0 {
+                        break reading                      // EOF: every writer is gone
+                    } else if errno != EINTR && errno != EAGAIN {
+                        how = "read error \(errno)"
+                        break reading
+                    }
+                } else if ready == 0, !p.isRunning {
+                    // the engine exited but something still holds the pipe
+                    let since = quietSince ?? Date()
+                    quietSince = since
+                    if Date().timeIntervalSince(since) > 2 { how = "quiet after exit"; break reading }
+                } else if ready < 0, errno != EINTR {
+                    how = "poll error \(errno)"
+                    break reading
+                }
+            }
+            #if DEBUG
+            UITestHooks.trace("reader end pid \(p.processIdentifier): \(how) after \(lines) lines")
+            #else
+            _ = (lines, how)
+            #endif
+            emit(flush: true)
+            p.waitUntilExit()
+            let status = p.terminationStatus
+            #if DEBUG
+            UITestHooks.trace("exit pid \(p.processIdentifier) status \(status)")
+            #endif
+            try? reader.close()
+            // queued after every line above: main runs them in order
+            DispatchQueue.main.async { onEnd(status) }
+        }
+        thread.name = "mediagrab.engine.reader"
+        thread.start()
+        return p
     }
 }
 
@@ -300,6 +311,12 @@ struct EngineReport {
     var root: String = ""
     var config: String = ""
     var unfinished: Int = 0
+    /// yt-dlp: installed version, its age, how it was installed, newest
+    var ytdlpVersion: String?
+    var ytdlpAgeDays: Int?
+    var ytdlpInstall: String?
+    var ytdlpLatest: String?
+    var ytdlpUpdateAvailable = false
     var tools: [Tool] = []
     var reachable = false
 
@@ -311,6 +328,13 @@ struct EngineReport {
         report.root = obj["root"] as? String ?? ""
         report.config = obj["config"] as? String ?? ""
         report.unfinished = (obj["unfinished"] as? NSNumber)?.intValue ?? 0
+        if let y = obj["ytdlp"] as? [String: Any] {
+            report.ytdlpVersion = y["version"] as? String
+            report.ytdlpAgeDays = (y["age_days"] as? NSNumber)?.intValue
+            report.ytdlpInstall = y["install"] as? String
+            report.ytdlpLatest = y["latest"] as? String
+            report.ytdlpUpdateAvailable = (y["update_available"] as? Bool) ?? false
+        }
         let found = obj["tools"] as? [String: Any] ?? [:]
         let catalog: [(String, String, String)] = [
             ("yt-dlp", "YouTube, X and 1000+ video sites, HLS/DASH streams", "brew install yt-dlp"),

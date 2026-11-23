@@ -144,7 +144,7 @@ final class JobStore: ObservableObject {
     func activate() {
         guard pollTimer == nil else { return }
         refresh()
-        loadEngineSettings()
+        loadEngineSettings(checkUpdates: true)
         let timer = Timer(timeInterval: 2.5, repeats: true) { [weak self] _ in
             self?.refresh()
             self?.retryDueDownloads()
@@ -354,6 +354,8 @@ final class JobStore: ObservableObject {
             return
         }
         job.relinkURL = nil
+        job.stateMissingSince = nil
+        job.completionAnnounced = false
         job.phase = .running
         job.stopRequested = false
         job.cancelRequested = false
@@ -408,9 +410,7 @@ final class JobStore: ObservableObject {
         if job.phase == .done {
             if job.finishedAt == nil { job.finishedAt = Date() }
             job.adopted = false
-            let name = job.finishedPath.map { ($0 as NSString).lastPathComponent } ?? job.title
-            notify(job.isTorrent ? "Torrent complete" : "Download complete", name)
-            flash("Finished: \(name)")
+            announceCompletion(job)
         } else if job.phase == .failed, job.retryAt != nil {
             flash("Connection problem with “\(job.title)” — it will retry by itself")
         } else if job.phase == .failed {
@@ -420,6 +420,14 @@ final class JobStore: ObservableObject {
         scheduleSave()
         pump()
         updateDockBadge()
+    }
+
+    private func announceCompletion(_ job: DownloadJob) {
+        guard !job.completionAnnounced else { return }
+        job.completionAnnounced = true
+        let name = job.finishedPath.map { ($0 as NSString).lastPathComponent } ?? job.title
+        notify(job.isTorrent ? "Torrent complete" : "Download complete", name)
+        flash("Finished: \(name)")
     }
 
     // MARK: pause / resume / cancel
@@ -726,6 +734,40 @@ final class JobStore: ObservableObject {
                 changed = true
             }
         }
+        // Self-healing: a download this app is driving whose engine state
+        // is gone and whose file is complete on disk has finished, even if
+        // the engine's last lines never reached us. Give the normal "done"
+        // a few seconds to arrive first.
+        for job in jobs where job.process != nil && job.phase == .running && !job.isTorrent {
+            let fm = FileManager.default
+            guard let id = job.engineID, byID[id] == nil, let out = job.outPath,
+                  let size = (try? fm.attributesOfItem(atPath: out)[.size] as? NSNumber)?.int64Value,
+                  size > 0, job.total <= 0 || size == job.total,
+                  !fm.fileExists(atPath: out + ".mgdstate"),
+                  !fm.fileExists(atPath: out + ".mgdpart") else {
+                job.stateMissingSince = nil
+                continue
+            }
+            let since = job.stateMissingSince ?? Date()
+            job.stateMissingSince = since
+            guard Date().timeIntervalSince(since) > 4 else { continue }
+            #if DEBUG
+            UITestHooks.trace("self-heal: \(job.title) finished on disk, engine pid \(job.process?.processIdentifier ?? -1) running=\(job.process?.isRunning ?? false)")
+            #endif
+            job.finishedPath = out
+            job.finishedSize = size
+            job.done = size
+            job.finishedAt = Date()
+            job.bytesPerSecond = 0
+            job.stateMissingSince = nil
+            job.phase = .done
+            announceCompletion(job)
+            if let process = job.process, process.isRunning {
+                job.stopRequested = true
+                process.terminate()        // its job is done; do not leave it hanging
+            }
+            changed = true
+        }
         // downloads whose engine state disappeared while nobody here was
         // driving them: finished elsewhere (file is there) or cancelled
         for job in jobs where job.process == nil && job.phase.isActive {
@@ -773,20 +815,49 @@ final class JobStore: ObservableObject {
 
     // MARK: engine settings
 
-    func loadEngineSettings() {
+    /// true while yt-dlp is being updated
+    @Published var updatingTool = false
+    @Published var ytdlpBannerDismissed = false
+
+    /// checkUpdates: also ask GitHub for the newest yt-dlp (once per launch,
+    /// and when Diagnostics checks again)
+    func loadEngineSettings(checkUpdates: Bool = false) {
         Task.detached(priority: .utility) {
             let cfg = Engine.runJSONBlocking(["defaults", "--json"])
-            let doc = EngineReport.parse(Engine.runJSONBlocking(["doctor", "--json"]))
+            let doc = EngineReport.parse(Engine.runJSONBlocking(
+                ["doctor", "--json"] + (checkUpdates ? ["--check-updates"] : [])))
             await MainActor.run {
                 let store = JobStore.shared
                 if let cfg {
                     if let root = cfg["root"] as? String, !root.isEmpty { store.downloadRoot = root }
                     store.speedLimit = (cfg["speed_limit"] as? NSNumber)?.intValue ?? 0
                 }
-                store.report = doc
+                if !checkUpdates, let old = store.report, old.ytdlpVersion == doc.ytdlpVersion {
+                    var merged = doc          // keep what the last update check found
+                    merged.ytdlpLatest = old.ytdlpLatest
+                    merged.ytdlpUpdateAvailable = old.ytdlpUpdateAvailable
+                    store.report = merged
+                } else {
+                    store.report = doc
+                }
                 store.engineReachable = doc.reachable
             }
         }
+    }
+
+    /// Update yt-dlp the way it was installed (Homebrew, pip, own updater).
+    @discardableResult
+    func updateYtdlp() async -> String {
+        await MainActor.run { self.updatingTool = true }
+        let answer = await Engine.runJSON(["update-tool", "yt-dlp", "--json"])
+        let doc = EngineReport.parse(await Engine.runJSON(["doctor", "--json", "--check-updates"]))
+        let message = (answer?["message"] as? String) ?? "The update did not run"
+        await MainActor.run {
+            self.updatingTool = false
+            if doc.reachable { self.report = doc }
+            self.flash(message, seconds: 10)
+        }
+        return message
     }
 
     static let speedChoices: [(label: String, value: String, bytes: Int)] = [

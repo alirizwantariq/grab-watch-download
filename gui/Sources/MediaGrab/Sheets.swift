@@ -480,6 +480,9 @@ struct DiagnosticsSheet: View {
                                 detail: tool.path.map { "\(tool.purpose) — \(tildePath($0))" }
                                     ?? "Needed for: \(tool.purpose)",
                                 fix: tool.path == nil ? tool.install : nil)
+                        if tool.id == "yt-dlp", tool.path != nil {
+                            ytdlpVersionRow(report)
+                        }
                     }
                 }
                 .background(RoundedRectangle(cornerRadius: 8)
@@ -520,7 +523,7 @@ struct DiagnosticsSheet: View {
             HStack {
                 Button {
                     model.running = true
-                    store.loadEngineSettings()
+                    store.loadEngineSettings(checkUpdates: true)
                     let model = model
                     Task {
                         let text = await Engine.run(["doctor"])
@@ -578,6 +581,28 @@ struct DiagnosticsSheet: View {
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private func ytdlpVersionRow(_ report: EngineReport) -> some View {
+        HStack(spacing: 8) {
+            Text("Version \(report.ytdlpVersion ?? "?")"
+                 + (report.ytdlpAgeDays.map { $0 == 0 ? " (released today)" : " (\($0) days old)" } ?? "")
+                 + (report.ytdlpInstall.map { " · via \($0 == "brew" ? "Homebrew" : $0)" } ?? ""))
+                .font(.caption).foregroundColor(.secondary)
+            Spacer()
+            if store.updatingTool {
+                ProgressView().controlSize(.small)
+            } else if report.ytdlpUpdateAvailable {
+                Button("Update to \(report.ytdlpLatest ?? "the newest")") {
+                    Task { await store.updateYtdlp() }
+                }
+                .controlSize(.small)
+            } else if report.ytdlpLatest != nil {
+                Label("Up to date", systemImage: "checkmark").font(.caption).foregroundColor(.green)
+            }
+        }
+        .padding(.leading, 42).padding(.trailing, 12).padding(.bottom, 8)
     }
 
     private func pathLine(_ label: String, _ path: String) -> some View {
