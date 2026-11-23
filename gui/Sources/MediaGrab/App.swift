@@ -55,6 +55,32 @@ struct MediaGrabApp: App {
             SettingsView()
                 .environmentObject(store)
         }
+
+        MenuBarExtra(isInserted: menuBarShown) {
+            MenuBarContent()
+                .environmentObject(store)
+                .environmentObject(session)
+        } label: {
+            MenuBarLabel(store: store)
+        }
+        .menuBarExtraStyle(.window)
+    }
+
+    /// The icon follows the setting (and removing it from the menu bar by
+    /// ⌘-dragging turns the setting off). Test runs keep out of the real
+    /// menu bar unless a flow asks for it.
+    private var menuBarShown: Binding<Bool> {
+        #if DEBUG
+        if UITestHooks.active && ProcessInfo.processInfo.environment["MEDIAGRAB_UITEST_MENUBAR"] == nil {
+            return .constant(false)
+        }
+        #endif
+        // write only real changes: the menu bar writes the value back as it
+        // sets the icon up, and an unchanged write would still republish
+        // the store and rebuild the scenes - endlessly
+        let store = store
+        return Binding(get: { store.showMenuBarIcon },
+                       set: { if store.showMenuBarIcon != $0 { store.showMenuBarIcon = $0 } })
     }
 }
 
@@ -79,10 +105,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         BrowserLink.refreshExportedExtension()
     }
 
-    /// Closing the window quits the app - unless downloads are still going,
-    /// which keep running with the dock badge showing their count.
+    /// Closing the window quits the app - unless downloads are still going
+    /// (they keep running with the dock badge showing their count) or the
+    /// menu bar icon is on (the app stays there).
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !JobStore.shared.hasWorkInFlight
+        let store = JobStore.shared
+        return !store.hasWorkInFlight && !store.showMenuBarIcon && store.whenDone == .nothing
+            && store.startAt == nil
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication,
@@ -193,6 +222,8 @@ struct SettingsView: View {
                         .font(.caption).foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                Toggle("Show MediaGrab in the menu bar", isOn: $store.showMenuBarIcon)
+                    .help("Progress at a glance, pause/resume and Paste Link from the menu bar; closing the window keeps MediaGrab running there")
                 Toggle("Retry by itself after connection problems", isOn: $store.autoRetry)
                     .help("Downloads that fail because the connection dropped continue on their own: a few times over the next minutes, and as soon as the Mac is back online or wakes up")
             }

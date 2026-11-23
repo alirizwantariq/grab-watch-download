@@ -799,6 +799,36 @@ def flow_schedule(run: Run, base: str):
     assert started["held"] is False and started["startAt"] == -1
 
 
+def flow_menu_bar(run: Run, base: str):
+    """The menu bar panel shows what downloads (overall progress for the
+    icon); with the icon on, closing the window keeps the app running and
+    it comes back; with it off, closing the window when idle quits. (The
+    real icon shows in the menu bar for the few seconds this runs.)"""
+    run.env["MEDIAGRAB_UITEST_MENUBAR"] = "1"
+    run.play([["ask", "off"], ["submit", f"{base}/slow/1200/bar_a.mp4"],
+              ["waitphase", "bar_a", "running", 15], ["wait", 2.5],
+              ["menubarview"], ["wait", 0.6], ["dump", "menu"], ["snap", "menu"], ["closemenubarview"],
+              ["closewindow"], ["wait", 1.5], ["dump", "closed"],
+              ["openmain"], ["wait", 1], ["dump", "reopened"],
+              ["waitphase", "bar_a", "done", 60], ["wait", 0.5],
+              ["menubarview"], ["wait", 0.6], ["snap", "menu-idle"], ["closemenubarview"],
+              ["dump", "idle"], ["menubar", "off"], ["wait", 0.3], ["closewindow"], ["wait", 10]],
+             timeout=90)
+    menu = run.dump("menu")
+    assert menu["showMenuBarIcon"] is True
+    assert 0 < menu["overallPercent"] < 100, menu["overallPercent"]
+    closed = run.dump("closed")
+    assert closed["visibleWindows"] == 0, closed["visibleWindows"]
+    assert run.dump("reopened")["visibleWindows"] == 1
+    idle = run.dump("idle")
+    assert idle["overallPercent"] == -1 and idle["jobs"][0]["phase"] == "done", idle
+    log = (run.out / "uitest.log").read_text()
+    # the app quit by itself when its window closed (no "quit" step left)
+    assert "quit requested" not in log, log[-400:]
+    assert pathlib.Path(run.jobs("idle")["bar_a.mp4"]["finishedPath"]).read_bytes() \
+        == blob("bar_a.mp4", SLOW_SIZE)
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -883,7 +913,7 @@ def flow_snapshots(run: Run, base: str):
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
          flow_browser_handoff, flow_site_login, flow_expired_link, flow_connection_drop, flow_many_links,
          flow_clipboard_watch, flow_ytdlp_update, flow_missed_end,
-         flow_mac_ready, flow_duplicates, flow_playlist, flow_schedule,
+         flow_mac_ready, flow_duplicates, flow_playlist, flow_schedule, flow_menu_bar,
          flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 

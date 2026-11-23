@@ -373,6 +373,9 @@ final class Session: ObservableObject {
     @Published var confirmation: Confirmation?
     /// a link copied in another app, offered in a banner
     @Published var clipboardOffer: ClipboardOffer?
+    /// opens (or brings back) the main window; set by the views, which have
+    /// SwiftUI's openWindow action
+    var openMainWindow: (() -> Void)?
 
     lazy var clipboard: ClipboardWatcher = {
         #if DEBUG

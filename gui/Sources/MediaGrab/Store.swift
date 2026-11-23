@@ -93,6 +93,12 @@ final class JobStore: ObservableObject {
     @Published var autoDownloadClipboard: Bool {
         didSet { Prefs.defaults.set(autoDownloadClipboard, forKey: "autoDownloadClipboard") }
     }
+    /// the icon in the menu bar (closing the window then keeps the app there)
+    @Published var showMenuBarIcon: Bool {
+        didSet { Prefs.defaults.set(showMenuBarIcon, forKey: "showMenuBarIcon") }
+    }
+    /// overall progress of what is downloading (menu bar icon), nil = none
+    @Published private(set) var overallPercent: Int?
     /// false while macOS reports no usable network connection
     @Published var networkAvailable = true
     /// the "keep the Mac awake" assertion, while held
@@ -112,7 +118,8 @@ final class JobStore: ObservableObject {
         let d = Prefs.defaults
         d.register(defaults: ["maxConcurrent": 3, "askBeforeDownload": true,
                               "notifyOnFinish": true, "keepAwake": true, "autoRetry": true,
-                              "watchClipboard": false, "autoDownloadClipboard": false])
+                              "watchClipboard": false, "autoDownloadClipboard": false,
+                              "showMenuBarIcon": true])
         maxConcurrent = d.integer(forKey: "maxConcurrent")
         askBeforeDownload = d.bool(forKey: "askBeforeDownload")
         notifyOnFinish = d.bool(forKey: "notifyOnFinish")
@@ -120,6 +127,7 @@ final class JobStore: ObservableObject {
         autoRetry = d.bool(forKey: "autoRetry")
         watchClipboard = d.bool(forKey: "watchClipboard")
         autoDownloadClipboard = d.bool(forKey: "autoDownloadClipboard")
+        showMenuBarIcon = d.bool(forKey: "showMenuBarIcon")
         loadHistory()
     }
 
@@ -150,6 +158,7 @@ final class JobStore: ObservableObject {
             self?.retryDueDownloads()
             self?.startScheduledIfDue()
             self?.checkWhenDone()
+            self?.updateOverallProgress()
         }
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
@@ -282,6 +291,17 @@ final class JobStore: ObservableObject {
         NSApp?.dockTile.badgeLabel = n > 0 ? String(n) : nil
         updateAwake()
         checkWhenDone()
+        updateOverallProgress()
+    }
+
+    /// Bytes done of everything downloading with a known size, as a
+    /// percentage (refreshed every couple of seconds, for the menu bar).
+    func updateOverallProgress() {
+        let running = jobs.filter { $0.phase == .running && !$0.converting && $0.total > 0 }
+        let total = running.reduce(Int64(0)) { $0 + $1.total }
+        let done = running.reduce(Int64(0)) { $0 + min($1.done, $1.total) }
+        let percent: Int? = total > 0 ? Int(Double(done) * 100 / Double(total)) : nil
+        if percent != overallPercent { overallPercent = percent }
     }
 
     // MARK: schedule: start later

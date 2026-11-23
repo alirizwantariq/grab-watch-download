@@ -224,6 +224,26 @@ enum UITestHooks {
             window.setFrameOrigin(NSPoint(x: -6000, y: -6000))
             window.orderFront(nil)
             extraWindows.append(window)
+        case "menubarview":
+            // the menu bar panel's content, hosted in a plain off-screen window
+            let host = NSHostingController(rootView: MenuBarContent()
+                .environmentObject(store).environmentObject(session))
+            let window = NSWindow(contentViewController: host)
+            window.title = "Menu"
+            window.setFrameOrigin(NSPoint(x: -7000, y: -6000))
+            window.orderFront(nil)
+            extraWindows.append(window)
+        case "closemenubarview":
+            for w in extraWindows where w.title == "Menu" { w.close() }
+            extraWindows.removeAll { $0.title == "Menu" }
+        case "menubar": store.showMenuBarIcon = arg(1) == "on"
+        case "closewindow":
+            NSApp.windows.first { $0.canBecomeMain && !$0.isSheet && $0.isVisible
+                                  && !extraWindows.contains($0) }?.performClose(nil)
+        case "openmain":
+            session.openMainWindow?()
+            await sleep(0.5)
+            parkWindows()
         case "seed": seed()
         case "waitphase":
             // ["waitphase", needle, phase, timeout]
@@ -394,6 +414,8 @@ enum UITestHooks {
     private static func snapshot(_ name: String) {
         var index = 0
         for window in NSApp.windows where window.isVisible || window.attachedSheet != nil {
+            // the menu bar icon's own windows (macOS keeps several per icon)
+            if String(describing: type(of: window)).contains("StatusBar") { continue }
             guard let view = window.contentView?.superview ?? window.contentView,
                   view.bounds.width > 50,
                   let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
@@ -468,12 +490,17 @@ enum UITestHooks {
             "startAt": store.startAt.map { $0.timeIntervalSinceNow } ?? -1,
             "held": store.isHeld,
             "whenDone": store.whenDone.rawValue,
+            "overallPercent": store.overallPercent ?? -1,
+            "showMenuBarIcon": store.showMenuBarIcon,
             "whenDoneCountdown": store.whenDoneCountdown ?? -1,
             "playlistTitle": { () -> String in
                 if case .batch(let b) = Session.shared.sheet { return b.playlist?.title ?? "" }
                 return ""
             }(),
             "windows": NSApp.windows.filter { $0.canBecomeMain && !$0.isSheet }.count,
+            "visibleWindows": NSApp.windows.filter {
+                $0.canBecomeMain && !$0.isSheet && $0.isVisible && !extraWindows.contains($0)
+            }.count,
             "bundledEngine": Engine.bundledLauncher ?? "",
             "bundledExtension": Engine.bundledExtension?.path ?? "",
             "handoffItems": handoffItems(),

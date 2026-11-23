@@ -6,6 +6,7 @@ struct ContentView: View {
     @EnvironmentObject var store: JobStore
     @EnvironmentObject var session: Session
     @FocusState private var linkFieldFocused: Bool
+    @Environment(\.openWindow) private var openWindow
 
     private var confirmationShown: Binding<Bool> {
         Binding(get: { session.confirmation != nil },
@@ -64,7 +65,10 @@ struct ContentView: View {
             Text(c.message)
         }
         .toolbar { toolbarContent }
-        .onAppear { linkFieldFocused = true }
+        .onAppear {
+            linkFieldFocused = true
+            session.openMainWindow = { openWindow(id: "main") }
+        }
     }
 
     // MARK: sheets

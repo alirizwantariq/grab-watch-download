@@ -99,6 +99,13 @@ missing and the command that installs each.
   smoothly on your Mac", percentage, time left, Skip Conversion). Settings
   choose Convert when needed / Only fix the format / Off; finished rows and
   the selection bar offer Make Mac-Ready for files downloaded earlier.
+- **Menu bar.** An icon in the menu bar (filled while downloading, with
+  the overall percentage) opens a panel: downloads in progress with pause /
+  resume, the schedule and when-done countdown, the last few finished files
+  (click to show in Finder), Paste Link, Pause/Resume All and Open
+  MediaGrab. With the icon on, closing the window keeps MediaGrab running
+  there; Settings can turn it off (then closing the window quits when
+  nothing is downloading, as before).
 - **Schedule and when done.** ⋯ ▸ Schedule Downloads… holds the queue
   until a time (e.g. 02:00, optionally pausing what runs now); rows say
   "Starts at 02:00" and a banner offers Start Now. ⋯ ▸ When Downloads
