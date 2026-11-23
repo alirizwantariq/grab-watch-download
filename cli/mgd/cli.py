@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("set-default",
                         help="set default dir for a category/root, or preferred cookie browser")
     sp.add_argument("category", choices=["root", "cookies-browser",
-                                         "speed-limit", "open-app",
+                                         "speed-limit", "open-app", "fragments",
                                          *categorize.CATEGORIES])
     sp.add_argument("value", help="path (or browser name for cookies-browser)")
 
@@ -370,6 +370,42 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
         return 1
 
 BOT_CHECK_MARKERS = ("sign in to confirm", "not a bot", "confirm you")
+
+
+DEFAULT_FRAGMENTS = 8
+
+
+def _ytdlp_speed_args(args, cfg: dict) -> list[str]:
+    """Throughput flags for yt-dlp runs.
+
+    - HLS/DASH streams (and YouTube's chunked formats) arrive as many small
+      pieces; yt-dlp fetches them one at a time unless told otherwise.
+      config "fragments" (default 8) pieces run in parallel.
+    - The speed limit (--max-speed, or the global "speed_limit" shared by
+      every running download) applies to yt-dlp downloads too. yt-dlp takes
+      a fixed rate, so the global limit is split by the downloads running
+      when this one starts."""
+    out: list[str] = []
+    try:
+        fragments = int(cfg.get("fragments", DEFAULT_FRAGMENTS))
+    except (TypeError, ValueError):
+        fragments = DEFAULT_FRAGMENTS
+    if fragments > 1:
+        out += ["--concurrent-fragments", str(min(fragments, 32))]
+    from .engine import parse_speed, _count_active_downloads
+    own = _speed_limit_arg(getattr(args, "max_speed", None))
+    try:
+        global_limit = parse_speed(cfg.get("speed_limit"))
+    except ValueError:
+        global_limit = None
+    limit = own
+    if global_limit:
+        # this run has no state file yet, so it is not in the count
+        share = global_limit // (_count_active_downloads(include_self=False) + 1)
+        limit = share if limit is None else min(limit, share)
+    if limit:
+        out += ["--limit-rate", str(max(1024, int(limit)))]
+    return out
 
 
 def _ytdlp_base_args() -> list[str]:
@@ -820,12 +856,13 @@ def _grab_platform(args, cfg: dict, url: str | None = None,
     by_ids = bool(selector) and "height<=" not in selector and selector != "ba/bestaudio"
     if not audio_only and not by_ids:
         sort_args = ["-S", "res,fps,vcodec:h264,acodec:m4a"]
+    speed_args = _ytdlp_speed_args(args, cfg)
     if getattr(args, "json_progress", False):
         print(json.dumps({"type": "start", "url": url, "engine": "yt-dlp"}),
               flush=True)
     for name, base in strategies[:max_strategies]:
         cmd = [ytdlp, *base, *base_flags, *dl_flags, *dest_args, *proxy_args,
-               *referer_args, *sort_args]
+               *referer_args, *sort_args, *speed_args]
         if selector:
             cmd += ["-f", selector]
         cmd += [*quality_extra, "--", url]
@@ -1599,6 +1636,14 @@ def cmd_set_default(args) -> int:
         else:
             cfg.pop("speed_limit", None)
             print("saved: global speed limit -> off")
+    elif args.category == "fragments":
+        try:
+            n = int(args.value)
+        except ValueError:
+            print("error: fragments takes a number (1 = one piece at a time)", file=sys.stderr)
+            return 2
+        cfg["fragments"] = max(1, min(32, n))
+        print(f"saved: stream pieces downloaded in parallel -> {cfg['fragments']}")
     elif args.category == "open-app":
         val = args.value.strip().lower()
         if val not in ("on", "off"):
@@ -1609,7 +1654,7 @@ def cmd_set_default(args) -> int:
     else:
         cfg.setdefault("defaults", {})[args.category] = args.value
     categorize.save_config(cfg)
-    if args.category not in ("cookies-browser", "speed-limit", "open-app"):
+    if args.category not in ("cookies-browser", "speed-limit", "open-app", "fragments"):
         print(f"saved: {args.category} -> {args.value}")
     return 0
 

@@ -12,6 +12,7 @@ import http.server
 import json
 import os
 import pathlib
+import shutil
 import signal
 import stat
 import struct
@@ -430,6 +431,90 @@ def test_video_downloads_prefer_formats_every_player_opens(tmp_path):
         assert argv[argv.index("-S") + 1] == "res,fps,vcodec:h264,acodec:m4a", argv
     assert "-S" not in flags("--quality", "audio")       # audio extraction
     assert "-S" not in flags("--quality", "f137+140")    # explicit format ids
+
+
+def test_ytdlp_runs_fetch_pieces_in_parallel_and_obey_the_speed_limit(tmp_path):
+    fake = _install_fake_ytdlp(tmp_path)
+    url = "https://www.youtube.com/watch?v=abc"
+
+    def argv(*extra):
+        (tmp_path / "ytdlp-calls.jsonl").unlink(missing_ok=True)
+        out = _mgd(tmp_path, ["grab", url, "--quality", "720", *extra], **fake)
+        assert out.returncode == 0, out.stderr
+        return _ytdlp_calls(tmp_path)[0]
+
+    a = argv()
+    assert a[a.index("--concurrent-fragments") + 1] == "8"
+    assert "--limit-rate" not in a                      # no limit set
+    a = argv("--max-speed", "500KB")
+    assert a[a.index("--limit-rate") + 1] == "500000"
+    _mgd(tmp_path, ["set-default", "speed-limit", "2MB"])
+    a = argv()
+    assert a[a.index("--limit-rate") + 1] == "2000000"   # alone: the whole limit
+    a = argv("--max-speed", "1MB")
+    assert a[a.index("--limit-rate") + 1] == "1000000"   # the lower of the two
+    # another download running: the global limit is shared
+    owner = _stand_in_process("mgd", "grab", "http://example.invalid/other.bin")
+    try:
+        _fake_state(tmp_path / "root" / "video", "other.bin", pid=owner.pid)
+        a = argv()
+        assert a[a.index("--limit-rate") + 1] == "1000000"
+    finally:
+        owner.kill()
+        owner.wait()
+    cfg = tmp_path / "cfg" / "mgd" / "config.json"
+    data = json.loads(cfg.read_text())
+    data.pop("speed_limit")
+    data["fragments"] = 1
+    cfg.write_text(json.dumps(data))
+    a = argv()
+    assert "--concurrent-fragments" not in a and "--limit-rate" not in a
+
+
+def test_hls_stream_pieces_really_download_in_parallel(tmp_path):
+    """Live check with the real yt-dlp: a stream whose server takes 0.4 s
+    per piece must not take 0.4 s x pieces."""
+    if not (shutil.which("yt-dlp") and shutil.which("ffmpeg")):
+        return                                   # tools not installed: skip
+    site = tmp_path / "site"
+    (site / "hls").mkdir(parents=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=320x180:rate=15:duration=16",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "15",
+                    "-hls_time", "1", "-hls_playlist_type", "vod",
+                    "-hls_segment_filename", str(site / "hls" / "s%03d.ts"),
+                    str(site / "hls" / "index.m3u8")], check=True)
+    pieces = len(list((site / "hls").glob("*.ts")))
+    assert pieces >= 12, pieces
+
+    class Slow(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(site), **kw)
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path.endswith(".ts"):
+                time.sleep(0.4)
+            super().do_GET()
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/hls/index.m3u8"
+        t0 = time.monotonic()
+        out = _mgd(tmp_path, ["grab", url, "-d", str(tmp_path / "o"), "--out-name", "clip",
+                              "--json-progress"], timeout=120)
+        took = time.monotonic() - t0
+        assert out.returncode == 0, out.stdout[-800:] + out.stderr[-800:]
+        assert (tmp_path / "o" / "clip.mp4").stat().st_size > 10_000
+        serial = pieces * 0.4
+        assert took < serial * 0.6, f"{took:.1f}s for {pieces} pieces (serial would be {serial:.1f}s)"
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_page_without_direct_media_falls_back_to_ytdlp(tmp_path):

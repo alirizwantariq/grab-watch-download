@@ -95,9 +95,10 @@ def _journal_dirs() -> list[pathlib.Path]:
     return dirs
 
 
-def _count_active_downloads() -> int:
+def _count_active_downloads(include_self: bool = True) -> int:
     """Live mgd downloads (state files whose pid is alive), including self
-    (self has usually written its state by the time throttling matters)."""
+    (self has usually written its state by the time throttling matters).
+    include_self=False counts the others only (0 when none)."""
     count = 0
     pids = set()
     for d in _journal_dirs():
@@ -114,12 +115,14 @@ def _count_active_downloads() -> int:
             pid = int(pid)
             if pid in pids:
                 continue
+            if not include_self and pid == os.getpid():
+                continue
             try:
                 os.kill(pid, 0)
                 pids.add(pid)
             except (ProcessLookupError, PermissionError, TypeError, ValueError):
                 continue
-    return max(1, len(pids))
+    return max(1, len(pids)) if include_self else len(pids)
 
 
 class _SpeedGovernor:

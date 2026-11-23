@@ -48,7 +48,9 @@ mgd native-host                    # Chrome native-messaging host for the
                                    # MediaGrab extension (see chrome-extension/)
 mgd watch                         # clipboard monitor: copy any link anywhere
                                    # and it auto-downloads (--all-types)
-mgd set-default speed-limit 2MB   # FDM-style global traffic limit (off to clear)
+mgd set-default speed-limit 2MB   # FDM-style global traffic limit (off to clear;
+                                   # yt-dlp downloads get their share too)
+mgd set-default fragments 8       # stream pieces fetched in parallel (default 8)
 mgd grab URL --max-speed 500KB    # per-download speed limit
 mgd grab "magnet:?xt=urn:btih:…"  # torrents & magnets: file picker (interactive)
 mgd grab "magnet:…" --select-files 1,3-5   # ...or pick files up front
