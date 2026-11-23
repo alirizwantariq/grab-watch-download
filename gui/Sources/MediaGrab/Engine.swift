@@ -208,6 +208,12 @@ enum Engine {
 
 // MARK: - mgd JSON payloads
 
+/// `--cookies <file>` when a site login came with the link.
+func cookieArgs(_ path: String?) -> [String] {
+    guard let path, FileManager.default.fileExists(atPath: path) else { return [] }
+    return ["--cookies", path]
+}
+
 /// One unfinished download as `mgd list --json` reports it.
 struct ListEntry: Identifiable, Equatable {
     /// Stable id (survives other downloads starting/finishing around it).
@@ -256,6 +262,8 @@ struct QualityProbe: Identifiable {
     let source: String?
     let options: [QualityOption]
     let error: String?
+    /// the site login the link came with (browser extension), if any
+    var cookies: String? = nil
 
     static func parse(url: String, _ object: [String: Any]?) -> QualityProbe {
         guard let obj = object else {

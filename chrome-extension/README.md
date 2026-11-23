@@ -17,6 +17,12 @@ segmented, resumable downloads).
 - **Probes file sizes** through the native host (ranged requests — nothing
   is downloaded during the scan). Stream playlists are labelled `STREAM`.
 - **Hands the selection to MediaGrab** with the page as `Referer`.
+- **Uses your site logins** ("Use my site logins", on by default): the
+  cookies the browser itself would send to the download urls and their page
+  go along, so members-only videos and CDNs that check a session work. The
+  engine keeps them in a private file (`~/.config/mgd/cookies/`, readable
+  only by you, removed after two weeks) and sends each cookie only to the
+  site it belongs to, redirects included.
 - **Send page**: on sites whose player has no direct file (YouTube, X, Vimeo
   …) the page link itself goes to MediaGrab, which resolves it with yt-dlp
   and shows its quality picker.
@@ -71,9 +77,11 @@ Chrome native messaging (4-byte little-endian length + JSON):
 
 ```
 {"command":"ping"}                               → {"ok":true,"app":"mgd","version":"1.3"}
-{"command":"probe","urls":[…],"referer":…}       → {"ok":true,"sizes":{url:bytes}}
+{"command":"probe","urls":[…],"referer":…,"cookies":[…]?}
+                                                 → {"ok":true,"sizes":{url:bytes}}
 {"command":"download","urls":[…],"referer":?,
  "titles":{url:name}?,"kinds":{url:"file|stream|page"}?,
+ "cookies":[chrome.cookies.Cookie…]?,
  "destination":?}                                → {"ok":true,"handoff":true,"spawned":n}
 {"command":"query"}                              → {"ok":true,"items":[{id,state,done,size,…}]}
 {"command":"open"}                               → {"ok":true}   (opens the app)

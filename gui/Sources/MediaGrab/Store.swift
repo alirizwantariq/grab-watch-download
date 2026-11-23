@@ -14,6 +14,8 @@ struct DownloadRequest {
     var poster: String?
     var isTorrent = false
     var torrentSelection: String?         // "1,3,5" (aria2 numbering)
+    /// private cookies.txt with the site login (from the browser extension)
+    var cookies: String?
 
     var arguments: [String] {
         var args = ["grab", url, "--json-progress", "--retries", "8"]
@@ -26,6 +28,7 @@ struct DownloadRequest {
         if let d = destination, !d.isEmpty { args += ["-d", d] }
         if let n = outName, Naming.isValid(n) { args += ["--out-name", Naming.sanitize(n)] }
         if let sel = torrentSelection, !sel.isEmpty { args += ["--select-files", sel] }
+        if let c = cookies, FileManager.default.fileExists(atPath: c) { args += ["--cookies", c] }
         return args
     }
 }

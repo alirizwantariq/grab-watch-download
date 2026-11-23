@@ -71,7 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "e.g. 1,3,5-7; see mgd torrent-info)")
     g.add_argument("--all-files", action="store_true",
                    help="torrents: download every file without asking")
-    g.add_argument("--cookies", default=None, help="Netscape cookie file for yt-dlp")
+    g.add_argument("--cookies", default=None,
+                   help="Netscape cookies.txt with your site login (sent only to "
+                        "the sites it belongs to; the browser extension fills it in)")
     g.add_argument("--cookies-from-browser", default=None,
                    help="browser to pull cookies from for yt-dlp: chrome, firefox, edge, safari, brave")
     g.add_argument("--resolver", default=None, choices=["auto", "ytdlp", "xd"],
@@ -142,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--proxy", default=None)
     pm.add_argument("--user-agent", default=None)
     pm.add_argument("--limit", type=int, default=100)
+    pm.add_argument("--cookies", default=None, help="Netscape cookies.txt")
     pm.add_argument("--no-size", action="store_true",
                     help="skip parallel size probing (titles only)")
     nh = sub.add_parser("native-host",
@@ -929,6 +932,10 @@ def cmd_grab(args) -> int:
     if _torrent_mod.is_torrent(args.url):
         return _grab_torrent(args, cfg, args.url)
 
+    cookies_file = _use_cookies(getattr(args, "cookies", None))
+    if getattr(args, "cookies", None) and not cookies_file:
+        args.cookies = None             # do not hand a broken file to yt-dlp
+
     if args.referer:
         # explicit referer: CDNs gated by it (erome etc.) would 403 even the
         # is-it-a-page probe below, sending the grab down a dead-end path
@@ -1069,6 +1076,7 @@ def cmd_grab(args) -> int:
                                  or (args.url if page_links is not None else None)),
                         mirror_hosts=_mirror_hosts_for(url_i) or
                                      _mirror_hosts_for(args.url),
+                        cookies_file=cookies_file,
                         expected_sha256=args.sha256 if t["kind"] == "direct" else None)
         dl.pid = os.getpid()
         try:
@@ -1470,6 +1478,24 @@ def cmd_stream(args) -> int:
     proc = subprocess.run([wt, url, f"--{player}", "--keep-seeding"],
                           cwd=stream_dir)
     return proc.returncode
+
+
+def _use_cookies(path) -> str | None:
+    """Send the cookies in this cookies.txt with every request of this
+    process (each only to its own site). Returns the path when loaded."""
+    if not path:
+        return None
+    path = os.path.abspath(os.path.expanduser(str(path)))
+    jar = net.load_cookie_file(path) if os.path.exists(path) else None
+    if jar is None:
+        print(f"# cookies file not usable, continuing without it: {path}", file=sys.stderr)
+        return None
+    net.set_cookie_jar(jar)
+    return path
+
+
+def _cookie_dir() -> pathlib.Path:
+    return categorize.config_path().parent / "cookies"
 
 
 def _start_event(url: str, out_path=None, st_path=None) -> dict:
@@ -2066,6 +2092,7 @@ def cmd_page_media(args) -> int:
     if args.user_agent:
         headers["User-Agent"] = args.user_agent
     out = {"url": url, "items": [], "error": None}
+    _use_cookies(getattr(args, "cookies", None))
     try:
         html = _fetch_page(url, headers, proxy)
     except (HttpError, OSError) as err:
@@ -2125,7 +2152,7 @@ def _handoff_path() -> pathlib.Path:
 
 
 def _write_handoff(urls: list[str], referer, destination, titles: dict,
-                   kinds: dict | None = None) -> None:
+                   kinds: dict | None = None, cookies: str | None = None) -> None:
     """Queue a batch for the MediaGrab app (it reads + deletes the file when
     `mediagrab://handoff` opens it).
 
@@ -2158,7 +2185,9 @@ def _write_handoff(urls: list[str], referer, destination, titles: dict,
                       "name": _clean_out_name(titles.get(u_)) or None,
                       # "file" | "stream" | "page" (a page goes through the
                       # app's normal quality-picker flow)
-                      "kind": kind if kind in ("file", "stream", "page") else None})
+                      "kind": kind if kind in ("file", "stream", "page") else None,
+                      # path of a private cookies.txt, never the cookies
+                      "cookies": cookies or None})
     handoff = {"urls": [it["url"] for it in items],
                "referer": referer or None,
                "destination": destination or None,
@@ -2211,6 +2240,11 @@ def cmd_native_host(_args) -> int:
             urls = [str(x) for x in msg.get("urls", [])][:64]
             referer = msg.get("referer")
             sizes: dict[str, int | None] = {}
+            net.set_cookie_jar(None)
+            try:
+                _use_cookies(net.write_cookie_file(msg.get("cookies") or [], _cookie_dir()))
+            except OSError:
+                pass
             for chunk_start in range(0, len(urls), 8):
                 chunk = urls[chunk_start:chunk_start + 8]
                 results: dict[str, int | None] = {}
@@ -2228,6 +2262,7 @@ def cmd_native_host(_args) -> int:
                 for t in ts:
                     t.join()
                 sizes.update(results)
+            net.set_cookie_jar(None)
             write_message({"ok": True, "sizes": sizes})
             continue
         if command == "download":
@@ -2239,6 +2274,13 @@ def cmd_native_host(_args) -> int:
             titles = raw_titles if isinstance(raw_titles, dict) else {}
             raw_kinds = msg.get("kinds")
             kinds = raw_kinds if isinstance(raw_kinds, dict) else {}
+            # the site login the extension read from the browser (only the
+            # cookies the browser itself would send to these urls)
+            cookies_path = None
+            try:
+                cookies_path = net.write_cookie_file(msg.get("cookies") or [], _cookie_dir())
+            except OSError:
+                cookies_path = None
             log_path = categorize.config_path().parent / "native-host.log"
 
             def spawn_all():
@@ -2255,6 +2297,8 @@ def cmd_native_host(_args) -> int:
                     name = _clean_out_name(titles.get(u_))
                     if name:
                         cmd += ["--out-name", name]
+                    if cookies_path:
+                        cmd += ["--cookies", cookies_path]
                     try:
                         log_path.parent.mkdir(parents=True, exist_ok=True)
                         err_sink = open(log_path, "a", encoding="utf-8")
@@ -2277,7 +2321,8 @@ def cmd_native_host(_args) -> int:
             if urls and _cfg().get("open_app", "on") != "off":
                 handed = False
                 try:
-                    _write_handoff(urls, referer, destination, titles, kinds)
+                    _write_handoff(urls, referer, destination, titles, kinds,
+                                   cookies_path)
                     if os.environ.get("MGD_NO_OPEN"):
                         write_message({"ok": True, "handoff": True,
                                        "spawned": len(urls)})
@@ -2497,10 +2542,13 @@ def cmd_resume(args) -> int:
         # resume from the link the user asked for when we know it: signed
         # CDN urls (the redirect target stored as "url") expire
         resume_url = st.get("source_url") or st.get("url", "")
+        net.set_cookie_jar(None)
+        cookies_file = _use_cookies(st.get("cookies"))
         dl = Downloader(resume_url, out_path,
                         proxy=_cfg().get("proxy") or os.environ.get("HTTPS_PROXY"),
                         referer=st.get("referer"),
                         mirror_hosts=_mirror_hosts_for(st.get("url", "")),
+                        cookies_file=cookies_file,
                         resume_state=st_path.read_bytes())
         dl.pid = os.getpid()
         if as_json:

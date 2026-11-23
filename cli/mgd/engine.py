@@ -323,7 +323,8 @@ class Downloader:
                  timeout: float = net.DEFAULT_TIMEOUT,
                  referer: str | None = None,
                  mirror_hosts: list[str] | None = None,
-                 max_speed: int | None = None):
+                 max_speed: int | None = None,
+                 cookies_file: str | None = None):
         self.url = url
         # the link the user asked for; self.url moves to the redirect target
         # once probed (signed CDN urls differ per visit and expire)
@@ -341,6 +342,9 @@ class Downloader:
         self.referer = referer
         # backup cdn mirror hostnames for the site (see _probe_with_retries)
         self.mirror_hosts = list(mirror_hosts or [])
+        # the site login (cookies.txt) this download was started with; the
+        # requests themselves pick cookies from net's jar
+        self.cookies_file = cookies_file
         # traffic shaping (mgd set-default speed-limit / --max-speed)
         self._governor = _SpeedGovernor(own_limit=max_speed)
 
@@ -845,6 +849,7 @@ class Downloader:
                 "pid": getattr(self, "pid", None),
                 "out_path": str(self.out_path),
                 "referer": self.referer,
+                "cookies": self.cookies_file,
                 "segments": [s.to_json() for s in self._segments],
             }), encoding="utf-8")
             os.replace(tmp, path)

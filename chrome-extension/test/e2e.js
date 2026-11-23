@@ -112,6 +112,8 @@ function startSite() {
     const port = server.address().port;
     const html = body => { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end(body); };
     if (url.pathname === "/album") {
+      // the site's login: members-only media needs this cookie
+      res.setHeader("Set-Cookie", "session=letmein; Path=/; HttpOnly");
       // the frame is another origin (localhost vs 127.0.0.1), like embeds
       return html(`<!doctype html><html><head>
 <title>Summer trip 2026 &lt;b&gt;album&lt;/b&gt; | TestTube</title>
@@ -123,6 +125,7 @@ function startSite() {
 </video>
 <script>var flashvars = { video_id: '77', video_title: 'Mountain hike', preview_url: '/poster.png', video_url: 'http://127.0.0.1:${port}/media/hike.mp4', video_url_text: '1080p', video_alt_url: 'http://127.0.0.1:${port}/media/hike_low.mp4', video_alt_url_text: '360p' };</script>
 <a href="/media/song.mp3">soundtrack</a>
+<video src="/members/vip_clip.mp4" title="Members only"></video>
 <a href="/files/big.zip" id="dl">archive</a>
 <a href="/files/tiny.zip" id="dlfast">small archive</a>
 <iframe src="http://localhost:${port}/embed" width="300" height="200"></iframe>
@@ -145,6 +148,10 @@ function startSite() {
       return res.end("#EXTM3U\n#EXT-X-VERSION:3\n");
     }
     if (url.pathname.startsWith("/media/")) return serveBytes(req, res, MEDIA, "video/mp4");
+    if (url.pathname.startsWith("/members/")) {
+      if (!/session=letmein/.test(req.headers.cookie || "")) { res.writeHead(403); return res.end(); }
+      return serveBytes(req, res, MEDIA, "video/mp4");
+    }
     if (url.pathname === "/files/big.zip") {
       // trickled, like a real remote file: still in progress when the
       // extension gets to it
@@ -312,6 +319,8 @@ async function tabIdOf(sw, urlPart) {
           byFile("master.m3u8").on === false && /HLS/.test(byFile("master.m3u8").sub),
           JSON.stringify(byFile("master.m3u8")));
     check("probed sizes are shown (3.1 MB)", /3\.1 MB/.test(byFile("beach_720p").sub), byFile("beach_720p").sub);
+    check("members-only media is sized with the site login",
+          !!byFile("vip_clip") && /3\.1 MB/.test(byFile("vip_clip").sub), JSON.stringify(byFile("vip_clip")));
     check("posters render as thumbnails", byFile("beach_720p").hasImg);
     check("names fall back to the page title, not the url's file name",
           byFile("embedded_clip").title === "Summer trip 2026" &&
@@ -326,7 +335,7 @@ async function tabIdOf(sw, urlPart) {
           injected.imgs === 0 && !injected.pwned && injected.text.includes("img src=x"),
           JSON.stringify(injected));
     const summary = await popup.evaluate(() => document.getElementById("summary").textContent);
-    check("summary counts the selection and its total size", /^6 of 7 selected · \d+\.\d MB$/.test(summary), summary);
+    check("summary counts the selection and its total size", /^7 of 8 selected · \d+\.\d MB$/.test(summary), summary);
     check("popup has no script errors", popup.mgdErrors.length === 0, popup.mgdErrors.join(" | "));
     await shot(popup, "popup-album");
 
@@ -336,13 +345,19 @@ async function tabIdOf(sw, urlPart) {
     await popup.click("#download");
     const handoff = await until(() => readHandoff(sandbox), 10000);
     check("Download hands the ticked items to the app",
-          handoff && handoff.urls.length === 5 && !handoff.urls.some(u => u.includes("song.mp3")) &&
+          handoff && handoff.urls.length === 6 && !handoff.urls.some(u => u.includes("song.mp3")) &&
           !handoff.urls.some(u => u.includes("m3u8")), JSON.stringify(handoff && handoff.urls));
     const beach = handoff && handoff.items.find(i => i.url.includes("beach_720p"));
     check("each item carries referer, kind and a clean suggested name",
           beach && beach.referer === base + "/album" && beach.kind === "file" &&
           !/[\\/:<>]/.test(beach.name) && /beach day 720p$/.test(beach.name),
           JSON.stringify(beach));
+    const vip = handoff && handoff.items.find(i => i.url.includes("vip_clip"));
+    const cookieText = vip && vip.cookies && fs.existsSync(vip.cookies) ? fs.readFileSync(vip.cookies, "utf8") : "";
+    check("the site login goes along as a private cookie file (never inside handoff.json)",
+          /session\tletmein/.test(cookieText) &&
+          (fs.statSync(vip.cookies).mode & 0o777) === 0o600 &&
+          !JSON.stringify(handoff).includes("letmein"), JSON.stringify(vip));
     const btn = await popup.evaluate(() => document.getElementById("download").textContent).catch(() => "closed");
     check("the button confirms the hand-off", btn === "Sent ✓" || btn === "closed", btn);
     await popup.close().catch(() => {});
@@ -356,6 +371,19 @@ async function tabIdOf(sw, urlPart) {
     check("right-click › Download link sends the link with the page as referer",
           menu && menu.ok && h2 && h2.urls[0].endsWith("from_menu.mp4") && h2.items[0].referer === base + "/album",
           JSON.stringify([menu, h2]));
+    clearHandoff(sandbox);
+    await sw.evaluate(() => new Promise(r => chrome.storage.sync.set({ useLogins: false }, r)));
+    await sw.evaluate(async (pageUrl, link) => onMenuClicked(
+      { menuItemId: "mgd-link", linkUrl: link, pageUrl }, { url: pageUrl }),
+      base + "/album", base + "/members/vip_clip.mp4");
+    const noLogin = readHandoff(sandbox);
+    check("with “Use my site logins” off, no cookies are handed over",
+          noLogin && noLogin.items.length === 1 && noLogin.items[0].cookies === null, JSON.stringify(noLogin));
+    await sw.evaluate(() => new Promise(r => chrome.storage.sync.set({ useLogins: true }, r)));
+    clearHandoff(sandbox);
+    await sw.evaluate(async (pageUrl, link) => onMenuClicked(
+      { menuItemId: "mgd-link", linkUrl: link, pageUrl }, { url: pageUrl }),
+      base + "/album", base + "/media/from_menu.mp4");
     const blob = await sw.evaluate(async pageUrl => onMenuClicked(
       { menuItemId: "mgd-media", srcUrl: "blob:https://x/123", pageUrl }, { url: pageUrl }),
       base + "/watch");
@@ -477,7 +505,7 @@ async function tabIdOf(sw, urlPart) {
     }));
     check("without the host: clear status, setup instructions, scan still works, Download disabled",
           /not linked/.test(offline.status) && /Browser Extension/.test(offline.notice) &&
-          offline.items === 7 && offline.dl, JSON.stringify(offline));
+          offline.items === 8 && offline.dl, JSON.stringify(offline));
     await shot(popup, "popup-no-host");
   } catch (err) {
     failures.push("crashed: " + (err && err.stack || err));

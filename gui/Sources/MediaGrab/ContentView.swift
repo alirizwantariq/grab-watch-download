@@ -53,7 +53,8 @@ struct ContentView: View {
         case .quality(let probe):
             QualitySheet(probe: probe,
                          onStart: { quality in
-                             session.begin(url: probe.url, quality: quality, title: probe.title)
+                             session.begin(url: probe.url, quality: quality, title: probe.title,
+                                           cookies: probe.cookies)
                          },
                          onClose: { session.sheet = nil })
         case .rename(let pending):

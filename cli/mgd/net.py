@@ -12,11 +12,15 @@ Supports:
 from __future__ import annotations
 
 import http.client
+import http.cookiejar
+import os
 import random
 import socket
 import ssl
 import struct
+import time
 import urllib.parse as u
+import urllib.request
 
 DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) mgd/1.0"
 DEFAULT_TIMEOUT = 30.0
@@ -325,6 +329,121 @@ def _close_quietly(conn) -> None:
         pass
 
 
+# ── cookies (site logins handed over by the browser extension) ──────────
+# One mgd process = one download, so the jar is process-wide. Every request
+# hop (redirects included) gets only the cookies that belong to its own
+# host/path/scheme, exactly like a browser: a redirect to a CDN on another
+# domain never receives the page's session cookies.
+_COOKIE_JAR: http.cookiejar.CookieJar | None = None
+COOKIE_FILE_MAGIC = "# Netscape HTTP Cookie File"
+
+
+def set_cookie_jar(jar: http.cookiejar.CookieJar | None) -> None:
+    global _COOKIE_JAR
+    _COOKIE_JAR = jar
+
+
+def load_cookie_file(path: str) -> http.cookiejar.CookieJar | None:
+    """Netscape cookies.txt -> jar (session cookies kept); None if unreadable."""
+    # browser rules: a host-only cookie goes to that exact host, never to
+    # its subdomains (Python's default policy is laxer than browsers)
+    policy = http.cookiejar.DefaultCookiePolicy(
+        strict_ns_domain=http.cookiejar.DefaultCookiePolicy.DomainStrictNonDomain)
+    jar = http.cookiejar.MozillaCookieJar(path, policy=policy)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except (OSError, http.cookiejar.LoadError):
+        return None
+    return jar
+
+
+def cookie_header(url: str, jar: http.cookiejar.CookieJar | None = None) -> str | None:
+    """The Cookie header a browser would send to url, from the jar."""
+    jar = jar if jar is not None else _COOKIE_JAR
+    if jar is None:
+        return None
+    req = urllib.request.Request(url)
+    jar.add_cookie_header(req)
+    return req.get_header("Cookie")
+
+
+def _clean_cookie_field(value) -> str | None:
+    text = str(value if value is not None else "")
+    if any(ch in text for ch in "\t\r\n"):
+        return None
+    return text
+
+
+def cookie_file_lines(cookies: list) -> list[str]:
+    """Browser cookies (chrome.cookies.Cookie dicts) -> Netscape lines.
+
+    Session cookies get a one-week expiry so every reader keeps them
+    (Python's jar and yt-dlp both drop expired / zero-expiry entries in
+    some modes). Malformed entries are skipped."""
+    lines = []
+    seen = set()
+    week = int(time.time()) + 7 * 24 * 3600
+    for c in cookies if isinstance(cookies, list) else []:
+        if not isinstance(c, dict):
+            continue
+        name = _clean_cookie_field(c.get("name"))
+        value = _clean_cookie_field(c.get("value"))
+        domain = _clean_cookie_field(c.get("domain"))
+        path = _clean_cookie_field(c.get("path") or "/") or "/"
+        if not name or value is None or not domain:
+            continue
+        host_only = bool(c.get("hostOnly")) and not domain.startswith(".")
+        domain = domain if host_only else "." + domain.lstrip(".")
+        key = (domain.lower(), path, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            expiry = int(float(c.get("expirationDate") or 0))
+        except (TypeError, ValueError):
+            expiry = 0
+        if expiry <= 0:
+            expiry = week
+        lines.append("\t".join([domain, "FALSE" if host_only else "TRUE", path,
+                                 "TRUE" if c.get("secure") else "FALSE",
+                                 str(expiry), name, value]))
+    return lines
+
+
+def write_cookie_file(cookies: list, directory) -> str | None:
+    """Write browser cookies to a private cookies.txt in directory (0600 in
+    a 0700 folder). Identical sets share one file. Files older than two
+    weeks are deleted on the way. Returns the path, None when empty."""
+    import hashlib
+    lines = cookie_file_lines(cookies)
+    if not lines:
+        return None
+    directory = os.fspath(directory)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    cutoff = time.time() - 14 * 24 * 3600
+    for name in os.listdir(directory):
+        full = os.path.join(directory, name)
+        try:
+            if name.endswith(".txt") and os.path.getmtime(full) < cutoff:
+                os.unlink(full)
+        except OSError:
+            pass
+    body = COOKIE_FILE_MAGIC + "\n# written by mgd from the browser extension\n" \
+        + "\n".join(sorted(lines)) + "\n"
+    digest = hashlib.sha256("\n".join(sorted(lines)).encode("utf-8", "surrogatepass")).hexdigest()
+    path = os.path.join(directory, f"{digest[:16]}.txt")
+    tmp = path + f".{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.replace(tmp, path)
+    return path
+
+
 def open_request(url: str, proxy: str | None, method: str = "GET",
                  headers: dict | None = None, timeout: float = DEFAULT_TIMEOUT,
                  range_start: int | None = None, range_end: int | None = None,
@@ -384,6 +503,10 @@ def _open_request_once(url: str, proxy: str | None, method: str = "GET",
             f"{u.unquote(p.username)}:{u.unquote(p.password or '')}".encode()).decode()
     if headers:
         h.update(headers)
+    if "Cookie" not in h:
+        cookie = cookie_header(url)
+        if cookie:
+            h["Cookie"] = cookie
     if range_start is not None:
         if range_end is None:
             h["Range"] = f"bytes={range_start}-"

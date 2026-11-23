@@ -105,6 +105,7 @@ and `cancel` accept the id, the output file path, or the row number.
 | `-r N`    | retry attempts per range (default 8) |
 | `--proxy URL` | `http://h:p`, `https://h:p` (TLS-wrapped) or `socks5://h:p[:user:pass]` |
 | `--sha256 HEX` | verify content integrity after download |
+| `--cookies FILE` | Netscape `cookies.txt` with your site login: sent with page, file and yt-dlp requests, each cookie only to its own site (remembered for resumes) |
 | `--user-agent UA`, `--header K:V` | control request identity |
 | `-q` | quiet progress |
 

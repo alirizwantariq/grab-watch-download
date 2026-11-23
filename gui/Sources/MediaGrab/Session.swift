@@ -12,15 +12,17 @@ final class PendingDownload: ObservableObject, Identifiable {
     let quality: String
     let referer: String?
     let poster: String?
+    let cookies: String?
     @Published var name: String
 
     init(url: String, quality: String, name: String, referer: String? = nil,
-         poster: String? = nil) {
+         poster: String? = nil, cookies: String? = nil) {
         self.url = url
         self.quality = quality
         self.name = name
         self.referer = referer
         self.poster = poster
+        self.cookies = cookies
     }
 }
 
@@ -53,11 +55,13 @@ final class BatchProbe: ObservableObject, Identifiable {
     let id = UUID()
     let url: String
     let items: [BatchItem]
+    let cookies: String?
     @Published var selected: Set<UUID>
 
-    init(url: String, items: [BatchItem]) {
+    init(url: String, items: [BatchItem], cookies: String? = nil) {
         self.url = url
         self.items = items
+        self.cookies = cookies
         selected = Set(items.map(\.id))   // everything ticked by default
     }
 
@@ -107,14 +111,17 @@ final class HandoffItem: ObservableObject, Identifiable {
     let url: String
     let referer: String?
     let kind: String          // file | stream | page
+    /// private cookies.txt with the site login (never the cookies themselves)
+    let cookies: String?
     @Published var name: String
     @Published var included = true
 
-    init(url: String, name: String, referer: String?, kind: String) {
+    init(url: String, name: String, referer: String?, kind: String, cookies: String? = nil) {
         self.url = url
         self.name = name
         self.referer = referer
         self.kind = kind
+        self.cookies = cookies
     }
 }
 
@@ -173,9 +180,11 @@ final class HandoffProbe: ObservableObject, Identifiable {
             let kind = it["kind"] as? String ?? "file"
             let referer = (it["referer"] as? String) ?? sharedReferer
             let name = Naming.suggested(forURL: url, title: it["name"] as? String)
+            let cookies = it["cookies"] as? String
             return HandoffItem(url: url, name: name,
                                referer: referer?.isEmpty == false ? referer : nil,
-                               kind: kind)
+                               kind: kind,
+                               cookies: cookies?.isEmpty == false ? cookies : nil)
         }
         guard !items.isEmpty else { return nil }
         let destination = obj["destination"] as? String
@@ -251,7 +260,7 @@ final class Session: ObservableObject {
     }
 
     /// Any text that should contain a link (field, clipboard, drop).
-    func submit(_ text: String, title: String? = nil) {
+    func submit(_ text: String, title: String? = nil, cookies: String? = nil) {
         guard !probing else {
             store.flash("Still checking the previous link…")
             return
@@ -272,7 +281,7 @@ final class Session: ObservableObject {
         if Naming.isTorrent(link) {
             scanTorrent(link)
         } else {
-            probe(link, title: title)
+            probe(link, title: title, cookies: cookies)
         }
     }
 
@@ -317,7 +326,7 @@ final class Session: ObservableObject {
         // the quality picker shows up
         if incoming.items.count == 1, let only = incoming.items.first, only.kind == "page" {
             if case .handoff = sheet {} else {
-                submit(only.url, title: only.name)
+                submit(only.url, title: only.name, cookies: only.cookies)
                 return
             }
         }
@@ -342,10 +351,12 @@ final class Session: ObservableObject {
     func startHandoff(_ probe: HandoffProbe) {
         let chosen = probe.chosen
         for item in chosen.reversed() {
-            store.start(DownloadRequest(url: item.url, title: item.name,
-                                        referer: item.referer,
-                                        destination: destination,
-                                        outName: item.name))
+            var request = DownloadRequest(url: item.url, title: item.name,
+                                          referer: item.referer,
+                                          destination: destination,
+                                          outName: item.name)
+            request.cookies = item.cookies
+            store.start(request)
         }
         sheet = nil
         store.flash("Added \(chosen.count) download\(chosen.count == 1 ? "" : "s")")
@@ -353,23 +364,25 @@ final class Session: ObservableObject {
 
     // MARK: link → download
 
-    private func probe(_ url: String, title: String?) {
+    private func probe(_ url: String, title: String?, cookies: String? = nil) {
         probing = true
         probingLabel = "Checking the link…"
         Task {
-            let answer = await Engine.runJSON(["qualities", url])
+            let answer = await Engine.runJSON(["qualities", url] + cookieArgs(cookies))
             await MainActor.run {
                 self.probing = false
-                let result = QualityProbe.parse(url: url, answer)
+                var result = QualityProbe.parse(url: url, answer)
+                result.cookies = cookies
                 if result.options.count > 1 {
                     self.sheet = .quality(result)
                 } else if result.error != nil, result.options.isEmpty,
                           result.source != "direct" {
                     self.sheet = .quality(result)     // explains + "try anyway"
                 } else if Self.isPlatform(url) {
-                    self.begin(url: url, quality: "auto", title: result.title ?? title)
+                    self.begin(url: url, quality: "auto", title: result.title ?? title,
+                               cookies: cookies)
                 } else {
-                    self.scanPage(url, title: title)
+                    self.scanPage(url, title: title, cookies: cookies)
                 }
             }
         }
@@ -377,25 +390,26 @@ final class Session: ObservableObject {
 
     /// Pages with several videos (albums, galleries) open a picker; a page
     /// with one video goes straight to the name sheet.
-    private func scanPage(_ url: String, title: String?) {
+    private func scanPage(_ url: String, title: String?, cookies: String? = nil) {
         probing = true
         probingLabel = "Looking for media on the page…"
         Task {
-            let answer = await Engine.runJSON(["page-media", url])
+            let answer = await Engine.runJSON(["page-media", url] + cookieArgs(cookies))
             await MainActor.run {
                 self.probing = false
                 let raw = answer?["items"] as? [[String: Any]] ?? []
                 let items = raw.compactMap { BatchItem(dict: $0) }
                 if items.count > 1 {
-                    self.sheet = .batch(BatchProbe(url: url, items: items))
+                    self.sheet = .batch(BatchProbe(url: url, items: items, cookies: cookies))
                 } else if let item = items.first, item.url != url {
                     self.begin(url: item.url, quality: "auto",
                                title: title ?? (item.title.isEmpty ? nil : item.title),
                                referer: url,
-                               poster: item.poster.isEmpty ? nil : item.poster)
+                               poster: item.poster.isEmpty ? nil : item.poster,
+                               cookies: cookies)
                 } else {
                     // a plain file, or a page the engine resolves itself
-                    self.begin(url: url, quality: "auto", title: title)
+                    self.begin(url: url, quality: "auto", title: title, cookies: cookies)
                 }
             }
         }
@@ -433,16 +447,18 @@ final class Session: ObservableObject {
     /// Last step before a download exists: confirm the name (unless the
     /// user turned that off).
     func begin(url: String, quality: String, title: String? = nil,
-               referer: String? = nil, poster: String? = nil) {
+               referer: String? = nil, poster: String? = nil, cookies: String? = nil) {
         let name = Naming.suggested(forURL: url, title: title)
         if store.askBeforeDownload {
             sheet = .rename(PendingDownload(url: url, quality: quality, name: name,
-                                            referer: referer, poster: poster))
+                                            referer: referer, poster: poster, cookies: cookies))
         } else {
-            store.start(DownloadRequest(url: url, title: name, quality: quality,
-                                        referer: referer, destination: destination,
-                                        outName: title == nil ? nil : name,
-                                        poster: poster))
+            var request = DownloadRequest(url: url, title: name, quality: quality,
+                                          referer: referer, destination: destination,
+                                          outName: title == nil ? nil : name,
+                                          poster: poster)
+            request.cookies = cookies
+            store.start(request)
             store.flash("Added: \(name)")
         }
     }
@@ -450,9 +466,11 @@ final class Session: ObservableObject {
     func confirmRename(_ pending: PendingDownload) {
         let name = Naming.sanitize(pending.name)
         guard Naming.isValid(name) else { return }
-        store.start(DownloadRequest(url: pending.url, title: name, quality: pending.quality,
-                                    referer: pending.referer, destination: destination,
-                                    outName: name, poster: pending.poster))
+        var request = DownloadRequest(url: pending.url, title: name, quality: pending.quality,
+                                      referer: pending.referer, destination: destination,
+                                      outName: name, poster: pending.poster)
+        request.cookies = pending.cookies
+        store.start(request)
         sheet = nil
     }
 
@@ -460,10 +478,12 @@ final class Session: ObservableObject {
         let chosen = batch.chosen
         for item in chosen.reversed() {
             let title = item.title.isEmpty ? Naming.suggested(forURL: item.url) : item.title
-            store.start(DownloadRequest(url: item.url, title: title,
-                                        referer: batch.url, destination: destination,
-                                        outName: item.title.isEmpty ? nil : item.title,
-                                        poster: item.poster.isEmpty ? nil : item.poster))
+            var request = DownloadRequest(url: item.url, title: title,
+                                          referer: batch.url, destination: destination,
+                                          outName: item.title.isEmpty ? nil : item.title,
+                                          poster: item.poster.isEmpty ? nil : item.poster)
+            request.cookies = batch.cookies
+            store.start(request)
         }
         sheet = nil
         store.flash("Added \(chosen.count) download\(chosen.count == 1 ? "" : "s")")

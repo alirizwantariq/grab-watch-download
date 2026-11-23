@@ -379,6 +379,12 @@ struct HandoffRow: View {
                             .padding(.horizontal, 4).padding(.vertical, 1)
                             .background(Capsule().fill(Color.purple.opacity(0.25)))
                     }
+                    if item.cookies != nil {
+                        Image(systemName: "person.badge.key")
+                            .font(.caption2).foregroundColor(.secondary)
+                            .help("Uses your login for this site (from the browser)")
+                            .accessibilityLabel("Uses your site login")
+                    }
                     Text(item.url)
                         .font(.caption2).foregroundColor(.secondary)
                         .lineLimit(1).truncationMode(.middle)

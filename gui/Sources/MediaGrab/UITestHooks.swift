@@ -143,7 +143,7 @@ enum UITestHooks {
             case .torrent(let probe): session.startTorrent(probe)
             case .quality(let probe):
                 session.begin(url: probe.url, quality: probe.options.first?.quality ?? "auto",
-                              title: probe.title)
+                              title: probe.title, cookies: probe.cookies)
             default: break
             }
         case "rename":

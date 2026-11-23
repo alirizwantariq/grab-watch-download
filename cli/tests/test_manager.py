@@ -655,9 +655,9 @@ def test_handoff_keeps_names_and_merges_quick_batches(tmp_path):
     assert handoff["urls"] == ["https://cdn.a/v/1.mp4?sig=x", "https://cdn.b/v/2.mp4"]
     assert handoff["items"] == [
         {"url": "https://cdn.a/v/1.mp4?sig=x", "referer": "https://a.example/page",
-         "name": "Holiday - part 1", "kind": "file"},
+         "name": "Holiday - part 1", "kind": "file", "cookies": None},
         {"url": "https://cdn.b/v/2.mp4", "referer": "https://b.example/other",
-         "name": None, "kind": None}]
+         "name": None, "kind": None, "cookies": None}]
 
 
 def test_native_host_query_lists_ids(tmp_path):
@@ -695,3 +695,215 @@ def test_defaults_and_doctor_json(tmp_path):
     doc = json.loads(_mgd(tmp_path, ["doctor", "--json"]).stdout)
     assert set(doc["tools"]) == {"yt-dlp", "ffmpeg", "aria2c", "webtorrent"}
     assert doc["unfinished"] == 0 and doc["root"] == str(tmp_path / "root")
+
+
+# ── site logins (cookies handed over by the browser extension) ───────────
+
+class _GatedSite:
+    """Media that needs the login cookie `session=letmein`, a page with a
+    video, and a redirect to the same server under another host name
+    (localhost vs 127.0.0.1) that records the cookies it receives."""
+
+    def __init__(self, content: bytes, delay: float = 0.0):
+        self.content = content
+        self.seen: dict[str, list[str]] = {}
+        site = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _send(self, status, body=b"", ctype="application/octet-stream", extra=None):
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    try:
+                        for i in range(0, len(body), 64 * 1024):
+                            self.wfile.write(body[i:i + 64 * 1024])
+                            if delay:
+                                self.wfile.flush()
+                                time.sleep(delay)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+            def do_GET(self):
+                host = self.headers.get("Host", "").split(":")[0]
+                cookie = self.headers.get("Cookie") or ""
+                site.seen.setdefault(f"{host}{self.path.split('?')[0]}", []).append(cookie)
+                logged_in = "session=letmein" in cookie
+                if self.path.startswith("/to-cdn"):
+                    port = self.server.server_address[1]
+                    return self._send(302, extra={"Location": f"http://localhost:{port}/cdn/clip.mp4"})
+                if self.path.startswith("/cdn/"):
+                    return self._serve_file()
+                if not logged_in:
+                    return self._send(403)
+                if self.path.startswith("/members/page"):
+                    return self._send(200, b'<html><body><video src="/members/clip.mp4"></video></body></html>',
+                                      "text/html")
+                return self._serve_file()
+
+            def _serve_file(self):
+                body = site.content
+                rng = self.headers.get("Range", "")
+                if rng.startswith("bytes="):
+                    first, _, last = rng[6:].partition("-")
+                    first = int(first)
+                    last = int(last) if last else len(body) - 1
+                    return self._send(206, body[first:last + 1],
+                                      extra={"Content-Range": f"bytes {first}-{last}/{len(body)}",
+                                             "Accept-Ranges": "bytes"})
+                return self._send(200, body, extra={"Accept-Ranges": "bytes"})
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+BROWSER_COOKIES = [   # what chrome.cookies.getAll returns, trimmed
+    {"name": "session", "value": "letmein", "domain": "127.0.0.1", "hostOnly": True,
+     "path": "/", "secure": False, "httpOnly": True, "session": True},
+    {"name": "theme", "value": "dark", "domain": "127.0.0.1", "hostOnly": True,
+     "path": "/", "secure": False, "expirationDate": 4102444800.5},
+    {"name": "elsewhere", "value": "nope", "domain": ".other.example", "hostOnly": False,
+     "path": "/"},
+]
+
+
+def _cookie_file(tmp_path) -> str:
+    from mgd import net
+    return net.write_cookie_file(BROWSER_COOKIES, tmp_path / "cookies")
+
+
+def test_cookie_file_is_private_and_reused(tmp_path):
+    first = _cookie_file(tmp_path)
+    again = _cookie_file(tmp_path)
+    assert first == again                                    # same login, one file
+    assert stat.S_IMODE(os.stat(first).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(os.path.dirname(first)).st_mode) == 0o700
+    text = pathlib.Path(first).read_text()
+    assert text.startswith("# Netscape HTTP Cookie File")
+    assert "session\tletmein" in text and "\t4102444800\ttheme\tdark" in text
+    old = pathlib.Path(first).with_name("0000000000000000.txt")
+    old.write_text("# Netscape HTTP Cookie File\n")
+    two_weeks = time.time() - 15 * 24 * 3600
+    os.utime(old, (two_weeks, two_weeks))
+    _cookie_file(tmp_path)
+    assert not old.exists(), "stale cookie files must be cleaned up"
+
+
+def test_gated_file_downloads_with_the_login_and_only_with_it(tmp_path):
+    content = b"members only " * 40000
+    site = _GatedSite(content)
+    try:
+        url = site.base + "/members/clip.mp4"
+        denied = _mgd(tmp_path, ["grab", url, "-d", str(tmp_path / "a"), "-q"])
+        assert denied.returncode != 0 and not (tmp_path / "a" / "clip.mp4").exists()
+        ok = _mgd(tmp_path, ["grab", url, "-d", str(tmp_path / "b"), "-q",
+                             "--cookies", _cookie_file(tmp_path)])
+        assert ok.returncode == 0, ok.stdout + ok.stderr
+        assert (tmp_path / "b" / "clip.mp4").read_bytes() == content
+        sent = site.seen["127.0.0.1/members/clip.mp4"][-1]
+        assert "session=letmein" in sent and "theme=dark" in sent
+        assert "elsewhere" not in sent, "a cookie for another site was sent"
+    finally:
+        site.stop()
+
+
+def test_login_cookies_do_not_follow_a_redirect_to_another_site(tmp_path):
+    content = b"cdn bytes " * 30000
+    site = _GatedSite(content)
+    try:
+        out = _mgd(tmp_path, ["grab", site.base + "/to-cdn/clip.mp4", "-d", str(tmp_path / "o"),
+                              "-q", "--cookies", _cookie_file(tmp_path)])
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert (tmp_path / "o" / "clip.mp4").read_bytes() == content
+        assert all("session" not in c for c in site.seen["localhost/cdn/clip.mp4"]), site.seen
+        assert any("session=letmein" in c for c in site.seen["127.0.0.1/to-cdn/clip.mp4"])
+    finally:
+        site.stop()
+
+
+def test_gated_page_is_scanned_with_the_login(tmp_path):
+    site = _GatedSite(b"v" * 300000)
+    try:
+        page = site.base + "/members/page"
+        without = json.loads(_mgd(tmp_path, ["page-media", page]).stdout)
+        assert without["error"] and not without["items"]
+        found = json.loads(_mgd(tmp_path, ["page-media", page,
+                                           "--cookies", _cookie_file(tmp_path)]).stdout)
+        assert [i["url"] for i in found["items"]] == [site.base + "/members/clip.mp4"]
+        assert found["items"][0]["size"] == 300000         # sized with the login too
+    finally:
+        site.stop()
+
+
+def test_paused_gated_download_resumes_with_its_login(tmp_path):
+    content = bytes(range(256)) * 12000                  # ~3 MB, trickled
+    site = _GatedSite(content, delay=0.2)
+    root = tmp_path / "root"
+    proc = subprocess.Popen([sys.executable, "bin/mgd", "grab", site.base + "/members/slow.bin",
+                             "-d", str(root), "-c", "1", "-q", "--cookies", _cookie_file(tmp_path)],
+                            cwd=str(CLI_DIR), env=_env(tmp_path),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(2.5)
+        item = _items(tmp_path)[0]
+        _mgd(tmp_path, ["pause", item["id"]])
+        proc.wait(timeout=20)
+        state = json.loads((root / "slow.bin.mgdstate").read_text())
+        assert state["cookies"] and os.path.exists(state["cookies"])
+        out = _mgd(tmp_path, ["resume", item["id"]], timeout=120)
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert (root / "slow.bin").read_bytes() == content
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        site.stop()
+
+
+def test_extension_hands_over_the_login_with_the_download(tmp_path):
+    content = b"from the browser " * 20000
+    site = _GatedSite(content)
+    try:
+        url = site.base + "/members/clip.mp4"
+        # probe: the popup's sizes need the login as well
+        (reply,) = _host(tmp_path, {"command": "probe", "urls": [url], "cookies": BROWSER_COOKIES})
+        assert reply["sizes"][url] == len(content)
+        (reply,) = _host(tmp_path, {"command": "probe", "urls": [url]})
+        assert reply["sizes"][url] is None
+        # hand-off to the app: a path to a private cookie file, not the cookies
+        (reply,) = _host(tmp_path, {"command": "download", "urls": [url],
+                                    "referer": site.base + "/members/page",
+                                    "cookies": BROWSER_COOKIES})
+        assert reply["handoff"] is True
+        raw = (tmp_path / "cfg" / "mgd" / "handoff.json").read_text()
+        assert "letmein" not in raw, "cookie values must not sit in handoff.json"
+        item = json.loads(raw)["items"][0]
+        assert stat.S_IMODE(os.stat(item["cookies"]).st_mode) == 0o600
+        assert "letmein" in pathlib.Path(item["cookies"]).read_text()
+        # headless mode: the spawned download uses the login
+        cfg = tmp_path / "cfg" / "mgd" / "config.json"
+        cfg.write_text(json.dumps({"open_app": "off"}))
+        (reply,) = _host(tmp_path, {"command": "download", "urls": [url],
+                                    "destination": str(tmp_path / "h"),
+                                    "cookies": BROWSER_COOKIES})
+        assert reply == {"ok": True, "spawned": 1}
+        target = tmp_path / "h" / "clip.mp4"
+        deadline = time.time() + 30
+        while time.time() < deadline and not (target.exists() and target.stat().st_size == len(content)):
+            time.sleep(0.3)
+        assert target.read_bytes() == content
+    finally:
+        site.stop()

@@ -68,6 +68,14 @@ class Site(http.server.BaseHTTPRequestHandler):
             vids = "".join(f'<video><source src="/fast/album_{i}_720p.mp4"></video>'
                            for i in range(1, 5))
             return self._html(f"<html><head><title>Album</title></head><body>{vids}</body></html>")
+        logged_in = "session=letmein" in (self.headers.get("Cookie") or "")
+        if path.startswith("/members/"):
+            if not logged_in:
+                return self._empty(403)
+            if path == "/members/page":
+                return self._html('<html><head><title>Members page</title></head><body>'
+                                  '<video src="/members/page_clip.mp4"></video></body></html>')
+            path = "/fast/" + path.rsplit("/", 1)[-1]
         parts = path.strip("/").split("/")
         rate = None
         if parts[0] == "slow" and len(parts) == 3:
@@ -274,6 +282,33 @@ def flow_browser_handoff(run: Run, base: str):
     assert not (run.box / "cfg" / "mgd" / "handoff.json").exists(), "hand-off must be consumed"
 
 
+BROWSER_COOKIES = [{"name": "session", "value": "letmein", "domain": "127.0.0.1",
+                    "hostOnly": True, "path": "/", "secure": False, "session": True}]
+
+
+def flow_site_login(run: Run, base: str):
+    """Members-only media sent from the browser downloads with the user's
+    login - a file, and a page the app scans itself."""
+    clip = f"{base}/members/vip_clip.mp4"
+    assert _host(run, {"command": "download", "urls": [clip], "referer": f"{base}/members/page",
+                       "titles": {clip: "VIP clip"}, "kinds": {clip: "file"},
+                       "cookies": BROWSER_COOKIES})["handoff"]
+    run.play([["handoff"], ["waitsheet", "handoff", 10], ["snap", "sheet"], ["confirm"],
+              ["waitphase", "VIP clip", "done", 30], ["wait", 0.5], ["quit"]])
+    page = f"{base}/members/page"
+    assert _host(run, {"command": "download", "urls": [page], "titles": {page: "Members page"},
+                       "kinds": {page: "page"}, "cookies": BROWSER_COOKIES})["handoff"]
+    run.play([["ask", "off"], ["handoff"], ["waitphase", "Members page", "done", 30],
+              ["wait", 0.5], ["dump", "done"], ["quit"]])
+    done = run.jobs("done")
+    assert done["VIP clip"]["phase"] == "done" and done["Members page"]["phase"] == "done", done
+    assert all("--cookies" in j["args"] for j in done.values())
+    assert run.files() == ["video/Members page.mp4", "video/VIP clip.mp4"], run.files()
+    assert pathlib.Path(done["VIP clip"]["finishedPath"]).read_bytes() == blob("vip_clip.mp4", FAST_SIZE)
+    history = (run.box / "data" / "history.json").read_text()
+    assert "letmein" not in history, "cookie values must never reach the history file"
+
+
 def flow_failure_and_retry(run: Run, base: str):
     """A dead link fails with a readable reason and can be tried again."""
     run.play([["ask", "off"], ["submit", f"{base}/gone/missing.mp4"],
@@ -351,7 +386,7 @@ def flow_snapshots(run: Run, base: str):
 
 
 FLOWS = [flow_name_pause_resume, flow_queue, flow_cancel, flow_adopt_external,
-         flow_browser_handoff, flow_failure_and_retry, flow_pages, flow_relaunch,
+         flow_browser_handoff, flow_site_login, flow_failure_and_retry, flow_pages, flow_relaunch,
          flow_snapshots]
 
 

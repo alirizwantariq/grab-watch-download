@@ -408,8 +408,12 @@ $("download").addEventListener("click", downloadSelected);
 $("sendPage").addEventListener("click", sendPage);
 $("openApp").addEventListener("click", () => native({ command: "open" }));
 
-chrome.storage.sync.get({ intercept: false }, v => {
+chrome.storage.sync.get({ intercept: false, useLogins: true }, v => {
   $("intercept").checked = !!(v && v.intercept);
+  $("useLogins").checked = !(v && v.useLogins === false);
+});
+$("useLogins").addEventListener("change", e => {
+  chrome.storage.sync.set({ useLogins: e.target.checked });
 });
 chrome.storage.local.get({ dest: "" }, v => {
   if (v && v.dest) { $("dest").value = v.dest; $("destBox").open = true; }

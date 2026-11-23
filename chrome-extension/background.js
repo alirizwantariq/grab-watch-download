@@ -14,7 +14,7 @@
 
 const HOST = "com.alirizwantariq.mediagrab";
 
-function native(payload) {
+function sendNative(payload) {
   return new Promise(resolve => {
     try {
       chrome.runtime.sendNativeMessage(HOST, payload, resp => {
@@ -29,6 +29,57 @@ function native(payload) {
 
 function isHttp(url) {
   return typeof url === "string" && /^https?:\/\//i.test(url);
+}
+
+// ── site logins ────────────────────────────────────────────────────────────
+// Downloads that need the user to be signed in (members-only videos, CDNs
+// that check a session) work when the cookies the browser itself would send
+// to those urls go along. Only cookies for the download urls and the page
+// they came from are read; MediaGrab sends each one only to its own site.
+// Switchable in the popup ("Use my site logins").
+
+function loginsEnabled() {
+  return new Promise(resolve => {
+    chrome.storage.sync.get({ useLogins: true }, v => resolve(!(v && v.useLogins === false)));
+  });
+}
+
+function cookiesFor(url) {
+  return new Promise(resolve => {
+    try {
+      chrome.cookies.getAll({ url }, list => {
+        void chrome.runtime.lastError;
+        resolve(Array.isArray(list) ? list : []);
+      });
+    } catch (e) { resolve([]); }
+  });
+}
+
+async function siteLogins(payload) {
+  const urls = [...new Set([...(payload.urls || []), payload.referer].filter(isHttp))].slice(0, 40);
+  const seen = new Set();
+  const out = [];
+  for (const list of await Promise.all(urls.map(cookiesFor))) {
+    for (const c of list) {
+      const key = `${c.domain}|${c.path}|${c.name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name: c.name, value: c.value, domain: c.domain, hostOnly: c.hostOnly,
+                 path: c.path, secure: c.secure, httpOnly: c.httpOnly,
+                 session: c.session, expirationDate: c.expirationDate });
+      if (out.length >= 400) return out;
+    }
+  }
+  return out;
+}
+
+async function native(payload) {
+  if (payload && (payload.command === "download" || payload.command === "probe") &&
+      await loginsEnabled()) {
+    const cookies = await siteLogins(payload);
+    if (cookies.length) payload = Object.assign({}, payload, { cookies });
+  }
+  return sendNative(payload);
 }
 
 // ── context menus ──────────────────────────────────────────────────────────
