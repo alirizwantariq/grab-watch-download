@@ -78,15 +78,32 @@ def load_config() -> dict:
     return cfg
 
 
+def atomic_write_text(path: pathlib.Path, text: str) -> None:
+    """Write-then-rename so a concurrent reader (mgd list, the GUI poll, a
+    second download) never sees a half-written file."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def save_config(cfg: dict) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(path, json.dumps(cfg, indent=2) + "\n")
 
 
 def default_root(cfg: dict) -> pathlib.Path:
-    root = cfg.get("root") or "~/Downloads/mgd"
-    path = pathlib.Path(os.path.expanduser(root))
+    # MGD_ROOT wins over the config: tests and sandboxed runs point it at a
+    # scratch dir so they can never see (or touch) the real download folder
+    root = os.environ.get("MGD_ROOT") or cfg.get("root") or "~/Downloads/mgd"
+    path = pathlib.Path(os.path.abspath(os.path.expanduser(root)))
     path.mkdir(parents=True, exist_ok=True)
     return path
 

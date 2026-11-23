@@ -5,11 +5,41 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import http.server
 import os
+import pathlib
 import socket
 import socketserver
 import threading
 import urllib.parse as u
+
+
+# ── isolation ────────────────────────────────────────────────────────────
+# Tests must never see (or touch) the user's real mgd data. Before this
+# sandbox existed, `mgd pause 1` / `mgd cancel 1` in a test could hit a real
+# download in ~/Downloads/mgd, tests appended to the real journal and
+# native-host.log, and handoffs could pop the real app open.
+# Everything spawned from the tests inherits these variables.
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+
+SANDBOX = pathlib.Path(os.path.realpath(_tempfile.mkdtemp(prefix="mgd-test-sandbox-")))
+os.environ["XDG_CONFIG_HOME"] = str(SANDBOX / "config")
+os.environ["MGD_ROOT"] = str(SANDBOX / "downloads")
+os.environ["MGD_NO_OPEN"] = "1"
+_atexit.register(_shutil.rmtree, SANDBOX, ignore_errors=True)
+
+
+def assert_sandboxed() -> None:
+    """Fail loudly if the engine would resolve anything outside the sandbox."""
+    from mgd import categorize
+    root = os.path.realpath(str(categorize.default_root({})))
+    cfg = os.path.realpath(str(categorize.config_path()))
+    for path in (root, cfg):
+        if not path.startswith(str(SANDBOX) + os.sep):
+            raise RuntimeError(f"test sandbox leak: {path} is outside {SANDBOX}")
+
 
 
 class RangeOriginHandler:

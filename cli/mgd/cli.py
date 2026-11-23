@@ -106,7 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
                                          *categorize.CATEGORIES])
     sp.add_argument("value", help="path (or browser name for cookies-browser)")
 
-    sub.add_parser("defaults", aliases=["config"], help="show defaults + config")
+    df = sub.add_parser("defaults", aliases=["config"], help="show defaults + config")
+    df.add_argument("--json", action="store_true", dest="as_json",
+                    help="machine-readable settings (used by the GUI)")
 
     lj = sub.add_parser("list", aliases=["jobs", "ls"],
                         help="list unfinished downloads with [running]/[paused] state")
@@ -121,7 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
     cx = sub.add_parser("cancel", aliases=["rm", "del"],
                         help="cancel a download and delete its partial data")
     cx.add_argument("target")
-    sub.add_parser("doctor", help="show engines, config and readiness")
+    dr = sub.add_parser("doctor", help="show engines, config and readiness")
+    dr.add_argument("--json", action="store_true", dest="as_json",
+                    help="machine-readable readiness report (used by the GUI)")
     ql = sub.add_parser("qualities", aliases=["formats"],
                         help="list downloadable qualities/resolutions for a "
                              "URL (JSON; used by the GUI and scripts)")
@@ -302,10 +306,11 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
         # user rename (GUI sheet): keep the bridge extension when omitted
         out_name = getattr(args, "out_name", None)
         if out_name:
-            base = str(out_name).strip().lstrip("/")
-            if "." not in pathlib.PurePosixPath(base).name:
-                base += pathlib.PurePosixPath(local_name).suffix
-            local_name = base
+            base = _clean_out_name(out_name)
+            bridge_ext = pathlib.PurePosixPath(local_name).suffix
+            if base and not _typed_extension(base, bridge_ext):
+                base += bridge_ext
+            local_name = base or local_name
         print(_arrow(f"{st.get('title') or url} [{chosen.get('label', 'best')}]"))
     except RuntimeError as err:
         print(f"error: {err}", file=sys.stderr)
@@ -314,11 +319,11 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
         return 1
     category = "audio" if type_ext == ".mp3" else (args.filetype or "video")
     if args.out:
-        out_path = pathlib.Path(os.path.expanduser(args.out))
+        out_path = pathlib.Path(os.path.abspath(os.path.expanduser(args.out)))
         out_path.parent.mkdir(parents=True, exist_ok=True)
     else:
-        out_dir = pathlib.Path(os.path.expanduser(args.dir)) if args.dir \
-            else categorize.category_dir(cfg, category)
+        out_dir = pathlib.Path(os.path.abspath(os.path.expanduser(args.dir))) \
+            if args.dir else categorize.category_dir(cfg, category)
         from .engine import _url_filename
         out_path = categorize.claim_unique_path(
             out_dir, local_name or _url_filename(dl_url))
@@ -329,7 +334,7 @@ def _grab_via_xd(args, cfg: dict, url: str) -> int:
     dl.pid = os.getpid()
     as_json = getattr(args, "json_progress", False)
     if as_json:
-        print(json.dumps({"type": "start", "url": url}), flush=True)
+        print(json.dumps(_start_event(url, out_path)), flush=True)
 
     def _cb(done: int, total: int | None, _json: bool = as_json) -> None:
         if _json:
@@ -393,16 +398,34 @@ def _ytdlp_progress_event(line: str) -> dict | None:
     return {"type": "progress", "done": done, "total": total}
 
 
+def _stop_child(proc) -> None:
+    """Stop a helper process (yt-dlp/aria2c) and wait for it: SIGTERM lets
+    it close its partial files cleanly, SIGKILL if it will not go."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _run_ytdlp_strategy(ytdlp: str, name: str, cmd: list[str],
                         json_progress: bool = False) -> int:
-    print(f"# yt-dlp strategy: {name}")
+    print(f"# yt-dlp strategy: {name}", flush=True)
+    proc = None
     try:
         if not json_progress:
-            return subprocess.run(cmd).returncode
+            proc = subprocess.Popen(cmd)
+            return proc.wait()
         # GUI mode: stream yt-dlp output, translating the MGD progress
         # template into NDJSON events and capturing the final file path.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True,
-                                bufsize=1)
+                                bufsize=1, encoding="utf-8", errors="replace")
         final_path: str | None = None
         for raw in proc.stdout:
             line = raw.rstrip("\n")
@@ -417,9 +440,20 @@ def _run_ytdlp_strategy(ytdlp: str, name: str, cmd: list[str],
             print(line, flush=True)
         code = proc.wait()
         if code == 0 and final_path:
-            print(json.dumps({"type": "done", "path": final_path}), flush=True)
+            size = None
+            try:
+                size = os.path.getsize(final_path)
+            except OSError:
+                pass
+            print(json.dumps({"type": "done", "path": final_path,
+                              "size": size}), flush=True)
         return code
     except KeyboardInterrupt:
+        # pause/cancel from the GUI arrives as SIGTERM to mgd only: yt-dlp
+        # would keep downloading in the background unless stopped here
+        _stop_child(proc)
+        if json_progress:
+            print(json.dumps({"type": "paused"}), flush=True)
         print("\nstopped (yt-dlp partials resume on rerun)", file=sys.stderr)
         return 130
 
@@ -647,10 +681,16 @@ def _probe_ytdlp_info(ytdlp: str, strategies: list[tuple[str, list[str]]],
     return None, None
 
 
-def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
+def _grab_platform(args, cfg: dict, url: str | None = None,
+                   quick: bool = False, report: bool = True) -> int:
     """YouTube/X/Twitter URLs: resolve via yt-dlp's upstream extractors with a
     strategy chain (plain -> impersonate -> browser cookies), then download
-    with an interactive quality menu (or --quality)."""
+    with an interactive quality menu (or --quality).
+
+    quick=True is for ordinary pages and plain stream links (not a login
+    platform): only the two cookie-less strategies run, so an unsupported
+    page fails in a couple of seconds instead of walking every browser's
+    cookie store. report=False leaves the failure message to the caller."""
     url = url or args.url
     ytdlp = shutil.which("yt-dlp")
     if not ytdlp:
@@ -721,16 +761,23 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
     # ── destination ───────────────────────────────────────────────────────
     audio_only = bool(selector == "ba/bestaudio" or quality_extra)
     dest_args = []
-    out_name = getattr(args, "out_name", None)
+    out_name = _clean_out_name(getattr(args, "out_name", None))
     if out_name and not args.out:
-        # user rename (GUI sheet): name template inside the category dir
-        base = str(out_name).strip().lstrip("/")
-        if "." not in pathlib.PurePosixPath(base).name:
-            base += ".%(ext)s"
-        d = (os.path.expanduser(args.dir) if args.dir
-             else str(categorize.category_dir(cfg, args.filetype or "video")))
+        # user rename (GUI sheet): name template inside the category dir.
+        # yt-dlp decides the container, so a typed media extension is
+        # dropped in favour of %(ext)s ("clip.mp4" never ends up holding
+        # webm data); literal % must be doubled inside an output template
+        base = out_name
+        ext = _typed_extension(base)
+        if ext and categorize.EXT_MAP.get(ext) in ("video", "audio", "playlist"):
+            # includes ".m3u8"/".mpd": the suggested name of a stream link
+            base = base[:-(len(ext) + 1)].rstrip() or base
+        base = base.replace("%", "%%") + ".%(ext)s"
+        default_cat = "audio" if audio_only else (args.filetype or "video")
+        d = (os.path.abspath(os.path.expanduser(args.dir)) if args.dir
+             else str(categorize.category_dir(cfg, default_cat)))
         pathlib.Path(d).mkdir(parents=True, exist_ok=True)
-        dest_args = ["-o", os.path.join(d, base)]
+        dest_args = ["-o", os.path.join(d.replace("%", "%%"), base)]
     elif args.out:
         o = args.out
         if pathlib.Path(o).suffix and "%(ext)s" not in o:
@@ -760,15 +807,34 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
     if url.startswith(("https://x.com", "https://twitter.com", "https://www.x.com",
                        "https://www.twitter.com")) and not explicit_cookies:
         max_strategies = 2
+    if quick:
+        max_strategies = min(max_strategies, 3 if explicit_cookies else 2)
+    referer_args = []
+    if getattr(args, "referer", None) and args.referer != url:
+        referer_args = ["--add-headers", f"Referer:{args.referer}"]
+    # Among formats of the chosen resolution, prefer H.264 video + AAC audio:
+    # that pair lands in an .mp4 every player opens (QuickTime and Quick
+    # Look cannot play the VP9/Opus .webm yt-dlp would otherwise favour).
+    # Resolution and frame rate still come first, so 4K stays 4K.
+    sort_args: list[str] = []
+    by_ids = bool(selector) and "height<=" not in selector and selector != "ba/bestaudio"
+    if not audio_only and not by_ids:
+        sort_args = ["-S", "res,fps,vcodec:h264,acodec:m4a"]
+    if getattr(args, "json_progress", False):
+        print(json.dumps({"type": "start", "url": url, "engine": "yt-dlp"}),
+              flush=True)
     for name, base in strategies[:max_strategies]:
-        cmd = [ytdlp, *base, *base_flags, *dl_flags, *dest_args, *proxy_args]
+        cmd = [ytdlp, *base, *base_flags, *dl_flags, *dest_args, *proxy_args,
+               *referer_args, *sort_args]
         if selector:
             cmd += ["-f", selector]
-        cmd += [*quality_extra, url]
+        cmd += [*quality_extra, "--", url]
         code = _run_ytdlp_strategy(ytdlp, name, cmd,
                                    json_progress=getattr(args, "json_progress", False))
         if code == 0:
             return 0
+        if code in (130, -signal.SIGTERM, -signal.SIGINT):
+            return 130          # paused/cancelled: do not try other strategies
         last_err = f"strategy {name} exited {code}"
 
     # ── third-party resolver bridge for gated X posts ────────────────────
@@ -782,14 +848,30 @@ def _grab_platform(args, cfg: dict, url: str | None = None) -> int:
         return _grab_via_xd(args, cfg, url)
 
     hint = ""
-    if getattr(args, "cookies_from_browser", None) is None:
+    if getattr(args, "cookies_from_browser", None) is None and not quick:
         hint = ("\nTip: open this link once in your browser (solve any "
                 "challenge/login), then rerun - or export cookies and use "
                 "--cookies cookies.txt. Safari users: grant your terminal "
                 "Full Disk Access (System Settings > Privacy & Security).")
+    if not report:
+        return 1            # caller reports / falls back to its own result
+    if getattr(args, "json_progress", False):
+        print(json.dumps({"type": "error", "message":
+                          "could not download this link (the site blocked "
+                          "the request or needs a login)"}), flush=True)
     print(f"error: all yt-dlp strategies failed ({last_err}). {hint}",
           file=sys.stderr)
     return 1
+
+
+_MANIFEST_RE = re.compile(r"\.(m3u8|mpd)(?:[?#]|$)", re.I)
+
+
+def _is_stream_manifest(url: str) -> bool:
+    """HLS/DASH playlists: a list of segments, not a file. The segmented
+    engine would only save the playlist text - yt-dlp (+ffmpeg) assembles
+    the actual video."""
+    return bool(_MANIFEST_RE.search(u.urlsplit(url).path or ""))
 
 
 def cmd_grab(args) -> int:
@@ -818,6 +900,16 @@ def cmd_grab(args) -> int:
     if _is_platform(args.url):
         return _grab_platform(args, cfg)
 
+    have_ytdlp = bool(shutil.which("yt-dlp"))
+    if _is_stream_manifest(args.url):
+        if have_ytdlp:
+            print("# HLS/DASH stream - assembling with yt-dlp")
+            return _grab_platform(args, cfg, args.url, quick=True)
+        print("error: this is an HLS/DASH stream playlist; install yt-dlp "
+              "and ffmpeg to download it (brew install yt-dlp ffmpeg)",
+              file=sys.stderr)
+        return 1
+
     try:
         page_links = _page_media(args.url, headers, args.proxy)
     except HttpError as err:
@@ -836,6 +928,27 @@ def cmd_grab(args) -> int:
         targets = [{"url": args.url, "kind": "direct", "title": ""}]
     else:
         links = page_links
+        # a page whose only video is an adaptive stream, or where the plain
+        # scan finds nothing (players that build their source in JS): let
+        # yt-dlp's site extractors have a go before giving up
+        direct = [l for l in links if not _is_stream_manifest(l["url"])]
+        playable = [l for l in direct if l["kind"] != "link-file"]
+        if have_ytdlp and not playable and not args.pick:
+            print("# no direct media file on this page - trying yt-dlp extractors")
+            code = _grab_platform(args, cfg, args.url, quick=True, report=False)
+            if code in (0, 130):
+                return code
+            if not direct:
+                msg = ("no downloadable media found on that page (no direct "
+                       "file, and yt-dlp does not support this site)")
+                if getattr(args, "json_progress", False):
+                    print(json.dumps({"type": "error", "message": msg}), flush=True)
+                print(f"error: {msg}", file=sys.stderr)
+                return 1
+        if not args.pick:
+            # --pick N counts the links exactly as `mgd grab-page` lists
+            # them; otherwise prefer real files over stream playlists
+            links = direct or links
         if not links:
             print("no downloadable media found on that page "
                   "(use 'mgd grab-page' to inspect candidates)", file=sys.stderr)
@@ -878,15 +991,38 @@ def cmd_grab(args) -> int:
     for t in targets:
         url_i = t["url"]
         title = f" ({t['title']})" if t.get("title") else ""
-        if getattr(args, "json_progress", False):
-            print(json.dumps({"type": "start", "url": url_i}), flush=True)
+        if _is_stream_manifest(url_i):
+            # a stream playlist picked from a page: assemble it with yt-dlp
+            # (the page is the Referer its CDN expects)
+            if not have_ytdlp:
+                msg = ("this is an HLS/DASH stream; install yt-dlp and ffmpeg "
+                       "to download it (brew install yt-dlp ffmpeg)")
+                if getattr(args, "json_progress", False):
+                    print(json.dumps({"type": "error", "message": msg}), flush=True)
+                print(_fail(f"{url_i}: {msg}"), file=sys.stderr)
+                failures += 1
+                continue
+            if page_links is not None and not args.referer:
+                args.referer = args.url
+            code = _grab_platform(args, cfg, url_i, quick=True)
+            if code == 130:
+                return 130
+            if code == 0:
+                results.append(url_i)
+            else:
+                failures += 1
+            continue
         try:
             out_path = _destination(args, cfg, url_i)
-            print(_arrow(f"{url_i}{title}"))
-            print(f"  saving to {out_path}")
         except (RuntimeError, OSError) as err:
+            if getattr(args, "json_progress", False):
+                print(json.dumps({"type": "error", "message": str(err)}), flush=True)
             print(f"error: {err}", file=sys.stderr)
             return 2
+        if getattr(args, "json_progress", False):
+            print(json.dumps(_start_event(url_i, out_path)), flush=True)
+        print(_arrow(f"{url_i}{title}"))
+        print(f"  saving to {out_path}")
         _journal_record(out_path)
         dl = Downloader(url_i, out_path, proxy=args.proxy, conns=conns,
                         retries=retries, stopper=stopper,
@@ -1082,15 +1218,15 @@ def _torrent_state_path(dest_dir: pathlib.Path, name: str) -> pathlib.Path:
 
 def _torrent_save_state(st: dict) -> None:
     try:
-        st["_path"].write_text(json.dumps(
-            {k: v for k, v in st.items() if k != "_path"}), encoding="utf-8")
+        categorize.atomic_write_text(st["_path"], json.dumps(
+            {k: v for k, v in st.items() if k != "_path"}))
     except OSError:
         pass
 
 
 def _torrent_spawn_aria2(url: str, src: str, dest_dir: pathlib.Path,
                          select: list[int] | None, cfg: dict,
-                         json_mode: bool, on_progress=None):
+                         json_mode: bool, on_progress=None, st_path=None):
     """Run aria2c, translating its summary lines into mgd's NDJSON events.
     Raises DownloadError when aria2 fails; SIGTERM surfaces as
     KeyboardInterrupt (handled by the caller, state already on disk)."""
@@ -1115,7 +1251,7 @@ def _torrent_spawn_aria2(url: str, src: str, dest_dir: pathlib.Path,
     if limit:
         cmd += ["--max-overall-download-limit", str(limit)]
     if json_mode:
-        print(json.dumps({"type": "start", "url": url}), flush=True)
+        print(json.dumps(_start_event(url, dest_dir, st_path)), flush=True)
     else:
         print(_arrow(f"torrent: {url[:70]}"))
         print(f"  engine: aria2c  dir: {dest_dir}"
@@ -1162,9 +1298,9 @@ def _grab_torrent(args, cfg: dict, url: str) -> int:
         print("no files selected - nothing to do")
         return 130
     if args.dir:
-        dest_dir = pathlib.Path(os.path.expanduser(args.dir))
+        dest_dir = pathlib.Path(os.path.abspath(os.path.expanduser(args.dir)))
     elif args.out:
-        dest_dir = pathlib.Path(os.path.expanduser(args.out))
+        dest_dir = pathlib.Path(os.path.abspath(os.path.expanduser(args.out)))
         if dest_dir.suffix:
             dest_dir = dest_dir.parent
     else:
@@ -1194,7 +1330,8 @@ def _grab_torrent(args, cfg: dict, url: str) -> int:
 
     try:
         _torrent_spawn_aria2(url, src, dest_dir, select, cfg,
-                              json_mode, on_progress=_st_progress)
+                              json_mode, on_progress=_st_progress,
+                              st_path=st_path)
         st_path.unlink(missing_ok=True)
         if json_mode:
             print(json.dumps({"type": "done", "path": str(dest_dir),
@@ -1236,7 +1373,7 @@ def _resume_torrent(st: dict, st_path: pathlib.Path, json_mode: bool) -> int:
     try:
         _torrent_spawn_aria2(url, src, dest_dir,
                              st.get("select"), cfg, json_mode,
-                             on_progress=_st_progress)
+                             on_progress=_st_progress, st_path=st_path)
         st_path.unlink(missing_ok=True)
         if json_mode:
             print(json.dumps({"type": "done", "path": str(dest_dir),
@@ -1298,6 +1435,44 @@ def cmd_stream(args) -> int:
     return proc.returncode
 
 
+def _start_event(url: str, out_path=None, st_path=None) -> dict:
+    """NDJSON 'start' event. Carries the download's stable id and where it
+    is being saved, so a GUI can pause/resume/cancel exactly this download
+    later instead of guessing by url or list position."""
+    ev = {"type": "start", "url": url}
+    if st_path is None and out_path is not None:
+        st_path = pathlib.Path(os.path.abspath(str(out_path)) + STATE_SUFFIX)
+    if st_path is not None:
+        ev["id"] = _state_id(pathlib.Path(st_path))
+    if out_path is not None:
+        ev["out_path"] = str(out_path)
+    return ev
+
+
+_NAME_BAD = '/\\:\x00' + "".join(chr(c) for c in range(1, 32))
+# extensions a typed name may legitimately end in beyond categorize.EXT_MAP
+_EXTRA_EXTS = {"bin", "torrent", "m4s", "part", "dat", "log", "db", "img",
+               "tgz", "tbz", "whl", "jar", "ipa", "vob", "m2ts", "f4v", "weba"}
+
+
+def _clean_out_name(raw) -> str:
+    """A user-typed file name made safe to drop inside a folder: no path
+    separators or control characters, no leading dots/spaces."""
+    name = "".join("-" if ch in _NAME_BAD else ch for ch in str(raw or ""))
+    return name.strip().lstrip(".").strip()[:200]
+
+
+def _typed_extension(name: str, also: str = "") -> str:
+    """The real file extension at the end of a typed name ('' when the dot
+    is just punctuation: 'Dr. Strange', 'take 1.2')."""
+    suffix = pathlib.PurePosixPath(name).suffix.lower().lstrip(".")
+    if not suffix or " " in suffix:
+        return ""
+    known = suffix in categorize.EXT_MAP or suffix in _EXTRA_EXTS \
+        or (also and suffix == also.lower().lstrip("."))
+    return suffix if known else ""
+
+
 def _speed_limit_arg(value) -> int | None:
     """--max-speed flag value -> bytes/s (None when unset)."""
     if not value:
@@ -1321,7 +1496,7 @@ def _mirror_hosts_for(url: str) -> list[str]:
 def _destination(args, cfg: dict, url: str) -> pathlib.Path:
     from .engine import _url_filename
     if args.out:
-        p = pathlib.Path(os.path.expanduser(args.out))
+        p = pathlib.Path(os.path.abspath(os.path.expanduser(args.out)))
         if p.exists() and p.is_dir():
             p = p / _url_filename(url)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1330,16 +1505,16 @@ def _destination(args, cfg: dict, url: str) -> pathlib.Path:
     name = _url_filename(url)
     out_name = getattr(args, "out_name", None)
     if out_name:
-        name = str(out_name).strip().lstrip("/")
-        if not name:
+        typed = _clean_out_name(out_name)
+        if not typed:
             raise RuntimeError("--out-name cannot be empty")
-        if "." not in pathlib.PurePosixPath(name).name:
-            # no extension typed -> keep the original one
-            orig_ext = _url_filename(url).rpartition(".")[2]
-            if orig_ext:
-                name = f"{name}.{orig_ext}"
+        orig_ext = pathlib.PurePosixPath(name).suffix      # ".mp4" or ""
+        if not _typed_extension(typed, orig_ext) and orig_ext:
+            # no (real) extension typed -> keep the original one
+            typed = f"{typed}{orig_ext}"
+        name = typed
     category = args.filetype or categorize.categorize(name, None)
-    d = pathlib.Path(os.path.expanduser(args.dir)) if args.dir \
+    d = pathlib.Path(os.path.abspath(os.path.expanduser(args.dir))) if args.dir \
         else categorize.category_dir(cfg, category)
     d.mkdir(parents=True, exist_ok=True)
     return categorize.claim_unique_path(d, name)
@@ -1442,6 +1617,16 @@ def cmd_set_default(args) -> int:
 def cmd_defaults(_args) -> int:
     cfg = _cfg()
     root = categorize.default_root(cfg)
+    if getattr(_args, "as_json", False):
+        print(json.dumps({
+            "root": str(root),
+            "speed_limit": cfg.get("speed_limit") or None,
+            "defaults": cfg.get("defaults") or {},
+            "conns": cfg.get("conns", 6),
+            "open_app": cfg.get("open_app", "on"),
+            "cookies_browser": cfg.get("cookies_browser"),
+        }))
+        return 0
     print(f"root: {root}")
     limit = cfg.get("speed_limit")
     print(f"speed limit: "
@@ -1461,23 +1646,26 @@ def _journal_path() -> pathlib.Path:
 def _journal_record(out_path: pathlib.Path) -> None:
     """Remember where downloads live so list/pause/resume can find them.
     Accepts either the output file path or a state path directly (torrent
-    state files are handed over as-is)."""
+    state files are handed over as-is). Entries whose state file is gone
+    (finished / cancelled downloads) are dropped on the way."""
     try:
         jp = _journal_path()
         jp.parent.mkdir(parents=True, exist_ok=True)
         entries: list[str] = []
         if jp.exists():
             try:
-                entries = json.loads(jp.read_text(encoding="utf-8"))
+                loaded = json.loads(jp.read_text(encoding="utf-8"))
+                entries = [str(e) for e in loaded] if isinstance(loaded, list) else []
             except ValueError:
                 entries = []
+        out_path = pathlib.Path(os.path.abspath(os.path.expanduser(str(out_path))))
         if str(out_path).endswith(STATE_SUFFIX):
             sp = str(out_path)
         else:
-            sp = str(out_path.expanduser().parent / (out_path.name + STATE_SUFFIX))
-        if sp not in entries:
-            entries.append(sp)
-            jp.write_text(json.dumps(entries[-500:]), encoding="utf-8")
+            sp = str(out_path.parent / (out_path.name + STATE_SUFFIX))
+        kept = [e for e in entries if e != sp and os.path.exists(e)]
+        kept.append(sp)
+        categorize.atomic_write_text(jp, json.dumps(kept[-500:]))
     except OSError:
         pass
 
@@ -1500,62 +1688,176 @@ def _find_states() -> list[pathlib.Path]:
         entries = json.loads(_journal_path().read_text(encoding="utf-8"))
     except (ValueError, OSError):
         entries = []
-    for line in entries:
-        p = pathlib.Path(line)
+    for line in entries if isinstance(entries, list) else []:
+        p = pathlib.Path(str(line))
         if p.exists() and p not in seen:
             seen.add(p)
             out.append(p)
     return sorted(out)
 
 
-def _state_pid_alive(st: dict) -> bool:
-    pid = st.get("pid")
-    if not pid:
-        return False
+_PID_CACHE: dict[int, bool] = {}
+
+
+def _check_pids(pids) -> None:
+    """Fill _PID_CACHE: is each pid a live mgd process right now?
+
+    "The pid exists" is not enough. After a crash or power loss the pid in a
+    state file can belong to an unrelated program by the time anyone looks
+    (the download would show as running forever and refuse to resume), and
+    a process that has exited but was not reaped yet still answers signal 0.
+    One `ps` call for all pids settles both."""
+    todo = []
+    for pid in pids:
+        if pid in _PID_CACHE:
+            continue
+        if pid == os.getpid():
+            _PID_CACHE[pid] = True
+            continue
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            pass                     # exists (someone else's): let ps decide
+        except OSError:
+            _PID_CACHE[pid] = False
+            continue
+        todo.append(pid)
+    if not todo:
+        return
+    if os.name == "nt":
+        _PID_CACHE.update({pid: True for pid in todo})
+        return
     try:
-        os.kill(int(pid), 0)
-        return True
-    except (ProcessLookupError, PermissionError, TypeError, ValueError):
+        out = subprocess.run(
+            ["ps", "-o", "pid=,stat=,command=", "-p", ",".join(map(str, todo))],
+            capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        _PID_CACHE.update({pid: True for pid in todo})   # cannot tell: be careful
+        return
+    seen: dict[int, bool] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        command = parts[2] if len(parts) > 2 else ""
+        seen[int(parts[0])] = not parts[1].startswith("Z") and "mgd" in command
+    for pid in todo:
+        _PID_CACHE[pid] = seen.get(pid, False)
+
+
+def _state_pid(st: dict) -> int | None:
+    try:
+        pid = int(st.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _state_pid_alive(st: dict, fresh: bool = False) -> bool:
+    """True while the mgd process that owns this download is running."""
+    pid = _state_pid(st)
+    if pid is None:
         return False
+    if fresh:
+        _PID_CACHE.pop(pid, None)
+    _check_pids([pid])
+    return _PID_CACHE.get(pid, False)
+
+
+def _state_id(st_path: pathlib.Path) -> str:
+    """Stable id of a download: derived from where its state file lives, so
+    it never changes while other downloads start and finish around it
+    (the 1-based numbers `mgd list` prints do). Always starts with a letter
+    so it can never be mistaken for one of those numbers."""
+    import hashlib
+    full = os.path.abspath(str(st_path))
+    return "d" + hashlib.sha1(full.encode("utf-8", "surrogatepass")).hexdigest()[:10]
+
+
+def _state_done(st: dict) -> int:
+    if st.get("kind") == TORRENT_STATE_KIND:
+        return int(st.get("done") or 0)
+    return sum(s.get("pos", 0) for s in st.get("segments", [])
+               if s.get("pos", 0) > 0)
+
+
+def _state_item(st_path: pathlib.Path, st: dict) -> dict:
+    """One row of `mgd list --json` / the native host's `query`."""
+    return {"id": _state_id(st_path),
+            "url": st.get("source_url") or st.get("url"),
+            "filename": st.get("filename"),
+            "out_path": st.get("out_path"),
+            "state_path": str(st_path),
+            "size": st.get("size"),
+            "done": _state_done(st),
+            "kind": "torrent" if st.get("kind") == TORRENT_STATE_KIND else "file",
+            "state": "running" if _state_pid_alive(st) else "paused"}
+
+
+def _state_items(states: list[pathlib.Path]) -> list[dict]:
+    """Rows for every readable state file (one process check for all)."""
+    loaded = [(p, _read_state(p)) for p in states]
+    loaded = [(p, st) for p, st in loaded if st is not None]
+    _check_pids([pid for pid in (_state_pid(st) for _, st in loaded) if pid])
+    return [_state_item(p, st) for p, st in loaded]
+
+
+def _read_state(st_path: pathlib.Path) -> dict | None:
+    try:
+        st = json.loads(st_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    return st if isinstance(st, dict) else None
+
+
+def _resolve_target(target: str, states: list[pathlib.Path],
+                    verb: str) -> pathlib.Path | None:
+    """Which download `mgd pause|resume|cancel <target>` means.
+
+    Accepts the stable id (`mgd list` shows it; GUIs and scripts should use
+    it), the output/state file path, or the 1-based number from `mgd list`.
+    Numbers shift whenever another download starts or finishes, so they are
+    only safe for a human reading the list right now."""
+    target = str(target).strip()
+    for p in states:
+        if _state_id(p) == target:
+            return p
+    if target.isdigit():
+        idx = int(target)
+        if not 1 <= idx <= len(states):
+            print(f"error: id {idx} out of range (1..{len(states)})"
+                  if states else f"error: no unfinished downloads to {verb}",
+                  file=sys.stderr)
+            return None
+        return states[idx - 1]
+    want = os.path.abspath(os.path.expanduser(target))
+    for p in states:
+        full = os.path.abspath(str(p))
+        if want in (full, full[:-len(STATE_SUFFIX)]):
+            return p
+    print(f"error: no download matches {target!r} - {verb} takes an id or "
+          "number from 'mgd list'", file=sys.stderr)
+    return None
 
 
 def cmd_list(args) -> int:
     states = _find_states()
     if getattr(args, "as_json", False):
-        items = []
-        for p in states:
-            try:
-                st = json.loads(p.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                continue
-            if st.get("kind") == TORRENT_STATE_KIND:
-                done = st.get("done", 0)
-            else:
-                done = sum(s.get("pos", 0) for s in st.get("segments", [])
-                           if s.get("pos", 0) != -2)
-            items.append({"url": st.get("url"), "filename": st.get("filename"),
-                          "out_path": st.get("out_path"), "size": st.get("size"),
-                          "done": done, "state": "running" if _state_pid_alive(st) else "paused"})
-        print(json.dumps({"items": items}))
+        print(json.dumps({"items": _state_items(states)}))
         return 0
     if not states:
         print("no unfinished downloads")
         return 0
     for i, p in enumerate(states, 1):
-        try:
-            st = json.loads(p.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
+        st = _read_state(p)
+        if st is None:
             continue
-        segs = st.get("segments", [])
         total = st.get("size")
-        if st.get("kind") == TORRENT_STATE_KIND:
-            done = st.get("done", 0)
-        else:
-            done = sum(s.get("pos", 0) for s in segs if s.get("pos", 0) != -2)
+        done = _state_done(st)
         pct = f"{done * 100 // total}%" if total else "?"
         status = "running" if _state_pid_alive(st) else "paused"
-        print(f"  {i}. [{status}] {p.name[:-len(STATE_SUFFIX)]}")
-        print(f"     {st.get('url')}")
+        print(f"  {i}. [{status}] {p.name[:-len(STATE_SUFFIX)]}  ({_state_id(p)})")
+        print(f"     {st.get('source_url') or st.get('url')}")
         print(f"     {pct} ({done}/{total} bytes)"
               + (f" - pause ok: mgd pause {i} | resume: mgd resume {i} | cancel: mgd cancel {i}"
                  if status == "running" else
@@ -1574,50 +1876,50 @@ def _kill_pid_of(st_path: pathlib.Path, st: dict) -> bool:
         return False
 
 
+def _wait_pid_gone(st: dict, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _state_pid_alive(st, fresh=True):
+            return True
+        time.sleep(0.1)
+    return not _state_pid_alive(st, fresh=True)
+
+
 def cmd_pause(args) -> int:
-    states = _find_states()
-    try:
-        idx = int(args.target)
-    except ValueError:
-        print("error: pause target must be an id from 'mgd list'", file=sys.stderr)
+    st_path = _resolve_target(args.target, _find_states(), "pause")
+    if st_path is None:
         return 2
-    if not 1 <= idx <= len(states):
-        print(f"error: id {idx} out of range (1..{len(states)})", file=sys.stderr)
+    st = _read_state(st_path)
+    if st is None:
         return 2
-    st_path = states[idx - 1]
-    try:
-        st = json.loads(st_path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return 2
+    name = st_path.name[:-len(STATE_SUFFIX)]
+    sid = _state_id(st_path)
     if _kill_pid_of(st_path, st):
-        print(f"pause signal sent to download {idx} - state saved, resume with: mgd resume {idx}")
         # give the process a moment to flush its state
-        for _ in range(20):
-            time.sleep(0.1)
-            if not _state_pid_alive(st):
-                break
+        _wait_pid_gone(st, 3.0)
+        print(f"paused {name} - state saved, resume with: mgd resume {sid}")
         return 0
-    print(f"download {idx} is not running (already paused) - resume with: mgd resume {idx}")
+    print(f"{name} is not running (already paused) - resume with: mgd resume {sid}")
     return 0
 
 
 def cmd_cancel(args) -> int:
-    states = _find_states()
-    try:
-        idx = int(args.target)
-    except ValueError:
-        print("error: cancel target must be an id from 'mgd list'", file=sys.stderr)
+    st_path = _resolve_target(args.target, _find_states(), "cancel")
+    if st_path is None:
         return 2
-    if not 1 <= idx <= len(states):
-        print(f"error: id {idx} out of range (1..{len(states)})", file=sys.stderr)
+    st = _read_state(st_path)
+    if st is None:
         return 2
-    st_path = states[idx - 1]
-    try:
-        st = json.loads(st_path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return 2
-    _kill_pid_of(st_path, st)
-    time.sleep(0.4)
+    if _kill_pid_of(st_path, st):
+        # the dying process saves its state one last time: wait for it to be
+        # gone before deleting, or that save would resurrect a state file
+        # with no data behind it
+        if not _wait_pid_gone(st, 5.0):
+            try:
+                os.kill(int(st["pid"]), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError, ValueError):
+                pass
+            _wait_pid_gone(st, 2.0)
     removed = []
     if st.get("kind") == TORRENT_STATE_KIND:
         # remove only the recorded partial files + aria2 control files
@@ -1626,12 +1928,14 @@ def cmd_cancel(args) -> int:
             p = d / f.get("path", "")
             for cand in (p, pathlib.Path(str(p) + ".aria2")):
                 try:
-                    cand.unlink(missing_ok=True)
-                    removed.append(cand.name)
+                    if cand.is_file():
+                        cand.unlink()
+                        removed.append(cand.name)
                 except OSError:
                     pass
+    base = str(st_path)[:-len(STATE_SUFFIX)]
     for suffix in (STATE_SUFFIX, PART_SUFFIX):
-        part = st_path.with_name(st_path.name.replace(STATE_SUFFIX, suffix))
+        part = pathlib.Path(base + suffix)
         if part.exists():
             try:
                 part.unlink()
@@ -1639,7 +1943,7 @@ def cmd_cancel(args) -> int:
             except OSError as err:
                 print(f"error: cannot remove {part}: {err}", file=sys.stderr)
                 return 1
-    print(f"cancelled download {idx}"
+    print(f"cancelled {pathlib.Path(base).name}"
           + (f" (removed {', '.join(removed)})" if removed else ""))
     return 0
 
@@ -1647,6 +1951,17 @@ def cmd_cancel(args) -> int:
 def cmd_doctor(_args) -> int:
     """Show what engines and setup mgd can use right now."""
     cfg = _cfg()
+    if getattr(_args, "as_json", False):
+        print(json.dumps({
+            "python": sys.version.split()[0],
+            "config": str(categorize.config_path()),
+            "root": str(categorize.default_root(cfg)),
+            "tools": {name: shutil.which(binary) for name, binary in (
+                ("yt-dlp", "yt-dlp"), ("ffmpeg", "ffmpeg"),
+                ("aria2c", "aria2c"), ("webtorrent", "webtorrent"))},
+            "unfinished": len(_find_states()),
+        }))
+        return 0
     ok, warn = "OK", "--"
     print("mgd doctor")
     print(f"  engine        {ok}  python {sys.version.split()[0]}, "
@@ -1673,8 +1988,7 @@ def cmd_doctor(_args) -> int:
     print(f"  cookie source {ok if cfg.get('cookies_browser') else warn}  "
           + (f"preferred: {cfg['cookies_browser']} (set with: mgd set-default cookies-browser chrome)"
              if cfg.get("cookies_browser") else "none chosen; auto-detect on first platform download"))
-    paused = len(_find_states())
-    print(f"  paused items  {paused}")
+    print(f"  unfinished    {len(_find_states())} download(s) (see: mgd list)")
     return 0
 
 
@@ -1761,6 +2075,52 @@ def cmd_page_media(args) -> int:
     return 0
 
 
+def _handoff_path() -> pathlib.Path:
+    return categorize.config_path().parent / "handoff.json"
+
+
+def _write_handoff(urls: list[str], referer, destination, titles: dict,
+                   kinds: dict | None = None) -> None:
+    """Queue a batch for the MediaGrab app (it reads + deletes the file when
+    `mediagrab://handoff` opens it).
+
+    A batch that arrives before the app consumed the previous one is merged
+    into it rather than replacing it - two quick right-click downloads must
+    both survive. Each item keeps its own referer and suggested name;
+    the top-level urls/referer/destination keys are what older app builds
+    read."""
+    path = _handoff_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    items: list[dict] = []
+    try:
+        old = json.loads(path.read_text(encoding="utf-8"))
+        fresh = time.time() - path.stat().st_mtime < 120
+        if fresh and isinstance(old, dict):
+            for it in old.get("items") or [
+                    {"url": x, "referer": old.get("referer")}
+                    for x in old.get("urls") or []]:
+                if isinstance(it, dict) and it.get("url"):
+                    items.append(it)
+    except (OSError, ValueError):
+        pass
+    known = {it["url"] for it in items}
+    for u_ in urls:
+        if u_ in known:
+            continue
+        known.add(u_)
+        kind = (kinds or {}).get(u_)
+        items.append({"url": u_, "referer": referer or None,
+                      "name": _clean_out_name(titles.get(u_)) or None,
+                      # "file" | "stream" | "page" (a page goes through the
+                      # app's normal quality-picker flow)
+                      "kind": kind if kind in ("file", "stream", "page") else None})
+    handoff = {"urls": [it["url"] for it in items],
+               "referer": referer or None,
+               "destination": destination or None,
+               "items": items}
+    categorize.atomic_write_text(path, json.dumps(handoff))
+
+
 def cmd_native_host(_args) -> int:
     """Chrome native-messaging host (stdio, 4-byte LE length + JSON).
 
@@ -1800,7 +2160,7 @@ def cmd_native_host(_args) -> int:
             return 0
         command = msg.get("command")
         if command == "ping":
-            write_message({"ok": True, "app": "mgd", "version": "1.2"})
+            write_message({"ok": True, "app": "mgd", "version": "1.3"})
             continue
         if command == "probe":
             urls = [str(x) for x in msg.get("urls", [])][:64]
@@ -1826,11 +2186,15 @@ def cmd_native_host(_args) -> int:
             write_message({"ok": True, "sizes": sizes})
             continue
         if command == "download":
-            urls = [str(x) for x in msg.get("urls", [])][:128]
+            urls = [str(x) for x in msg.get("urls", []) if x][:128]
             destination = msg.get("destination")
             referer = msg.get("referer")
-            log_path = pathlib.Path(
-                os.environ.get("HOME") or "/tmp") / ".config/mgd/native-host.log"
+            # optional {url: suggested file name} from the page scan
+            raw_titles = msg.get("titles")
+            titles = raw_titles if isinstance(raw_titles, dict) else {}
+            raw_kinds = msg.get("kinds")
+            kinds = raw_kinds if isinstance(raw_kinds, dict) else {}
+            log_path = categorize.config_path().parent / "native-host.log"
 
             def spawn_all():
                 """Headless fallback: detached mgd grab per url."""
@@ -1843,7 +2207,11 @@ def cmd_native_host(_args) -> int:
                         # tiered CDNs (erome etc.) 403 media requests without
                         # the source page as Referer
                         cmd += ["--referer", str(referer)]
+                    name = _clean_out_name(titles.get(u_))
+                    if name:
+                        cmd += ["--out-name", name]
                     try:
+                        log_path.parent.mkdir(parents=True, exist_ok=True)
                         err_sink = open(log_path, "a", encoding="utf-8")
                         print(f"{time.strftime('%F %T')} grab spawn: {u_}",
                               file=err_sink)
@@ -1864,15 +2232,7 @@ def cmd_native_host(_args) -> int:
             if urls and _cfg().get("open_app", "on") != "off":
                 handed = False
                 try:
-                    handoff = {"urls": [u for u in urls if u],
-                               "referer": referer or None,
-                               "destination": destination or None}
-                    cfg_base = (os.environ.get("XDG_CONFIG_HOME")
-                                or os.path.join(os.environ.get("HOME") or "/tmp",
-                                                ".config"))
-                    handoff_path = pathlib.Path(cfg_base) / "mgd" / "handoff.json"
-                    handoff_path.parent.mkdir(parents=True, exist_ok=True)
-                    handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
+                    _write_handoff(urls, referer, destination, titles, kinds)
                     if os.environ.get("MGD_NO_OPEN"):
                         write_message({"ok": True, "handoff": True,
                                        "spawned": len(urls)})
@@ -1891,22 +2251,8 @@ def cmd_native_host(_args) -> int:
             write_message({"ok": True, "spawned": spawn_all()})
             continue
         if command == "query":
-            states = _find_states()
-            items = []
-            for st_path in states:
-                try:
-                    st = json.loads(st_path.read_text(encoding="utf-8"))
-                except (ValueError, OSError):
-                    continue
-                done = sum(s.get("pos", 0) for s in st.get("segments", [])
-                            if s.get("pos", 0) != -2)
-                items.append({"url": st.get("url"),
-                              "filename": st.get("filename"),
-                              "out_path": st.get("out_path"),
-                              "size": st.get("size"), "done": done,
-                              "state": "running" if _state_pid_alive(st)
-                              else "paused"})
-            write_message({"ok": True, "items": items[:64]})
+            _PID_CACHE.clear()       # the host can outlive several queries
+            write_message({"ok": True, "items": _state_items(_find_states())[:64]})
             continue
         if command == "open":
             try:
@@ -1975,7 +2321,6 @@ def cmd_watch(args) -> int:
             if url in seen or not _watch_worth_grabbing(url, args.all_types):
                 continue
             seen.add(url)
-            print(_arrow(f"clipboard -> downloading {url}"))
             cmd = [sys.executable,
                    str(pathlib.Path(__file__).resolve().parent.parent
                        / "bin" / "mgd"), "grab", url]
@@ -2074,37 +2419,47 @@ def cmd_resume(args) -> int:
     if args.target == "all":
         chosen = states
     else:
-        try:
-            idx = int(args.target)
-        except ValueError:
-            print("error: resume target must be an id or 'all'", file=sys.stderr)
+        one = _resolve_target(args.target, states, "resume")
+        if one is None:
             return 2
-        if not 1 <= idx <= len(states):
-            print(f"error: id {idx} out of range (1..{len(states)})", file=sys.stderr)
-            return 2
-        chosen = [states[idx - 1]]
+        chosen = [one]
     as_json = getattr(args, "json_progress", False)
     failures = 0
     for st_path in chosen:
-        try:
-            st = json.loads(st_path.read_text(encoding="utf-8"))
-        except (ValueError, OSError) as err:
-            print(f"error: cannot read {st_path}: {err}", file=sys.stderr)
+        st = _read_state(st_path)
+        if st is None:
+            print(f"error: cannot read {st_path}", file=sys.stderr)
+            failures += 1
+            continue
+        if _state_pid_alive(st):
+            # two processes writing one part file would corrupt it
+            msg = f"{st_path.name[:-len(STATE_SUFFIX)]} is already downloading"
+            if as_json:
+                print(json.dumps({"type": "error", "message": msg}), flush=True)
+            else:
+                print(f"error: {msg}", file=sys.stderr)
             failures += 1
             continue
         out_path = pathlib.Path(st.get("out_path") or "")
         if not out_path.name:
             out_path = st_path.parent / (st.get("filename") or "download")
         if st.get("kind") == TORRENT_STATE_KIND:
-            return _resume_torrent(st, st_path, as_json)
-        dl = Downloader(st.get("url", ""), out_path,
+            code = _resume_torrent(st, st_path, as_json)
+            if code == 130:
+                return 130
+            failures += 1 if code else 0
+            continue
+        # resume from the link the user asked for when we know it: signed
+        # CDN urls (the redirect target stored as "url") expire
+        resume_url = st.get("source_url") or st.get("url", "")
+        dl = Downloader(resume_url, out_path,
                         proxy=_cfg().get("proxy") or os.environ.get("HTTPS_PROXY"),
                         referer=st.get("referer"),
                         mirror_hosts=_mirror_hosts_for(st.get("url", "")),
                         resume_state=st_path.read_bytes())
         dl.pid = os.getpid()
         if as_json:
-            print(json.dumps({"type": "start", "url": st.get("url", "")}), flush=True)
+            print(json.dumps(_start_event(resume_url, out_path)), flush=True)
         else:
             print(_arrow(f"resuming {out_path.name} ({st.get('size', '?')} bytes total)"))
 

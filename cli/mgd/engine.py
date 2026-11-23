@@ -322,6 +322,9 @@ class Downloader:
                  mirror_hosts: list[str] | None = None,
                  max_speed: int | None = None):
         self.url = url
+        # the link the user asked for; self.url moves to the redirect target
+        # once probed (signed CDN urls differ per visit and expire)
+        self.source_url = url
         self.out_path = pathlib.Path(out_path).expanduser()
         self.proxy = proxy
         self.conns = max(1, min(MAX_CONNS, int(conns)))
@@ -470,7 +473,15 @@ class Downloader:
             state = json.loads(state_bytes)
         except ValueError:
             return None
-        if state.get("kind") != "mgd-download-state" or state.get("url") != self.url:
+        if state.get("kind") != "mgd-download-state":
+            return None
+        # same file when either the final url matches, or the link the user
+        # originally asked for does (it may redirect to a fresh signed url on
+        # every visit - etag/last-modified/size below still guard identity)
+        same_final = state.get("url") == self.url
+        same_source = bool(state.get("source_url")) and \
+            state.get("source_url") == self.source_url
+        if not (same_final or same_source):
             return None
         if pr.etag and state.get("etag") and pr.etag != state["etag"]:
             return None
@@ -815,10 +826,16 @@ class Downloader:
                 pass
 
     def save_state(self) -> None:
+        """Persist segment positions. Written atomically (tmp + rename): the
+        state is re-saved twice a second while `mgd list` / the GUI poll read
+        it, and a torn read would make the download vanish from the list."""
+        path = self._state_path()
+        tmp = path.with_name(f".{path.name}.tmp")
         try:
-            self._state_path().write_text(json.dumps({
+            tmp.write_text(json.dumps({
                 "kind": "mgd-download-state", "version": 1,
-                "url": self.url, "filename": self._filename,
+                "url": self.url, "source_url": self.source_url,
+                "filename": self._filename,
                 "size": self._size, "etag": self._etag,
                 "last_modified": self._last_modified,
                 "accept_ranges": self._accept_ranges,
@@ -827,8 +844,12 @@ class Downloader:
                 "referer": self.referer,
                 "segments": [s.to_json() for s in self._segments],
             }), encoding="utf-8")
+            os.replace(tmp, path)
         except OSError:
-            pass
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _close_quietly(conn) -> None:

@@ -56,7 +56,9 @@ mgd torrent-info "magnet:…"       # JSON file manifest (drives the GUI picker)
 mgd stream "magnet:…"             # stream the video while it downloads
                                    # (webtorrent-cli + VLC/IINA, sequential)
 mgd jobs                           # [running]/[paused] + per-item actions
-mgd pause 1 / mgd resume 1 / mgd cancel 1
+mgd pause 1 / mgd resume 1 / mgd cancel 1   # by the number mgd jobs prints…
+mgd pause d3fa9c01b2e              # …or by the stable id shown next to it
+mgd grab "https://site/video.m3u8" # HLS/DASH streams: assembled with yt-dlp
 mgd qualities "youtu.be/.."        # JSON quality/resolution menu (GUI uses this)
 mgd doctor                         # engines + config readiness
 mgd grab-page <url> [--json]       # just list media links found on a page
@@ -65,7 +67,30 @@ mgd set-default root ~/Downloads   # default root (categories become subdirs)
 mgd defaults                       # show the current mapping
 mgd list                           # unfinished downloads + how to resume
 mgd resume <id> | resume all       # resume saved downloads
+mgd list --json                    # machine-readable (id, state, done, size…)
+mgd defaults --json / doctor --json  # settings + tool readiness for GUIs
 ```
+
+### Download ids
+
+`mgd list` shows two ways to address a download: its row number and a stable
+id (`d` + 10 hex digits, derived from where the download is being saved).
+Row numbers shift whenever another download starts or finishes, so anything
+automated (the MediaGrab app, scripts) should use the id. `pause`, `resume`
+and `cancel` accept the id, the output file path, or the row number.
+`--json-progress` runs announce their id in the first event:
+`{"type":"start","url":…,"id":"d3fa9c01b2e","out_path":…}`.
+
+### What a link turns into
+
+| Link | Handled by |
+| --- | --- |
+| a file (`.mp4`, `.zip`, …) | the segmented engine |
+| a page with `<video>`/KVS player/direct links | page scan, then the engine (page sent as `Referer`) |
+| YouTube / X | yt-dlp (quality menu), X falls back to the bridge |
+| `.m3u8` / `.mpd` stream playlists | yt-dlp + ffmpeg (a playlist is not a file) |
+| a page with no direct media | yt-dlp's site extractors, then a clear error |
+| magnet / `.torrent` | aria2c |
 
 ### grab options
 
@@ -125,26 +150,37 @@ page URLs are scanned for `<video>`, `<audio>`, `<source>`, `og:video`,
 
 `gui/` contains a native SwiftUI app (MediaGrab) that drives this engine:
 paste-link window, automatic quality chooser (YouTube/X resolution menus),
-download list with per-row pause/resume, file icons that reveal in Finder,
-paused-download pickup (even from other terminals) and a diagnostics pane. Build with `gui/script/build_app.sh`; make a
-drag-to-Applications DMG with `gui/script/create_dmg.sh`. See
-`gui/README.md`.
+a download queue with per-row pause/resume/retry, pickup of downloads started
+anywhere else (terminal, browser extension) and a diagnostics sheet. The app
+bundle carries its own copy of this engine. Build with
+`gui/script/build_app.sh`; make a drag-to-Applications DMG with
+`gui/script/create_dmg.sh`. See `gui/README.md`.
 
 ## Tests
 
 ```sh
 cd cli
-python3 tests/run_tests.py     # 16 tests; no pytest needed
+python3 tests/run_tests.py            # everything; no pytest needed
+python3 tests/run_tests.py pause id   # only tests whose name matches
 ```
+
+The suite runs in a sandbox (`tests/conftest.py`): its own config directory
+and download root (`XDG_CONFIG_HOME`, `MGD_ROOT`), and `MGD_NO_OPEN` so
+nothing can open the app. It never reads or writes `~/.config/mgd` or
+`~/Downloads/mgd`, so it is safe to run while real downloads are going.
 
 Covered: segmented download correctness, pause + resume byte-perfect,
 connection-drop retries, no-range streaming fallback, redirect following,
 SHA-256 verification, HTTP forward proxy, SOCKS5 proxy, category routing,
-filename de-duplication, page-media extraction.
+filename de-duplication, page-media extraction, stable ids surviving a
+shifting list, cancel touching only its own download, atomic state files,
+file naming rules, stream/yt-dlp routing, pausing yt-dlp downloads, the
+native host protocol and extension hand-offs.
 
 ## Known limitations (v1)
 
-- HLS/DASH (`.m3u8`/`.mpd`) manifests are detected in pages but not reassembled
-  — pass segment URLs or use yt-dlp for adaptive streams.
+- HLS/DASH (`.m3u8`/`.mpd`) streams need yt-dlp and ffmpeg installed; without
+  them mgd says so instead of saving the playlist text.
 - Credentials in URLs use HTTP Basic; cookies are not stored between runs.
-- No bandwidth throttler or scheduler yet (queues land in a later version).
+- The CLI starts every `mgd grab` immediately; queueing (N at a time) is done
+  by the MediaGrab app.

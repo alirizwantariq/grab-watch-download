@@ -9,8 +9,24 @@ import time
 import mgd
 from mgd import cli as mgd_cli
 
+import conftest  # noqa: F401  (sandboxes XDG_CONFIG_HOME / MGD_ROOT first)
+
 CLI_DIR = pathlib.Path(__file__).parent.parent
-TEST_CFG = tempfile.mkdtemp(prefix="mgdtest-cfg")
+TEST_CFG = os.environ["XDG_CONFIG_HOME"]
+
+
+def _own_item(root, timeout=10.0):
+    """The `mgd list --json` row of the download saving under `root` -
+    tests address their own download by its stable id, never by list
+    position (positions shift when anything else starts or finishes)."""
+    deadline = time.time() + timeout
+    root = str(root)
+    while True:
+        items = json.loads(_mgd(["list", "--json"]).stdout).get("items", [])
+        mine = [i for i in items if str(i.get("out_path", "")).startswith(root)]
+        if mine or time.time() > deadline:
+            return mine[0] if mine else None
+        time.sleep(0.2)
 
 
 def _mgd(args, env_extra=None, timeout=90):
@@ -722,7 +738,7 @@ def test_native_host_download_referer(tmp_path):
         (ln,) = struct.unpack("<I", p.stdout[:4])
         assert json.loads(p.stdout[4:4 + ln])["spawned"] == 1
         out = dest / "video.mp4"
-        deadline = time.time() + 30
+        deadline = time.time() + 6     # a 403 is immediate; no retries
         while time.time() < deadline:
             time.sleep(0.5)
             if out.exists():
@@ -834,7 +850,9 @@ def test_native_host_query():
         return struct.pack("<I", len(body)) + body
 
     import tempfile, os
-    env = dict(os.environ, XDG_CONFIG_HOME=tempfile.mkdtemp())
+    # a config + download root nobody else writes to: truly empty
+    env = dict(os.environ, XDG_CONFIG_HOME=tempfile.mkdtemp(dir=conftest.SANDBOX),
+               MGD_ROOT=tempfile.mkdtemp(dir=conftest.SANDBOX))
     p = subprocess.run([_sys.executable, "bin/mgd", "native-host"],
                        input=frame({"command": "query"}),
                        capture_output=True, timeout=30, env=env)
@@ -1145,33 +1163,36 @@ def test_pause_then_resume(tmp_path):
                                      "XDG_CONFIG_HOME": TEST_CFG},
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(3.0)
-        listed = _mgd(["list", "--json"])
-        items = json.loads(listed.stdout).get("items", [])
-        assert items, "no state file while downloading"
-        assert items[0]["state"] == "running"
-        pause = _mgd(["pause", "1"])
+        item = _own_item(root)
+        assert item, "no state file while downloading"
+        assert item["state"] == "running"
+        assert item["id"].startswith("d") and not item["id"].isdigit()
+        pause = _mgd(["pause", item["id"]])
         assert pause.returncode == 0, pause.stdout + pause.stderr
         proc.wait(timeout=30)
-        time.sleep(1.0)
-        listed2 = _mgd(["list", "--json"])
-        item = json.loads(listed2.stdout)["items"][0]
-        assert item["state"] == "paused"
-        assert item["done"] > 0
+        assert proc.returncode == 130, proc.returncode
+        time.sleep(0.5)
+        paused = _own_item(root)
+        assert paused["state"] == "paused"
+        assert paused["done"] > 0
+        assert paused["id"] == item["id"], "id must not change across pause"
         # resume completes file byte-perfect; --json-progress must emit
         # start/progress/done NDJSON (the GUI consumes exactly this)
         content = origin.content
-        res = _mgd(["resume", "1", "--json-progress"], timeout=120)
+        res = _mgd(["resume", item["id"], "--json-progress"], timeout=120)
         final = root / "drip.bin"
         assert final.read_bytes() == content, proc.stdout
-        kinds = [json.loads(l)["type"] for l in res.stdout.splitlines()
-                 if l.startswith('{"type"')]
+        events = [json.loads(l) for l in res.stdout.splitlines()
+                  if l.startswith('{"type"')]
+        kinds = [e["type"] for e in events]
         assert "start" in kinds and "progress" in kinds and "done" in kinds
-        done_line = [l for l in res.stdout.splitlines() if '"done"' in l][-1]
+        start = [e for e in events if e["type"] == "start"][0]
+        assert start["id"] == item["id"] and start["out_path"] == str(final)
+        done_line = [l for l in res.stdout.splitlines() if '"type": "done"' in l][-1]
         assert json.loads(done_line)["path"] == str(final)
         assert (res.returncode == 0)
-        # list now empty (state cleared)
-        listed3 = _mgd(["list", "--json"])
-        assert not json.loads(listed3.stdout)["items"]
+        # state cleared: our download is gone from the list
+        assert _own_item(root, timeout=0) is None
     finally:
         origin.stop()
         try:
@@ -1193,13 +1214,14 @@ def test_cancel_removes_partial(tmp_path):
                                      "XDG_CONFIG_HOME": TEST_CFG},
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(3.0)
-        out = _mgd(["cancel", "1"])
+        item = _own_item(root)
+        assert item and item["state"] == "running", item
+        out = _mgd(["cancel", item["id"]])
         assert out.returncode == 0, out.stdout + out.stderr
         proc.wait(timeout=20)
         time.sleep(0.5)
         assert not list(root.iterdir()), f"partial files left: {list(root.iterdir())}"
-        listed = _mgd(["list", "--json"])
-        assert not json.loads(listed.stdout)["items"]
+        assert _own_item(root, timeout=0) is None
     finally:
         origin.stop()
         try:
